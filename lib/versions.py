@@ -1,0 +1,6 @@
+"""Independent protocol versions for the DigitalPsychology planes."""
+
+BEHAVIOR_EVENT_SCHEMA_VERSION = "2.2.0"
+GUARD_REGISTRY_SCHEMA_VERSION = "1.0.0"
+RECEIPT_REGISTRY_SCHEMA_VERSION = "1.0.0"
+GUARD_PACK_SCHEMA_VERSION = "1.1.0"

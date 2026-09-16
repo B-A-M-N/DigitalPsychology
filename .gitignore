@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.sqlite3
+*.ndjson
+build/
+*.egg-info/
+compiled-guard-pack.json
+.coverage

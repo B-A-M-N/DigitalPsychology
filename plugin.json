@@ -1,0 +1,9 @@
+{
+  "name": "digital-psychology",
+  "version": "1.0.0",
+  "description": "Observational agent-behavior measurement, evaluation, and guarded policy-artifact export.",
+  "role": "observational",
+  "runtime_boundary": "trusted compiled-guard-pack.json",
+  "runtime_owner": "cognitive-frameworks",
+  "schema_version": "2.1.0"
+}

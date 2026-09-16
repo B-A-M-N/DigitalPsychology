@@ -1,0 +1,152 @@
+{
+  "fixture_version": "1.0.0",
+  "guards": [
+    {
+      "id": "fixture-scoped",
+      "family": "fixture-scoped",
+      "version": "1",
+      "key": "fixture-scoped@1",
+      "status": "active",
+      "target_behavior": "fixture behavior",
+      "rule": "When the mutation trigger is active, verify the fixture boundary before completion.",
+      "location": "fixture",
+      "priority": "P1",
+      "scope": {
+        "domains": ["rebase"],
+        "stateworks": ["getter"],
+        "task_shapes": ["implement"],
+        "models": ["model-a"],
+        "harnesses": ["harness-a"]
+      },
+      "trigger": "mutation",
+      "enforcement_key": "fixture.behavior"
+    },
+    {
+      "id": "fixture-duplicate",
+      "family": "fixture-duplicate",
+      "version": "1",
+      "key": "fixture-duplicate@1",
+      "status": "active",
+      "target_behavior": "fixture behavior",
+      "rule": "A duplicate implementation of the fixture behavior.",
+      "location": "fixture",
+      "priority": "P2",
+      "scope": {
+        "domains": ["rebase"],
+        "stateworks": ["getter"],
+        "task_shapes": ["implement"],
+        "models": ["model-a"],
+        "harnesses": ["harness-a"]
+      },
+      "trigger": "mutation",
+      "enforcement_key": "fixture.behavior"
+    },
+    {
+      "id": "fixture-canary",
+      "family": "fixture-canary",
+      "version": "1",
+      "key": "fixture-canary@1",
+      "status": "canary",
+      "target_behavior": "fixture canary behavior",
+      "rule": "Use the canary fixture behavior only for explicitly assigned tasks.",
+      "location": "fixture",
+      "priority": "P2",
+      "rollout": {"canary_task_ids": ["task-canary"]},
+      "scope": {
+        "domains": ["rebase"],
+        "stateworks": ["getter"],
+        "task_shapes": ["implement"],
+        "models": ["model-a"],
+        "harnesses": ["harness-a"]
+      },
+      "trigger": "mutation",
+      "enforcement_key": "fixture.canary"
+    },
+    {
+      "id": "fixture-wrong-trigger",
+      "family": "fixture-wrong-trigger",
+      "version": "1",
+      "key": "fixture-wrong-trigger@1",
+      "status": "active",
+      "target_behavior": "wrong trigger behavior",
+      "rule": "This must not apply to mutation tasks.",
+      "location": "fixture",
+      "priority": "P1",
+      "scope": {
+        "domains": ["rebase"],
+        "stateworks": ["getter"],
+        "task_shapes": ["implement"],
+        "models": ["model-a"],
+        "harnesses": ["harness-a"]
+      },
+      "trigger": "observation",
+      "enforcement_key": "fixture.wrong-trigger"
+    }
+  ],
+  "cases": [
+    {
+      "name": "matching mutation task",
+      "domains": ["rebase"],
+      "stateworks": ["getter"],
+      "shapes": ["implement"],
+      "model": "model-a",
+      "harness": "harness-a",
+      "trigger": "mutation",
+      "task_id": "task-canary",
+      "expected_active": ["fixture-scoped", "fixture-canary"]
+    },
+    {
+      "name": "unassigned canary task",
+      "domains": ["rebase"],
+      "stateworks": ["getter"],
+      "shapes": ["implement"],
+      "model": "model-a",
+      "harness": "harness-a",
+      "trigger": "mutation",
+      "task_id": "task-not-canary",
+      "expected_active": ["fixture-scoped"]
+    },
+    {
+      "name": "unknown model fails closed",
+      "domains": ["rebase"],
+      "stateworks": ["getter"],
+      "shapes": ["implement"],
+      "model": null,
+      "harness": "harness-a",
+      "trigger": "mutation",
+      "task_id": "task-canary",
+      "expected_active": []
+    },
+    {"name":"extra domain still matches","domains":["rebase","other"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":["fixture-scoped","fixture-canary"]},
+    {"name":"wrong domain excluded","domains":["merge"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"wrong statework excluded","domains":["rebase"],"stateworks":["gitter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"wrong shape excluded","domains":["rebase"],"stateworks":["getter"],"shapes":["debug"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"wrong harness excluded","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-b","trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"wrong model excluded","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-b","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"observation trigger selects observation guard","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"observation","task_id":"task-canary","expected_active":["fixture-wrong-trigger"]},
+    {"name":"missing trigger fails closed","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":null,"task_id":"task-canary","expected_active":[]},
+    {"name":"missing domain fails closed","domains":[],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"missing statework fails closed","domains":["rebase"],"stateworks":[],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"missing harness fails closed","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":null,"trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"missing model fails closed","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":null,"harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":[]},
+    {"name":"unassigned canary task two","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary-2","expected_active":["fixture-scoped"]},
+    {"name":"unassigned canary task three","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary-3","expected_active":["fixture-scoped"]},
+    {"name":"explicit canary assignment remains deterministic","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":["fixture-scoped","fixture-canary"]},
+    {"name":"multiple stateworks with getter matches","domains":["rebase"],"stateworks":["gitter","getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":["fixture-scoped","fixture-canary"]},
+    {"name":"multiple shapes with implement matches","domains":["rebase"],"stateworks":["getter"],"shapes":["debug","implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":["fixture-scoped","fixture-canary"]},
+    {"name":"empty task id excludes canary","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"","expected_active":["fixture-scoped"]},
+    {"name":"null task id excludes canary","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":null,"expected_active":["fixture-scoped"]},
+    {"name":"scope is intersection not union","domains":["other","rebase"],"stateworks":["other","getter"],"shapes":["other","implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-canary","expected_active":["fixture-scoped","fixture-canary"]},
+    {"name":"control remains eligible","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-not-canary","expected_active":["fixture-scoped"]},
+    {"name":"control remains eligible two","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-control-2","expected_active":["fixture-scoped"]},
+    {"name":"control remains eligible three","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"task-control-3","expected_active":["fixture-scoped"]},
+    {"name":"wrong trigger excludes scoped guard","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"recovery","task_id":"task-canary","expected_active":[]},
+    {"name":"wrong trigger excludes canary guard","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"observation","task_id":"task-not-canary","expected_active":["fixture-wrong-trigger"]},
+    {"name":"model exact match","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"model-exact","expected_active":["fixture-scoped"]},
+    {"name":"harness exact match","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"harness-exact","expected_active":["fixture-scoped"]},
+    {"name":"shape exact match","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"shape-exact","expected_active":["fixture-scoped"]},
+    {"name":"statework exact match","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"statework-exact","expected_active":["fixture-scoped"]},
+    {"name":"domain exact match","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"domain-exact","expected_active":["fixture-scoped"]},
+    {"name":"all selectors exact","domains":["rebase"],"stateworks":["getter"],"shapes":["implement"],"model":"model-a","harness":"harness-a","trigger":"mutation","task_id":"all-exact","expected_active":["fixture-scoped"]}
+  ]
+}

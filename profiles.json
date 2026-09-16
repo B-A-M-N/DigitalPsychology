@@ -1,0 +1,29 @@
+{
+  "profiles": [
+    {
+      "guard": "G-retry",
+      "evaluator": "retry_changes_hypothesis",
+      "applicable_episodes": 0,
+      "passing_episodes": 0,
+      "rate": null,
+      "ci_lower_bound": null,
+      "window": "",
+      "task_context": {
+        "model": "claude-sonnet-4",
+        "harness": "codex-cli",
+        "framework_policy_hash": "abc123",
+        "statework_versions": {
+          "gitter": "1.1.0",
+          "getter": "1.1.0"
+        },
+        "guard_pack": "1.1.0",
+        "toolset": "codex",
+        "task_family": "implement",
+        "environment": "sandbox"
+      },
+      "note": "per-applicable-episode metrics"
+    }
+  ],
+  "count": 1,
+  "generated_at": "2026-09-14T20:49:39.306059Z"
+}
