@@ -73,7 +73,7 @@ def _window_time(profile: Dict[str, Any]) -> float:
         return float("-inf")
 
 
-def _profile_key(profile: Dict[str, Any]) -> Tuple[str, str, str, str, str, str, str]:
+def _profile_key(profile: Dict[str, Any]) -> Tuple[str, str, str, str, str, str, str, str]:
     context = profile.get("task_context") or {}
     guard_key = str(profile.get("guard_key") or profile.get("guard") or "")
     return (
@@ -83,8 +83,17 @@ def _profile_key(profile: Dict[str, Any]) -> Tuple[str, str, str, str, str, str,
         str(context.get("environment") or ""),
         str(context.get("task_family") or context.get("task_shape") or ""),
         str(profile.get("cohort") or ""),
-        str(profile.get("stratification_key") or ""),
+        str(context.get("comparison_context_hash") or ""),
+        str(context.get("window_group") or ""),
     )
+
+
+def _window_key(profile: Dict[str, Any]) -> str:
+    context = profile.get("task_context") or {}
+    explicit = profile.get("window_id") or context.get("window_id")
+    if explicit:
+        return str(explicit)
+    return str(profile.get("window_end") or profile.get("generated_at") or "")
 
 
 def main() -> int:
@@ -111,15 +120,15 @@ def main() -> int:
 
     state = _load_state(args.state)
     flagged_once = set(state.get("flagged", []))
-    strata: Dict[Tuple[str, str, str, str, str, str, str], List[Dict[str, Any]]] = {}
+    strata: Dict[Tuple[str, str, str, str, str, str, str, str], List[Dict[str, Any]]] = {}
     for profile in profiles:
         if profile.get("cohort") != "treatment" or profile.get("rate") is None:
             continue
         strata.setdefault(_profile_key(profile), []).append(profile)
     for stratum, series in strata.items():
-        series = sorted(series, key=_window_time)
-        latest_time = _window_time(series[-1])
-        window = [p for p in series if _window_time(p) == latest_time]
+        series = sorted(series, key=lambda item: (_window_key(item), _window_time(item)))
+        latest_window = _window_key(series[-1])
+        window = [p for p in series if _window_key(p) == latest_window]
         applicable = sum(int(p.get("applicable_episodes", 0) or 0) for p in window)
         if applicable < args.min_sample:
             continue

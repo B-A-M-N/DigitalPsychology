@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover
 PROFILE_VERSION = "1.0.0"
 ROUTING_STATUSES = {"candidate", "validated", "active", "stale", "rolled_back"}
 ROUTING_EXPERIMENT_VERSION = "1.0.0"
+ROUTING_PACK_VERSION = "1.0.0"
 
 
 class RoutingProfileError(ValueError):
@@ -30,6 +31,23 @@ class RoutingProfileError(ValueError):
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def routing_pack_semantic_hash(pack: Mapping[str, Any]) -> str:
+    body = dict(pack)
+    body.pop("semantic_hash", None)
+    return hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
+
+
+def build_routing_pack(profiles: Iterable[Mapping[str, Any]], *,
+                       source_revision: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "routing_pack_version": ROUTING_PACK_VERSION,
+        "source_revision": source_revision or None,
+        "profiles": [dict(profile) for profile in profiles],
+    }
+    payload["semantic_hash"] = routing_pack_semantic_hash(payload)
+    return payload
 
 
 def profile_semantic_hash(profile: Mapping[str, Any]) -> str:
@@ -445,11 +463,14 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
     from .trajectories import build_trajectories
 
     event_list = list(events)
-    _episodes, tasks, sessions, _agents = build_trajectories(event_list)
+    _episodes, tasks, _sessions, _agents = build_trajectories(event_list)
     event_to_session: dict[str, str] = {}
-    for session in sessions:
-        for event in session.events:
-            event_to_session[event.event_id] = session.trajectory_id
+    for task in tasks:
+        for event in task.events:
+            # The experimental unit is an independent task attempt, not a
+            # log line and not a whole long-lived session containing several
+            # tasks.
+            event_to_session[event.event_id] = task.trajectory_id
     grouped: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
     for event in event_list:
         if event.event_type != "route_outcome":
@@ -463,9 +484,14 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
         trajectory_id = event_to_session.get(event.event_id)
         if not trajectory_id or not payload.get("route_decision_id"):
             continue
-        context = dict(task_context.get(
-            f"{event.session_id}:{event.task_id}:{event.attempt_id}",
-            task_context.get(f"{event.session_id}:{event.task_id}", {})))
+        context_value = task_context.get(
+            f"{event.session_id}:{event.task_id}:{event.attempt_id}")
+        if not isinstance(context_value, Mapping):
+            # Schema-v2 routing evidence is never attributed through a
+            # task-only fallback; legacy imports must be explicitly adapted
+            # before they can become promotion-grade evidence.
+            continue
+        context = dict(context_value)
         plan = context.get("routing_experiment_plan")
         cohort = context.get("routing_cohort")
         if not isinstance(plan, Mapping) or cohort not in {"control", "treatment"}:

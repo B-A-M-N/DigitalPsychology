@@ -1725,6 +1725,17 @@ class GuardCompiler:
             return {"error": "supersession cycle",
                     "cycles": sorted(set(cycles)),
                     "active": [], "estimated_tokens": 0}
+        families: Dict[str, List[Guard]] = {}
+        for guard in remaining:
+            families.setdefault(guard.family or guard.id.split("@")[0], []).append(guard)
+        duplicate_families = {
+            family: sorted(item.key for item in members)
+            for family, members in families.items() if len(members) > 1
+        }
+        if duplicate_families:
+            return {"error": "multiple effective guard versions without explicit supersession",
+                    "families": duplicate_families,
+                    "active": [], "estimated_tokens": 0}
         if not remaining:
             # supersession removed everything (cyclic/self-destructive set) —
             # never resurrect: fail compilation

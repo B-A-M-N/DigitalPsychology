@@ -57,13 +57,72 @@ class SessionTrajectory:
 
 
 @dataclass
+class InteractionTrajectory:
+    """Delegation topology above individual session trajectories."""
+
+    interaction_id: str
+    session_trajectory_ids: tuple[str, ...]
+    agent_instance_ids: tuple[str, ...]
+    roles: tuple[str, ...]
+    event_ids: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"interaction_id": self.interaction_id,
+                "session_trajectory_ids": list(self.session_trajectory_ids),
+                "agent_instance_ids": list(self.agent_instance_ids),
+                "roles": list(self.roles), "event_ids": list(self.event_ids)}
+
+
+def build_interaction_trajectories(sessions: Iterable[SessionTrajectory]) -> list[InteractionTrajectory]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for session in sessions:
+        by_interaction: dict[str, list[Event]] = {}
+        for event in session.events:
+            if event.interaction_id:
+                by_interaction.setdefault(event.interaction_id, []).append(event)
+        for interaction_id, events in by_interaction.items():
+            item = grouped.setdefault(interaction_id, {"sessions": set(), "agents": set(),
+                                                       "roles": set(), "events": set()})
+            item["sessions"].add(session.trajectory_id)
+            item["agents"].add(session.agent_instance_id)
+            item["roles"].update(event.role for event in events if event.role)
+            item["events"].update(event.event_id for event in events)
+    return [InteractionTrajectory(
+        interaction_id=interaction_id,
+        session_trajectory_ids=tuple(sorted(item["sessions"])),
+        agent_instance_ids=tuple(sorted(item["agents"])),
+        roles=tuple(sorted(item["roles"])),
+        event_ids=tuple(sorted(item["events"])),
+    ) for interaction_id, item in sorted(grouped.items())]
+
+
+@dataclass
 class AgentProfile:
     agent_instance_id: str
     session_trajectories: List[SessionTrajectory] = field(default_factory=list)
+    interaction_trajectories: List[InteractionTrajectory] = field(default_factory=list)
+
+    @property
+    def behavioral_tendencies(self) -> dict[str, Any]:
+        tasks = [task for session in self.session_trajectories for task in session.tasks]
+        events = [event for task in tasks for event in task.events]
+        subjects: dict[str, int] = {}
+        for task in tasks:
+            subjects[task.behavioral_subject] = subjects.get(task.behavioral_subject, 0) + 1
+        return {
+            "independent_session_count": len(self.session_trajectories),
+            "independent_task_count": len(tasks),
+            "episode_count": sum(len(task.episodes) for task in tasks),
+            "event_count": len(events),
+            "task_counts_by_behavioral_subject": subjects,
+            "interaction_count": len(self.interaction_trajectories),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {"agent_instance_id": self.agent_instance_id,
-                "session_trajectories": [session.to_dict() for session in self.session_trajectories]}
+                "session_trajectories": [session.to_dict() for session in self.session_trajectories],
+                "interaction_trajectories": [item.to_dict() for item in self.interaction_trajectories],
+                "behavioral_tendencies": self.behavioral_tendencies}
 
 
 def build_trajectories(events: Iterable[Event], *, window_minutes: float = 30.0) -> tuple[list[Episode], list[TaskTrajectory], list[SessionTrajectory], list[AgentProfile]]:
@@ -93,8 +152,16 @@ def build_trajectories(events: Iterable[Event], *, window_minutes: float = 30.0)
         interaction_ids.update(event.interaction_id for event in task.events if event.interaction_id)
         session.interaction_ids = tuple(sorted(interaction_ids))
     session_list = sorted(sessions.values(), key=lambda item: item.trajectory_id)
+    interaction_list = build_interaction_trajectories(session_list)
+    interactions_by_agent: dict[str, list[InteractionTrajectory]] = {}
+    for interaction in interaction_list:
+        for agent_instance_id in interaction.agent_instance_ids:
+            interactions_by_agent.setdefault(agent_instance_id, []).append(interaction)
     agents: dict[str, AgentProfile] = {}
     for session in session_list:
-        agents.setdefault(session.agent_instance_id, AgentProfile(session.agent_instance_id)).session_trajectories.append(session)
+        profile = agents.setdefault(session.agent_instance_id, AgentProfile(session.agent_instance_id))
+        profile.session_trajectories.append(session)
+    for agent_instance_id, profile in agents.items():
+        profile.interaction_trajectories = interactions_by_agent.get(agent_instance_id, [])
     agent_list = [agents[key] for key in sorted(agents)]
     return episodes, task_list, session_list, agent_list

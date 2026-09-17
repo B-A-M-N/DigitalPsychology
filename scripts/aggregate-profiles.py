@@ -12,11 +12,14 @@ Pipeline contract:
     monitor-guards profiles.json
 (or library calls around the same store). Profiles join a per-task context
 sidecar keyed by task_id (model/harness/guard pack/toolset/framework hash)
-instead of repeating metadata per event.
+instead of repeating metadata per event. Schema-v2 manifests are keyed by
+session/task/attempt; task-only attribution is treated as legacy and is not
+promotion-grade.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -27,7 +30,7 @@ from typing import Any, Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lib.feedback_loop import load_events, EVALUATORS, ProbeRunner, EpisodeBuilder  # noqa: E402
-from lib.routing_profiles import derive_profiles  # noqa: E402
+from lib.routing_profiles import build_routing_pack, derive_profiles  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,19 +49,40 @@ def evaluator_for(guard: Dict[str, Any]) -> str | None:
 
 
 def _episode_context(episode, task_context: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    session_key = f"{getattr(episode, 'session_id', '')}:{getattr(episode, 'task_id', '')}"
-    return task_context.get(session_key,
-                            task_context.get(getattr(episode, "task_id", ""), {}))
+    session_id = getattr(episode, "session_id", "")
+    task_id = getattr(episode, "task_id", "")
+    attempt_id = getattr(episode, "attempt_id", "")
+    if session_id and task_id and attempt_id:
+        return dict(task_context.get(f"{session_id}:{task_id}:{attempt_id}", {}))
+    # Legacy imports are deliberately explicit and never silently promoted.
+    return dict(task_context.get(f"legacy:{task_id}", {}))
 
 
 def _context_key(context: Dict[str, Any]) -> Tuple[Any, ...]:
-    return (context.get("agent_instance_id"), context.get("session_id"),
-            context.get("attempt_id"), context.get("behavioral_subject"),
-            context.get("model"), context.get("harness"), context.get("task_family"),
-            context.get("environment"), context.get("policy_hash") or context.get("framework_policy_hash"),
-            tuple(sorted((context.get("statework_versions") or context.get("stateworks") or {}).items())),
+    return (context.get("agent_instance_id"), context.get("model"),
+            context.get("harness"), context.get("task_family"),
+            context.get("task_shape"), tuple(sorted(context.get("domain_tags") or ())),
+            context.get("phase"), context.get("environment"),
+            context.get("framework_version"),
+            json.dumps(context.get("statework_versions") or context.get("stateworks") or {},
+                       sort_keys=True, separators=(",", ":")),
             context.get("guard_pack_hash") or context.get("guard_pack"), context.get("toolset"),
-            context.get("cohort"))
+            context.get("comparison_context_hash"), context.get("cohort"),
+            context.get("window_id"))
+
+
+def _window_id(context: Dict[str, Any], event_times: List[str], window_minutes: float) -> str:
+    explicit = context.get("window_id") or context.get("experiment_batch_id")
+    if explicit:
+        return str(explicit)
+    if not event_times:
+        return "unknown"
+    try:
+        instant = datetime.fromisoformat(str(min(event_times)).replace("Z", "+00:00"))
+        bucket = int(instant.timestamp() // max(window_minutes * 60.0, 1.0))
+        return f"utc-{bucket}"
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
 
 
 def _guard_scope_matches(guard: Dict[str, Any], context: Dict[str, Any]) -> bool:
@@ -161,21 +185,25 @@ def aggregate(events, pack: Dict[str, Any], task_context: Dict[str, Dict[str, An
             if cohort == "ineligible":
                 continue
             context["cohort"] = cohort
+            event_times = [event.timestamp for event in ep.events]
+            context["window_id"] = _window_id(context, event_times, window_minutes)
+            # The statistical key is intentionally independent of session and
+            # attempt identity. Those values remain provenance on each trial.
             key = _context_key(context)
             bucket = buckets.setdefault(key, {
-                "context": context, "cohort": cohort, "applicable": 0, "passing": 0,
+                "context": context, "cohort": cohort, "trials": {},
                 "ci_low": [], "ci_high": [], "window_start": None, "window_end": None,
             })
-            event_times = [event.timestamp for event in ep.events]
             if event_times:
                 bucket["window_start"] = min(x for x in [bucket["window_start"], min(event_times)] if x)
                 bucket["window_end"] = max(x for x in [bucket["window_end"], max(event_times)] if x)
-            bucket["applicable"] += 1
-            if result.passed:
-                bucket["passing"] += 1
+            trajectory_key = json.dumps(context["trajectory_key"], separators=(",", ":"))
+            trial = bucket["trials"].setdefault(
+                trajectory_key, {"passing": True, "trajectory_key": context["trajectory_key"]})
+            trial["passing"] = bool(trial["passing"] and result.passed)
         for key, bucket in buckets.items():
-            applicable = bucket["applicable"]
-            passing = bucket["passing"]
+            applicable = len(bucket["trials"])
+            passing = sum(1 for trial in bucket["trials"].values() if trial["passing"])
             rate = passing / applicable if applicable else None
             z = 1.96
             ci_low = ci_high = None
@@ -199,6 +227,8 @@ def aggregate(events, pack: Dict[str, Any], task_context: Dict[str, Dict[str, An
                 "ci_upper_bound": round(ci_high, 4) if ci_high is not None else None,
                 "window_start": bucket["window_start"] or "",
                 "window_end": bucket["window_end"] or "",
+                "window_id": bucket["context"].get("window_id", "unknown"),
+                "trajectory_ids": [trial["trajectory_key"] for trial in bucket["trials"].values()],
                 "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "window": "",
                 "task_context": bucket["context"],
@@ -230,9 +260,12 @@ def load_task_context(path: Path | None, *, diagnostics: Dict[str, List[str]] | 
                 diagnostics["invalid_manifests"].append(str(manifest))
                 continue
             session_id = data.get("session_id")
-            if session_id:
-                contexts[f"{session_id}:{task_id}"] = data
-            contexts[task_id] = data
+            attempt_id = data.get("attempt_id")
+            if session_id and attempt_id:
+                contexts[f"{session_id}:{task_id}:{attempt_id}"] = data
+            else:
+                data["legacy_context"] = True
+                contexts[f"legacy:{task_id}"] = data
         return contexts
     if not path.exists():
         diagnostics["invalid_manifests"].append(str(path))
@@ -245,7 +278,18 @@ def load_task_context(path: Path | None, *, diagnostics: Dict[str, List[str]] | 
     if not isinstance(data, dict):
         diagnostics["invalid_manifests"].append(str(path))
         return {}
-    return data.get("tasks", {})
+    contexts: Dict[str, Dict[str, Any]] = {}
+    for key, value in (data.get("tasks", {}) or {}).items():
+        if not isinstance(value, dict):
+            continue
+        task_id = value.get("task_id") or key
+        if value.get("session_id") and value.get("attempt_id"):
+            contexts[f"{value['session_id']}:{task_id}:{value['attempt_id']}"] = value
+        else:
+            value = dict(value)
+            value["legacy_context"] = True
+            contexts[f"legacy:{task_id}"] = value
+    return contexts
 
 
 def main() -> int:
@@ -279,9 +323,18 @@ def main() -> int:
     diagnostics: Dict[str, List[str]] = {}
     task_context = load_task_context(context_path, diagnostics=diagnostics)
     event_tasks = {getattr(event, "task_id", "") for event in events if getattr(event, "task_id", "")}
-    diagnostics["unattributed_tasks"] = sorted(event_tasks - set(task_context))
+    def event_context(event):
+        session_id = getattr(event, "session_id", "")
+        task_id = getattr(event, "task_id", "")
+        attempt_id = getattr(event, "attempt_id", "")
+        if session_id and task_id and attempt_id:
+            return task_context.get(f"{session_id}:{task_id}:{attempt_id}")
+        return task_context.get(f"legacy:{task_id}")
+
+    diagnostics["unattributed_tasks"] = sorted(
+        {getattr(event, "task_id", "") for event in events if event_context(event) is None})
     for event in events:
-        context = task_context.get(getattr(event, "task_id", ""), {})
+        context = event_context(event) or {}
         expected = context.get("policy_hash") or context.get("framework_policy_hash")
         actual = (getattr(event, "payload", {}) or {}).get("policy_hash")
         if expected and actual and expected != actual:
@@ -299,8 +352,9 @@ def main() -> int:
         print(f"Wrote {len(profiles)} profile(s) -> {args.out}")
     if args.routing_profile_out:
         args.routing_profile_out.parent.mkdir(parents=True, exist_ok=True)
-        artifact: Any = (routing_profiles[0] if len(routing_profiles) == 1
-                         else {"profiles": routing_profiles})
+        source_revision = hashlib.sha256(
+            args.event_store.read_bytes() + args.guard_pack.read_bytes()).hexdigest()
+        artifact: Any = build_routing_pack(routing_profiles, source_revision=source_revision)
         args.routing_profile_out.write_text(json.dumps(artifact, indent=2) + "\n",
                                             encoding="utf-8")
         print(f"Wrote {len(routing_profiles)} routing profile(s) -> {args.routing_profile_out}")
