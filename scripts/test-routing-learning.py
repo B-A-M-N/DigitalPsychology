@@ -29,7 +29,7 @@ def candidate_and_plan():
     context = {
         "task_family": "performance", "task_shape": "performance",
         "domain_tags": [], "phase": None, "environment": "test",
-        "toolset": "fixture", "statework_versions": "{}",
+        "toolset": "fixture", "statework_versions": {},
         "framework_version": "1.4.0", "guard_pack_hash": "guard-pack",
     }
     candidate = build_profile(
@@ -46,8 +46,8 @@ def candidate_and_plan():
         experiment_id="experiment-1", candidate_profile_hash=candidate["profile_hash"],
         candidate_profile_id=candidate["profile_id"], candidate_adjustment=adjustment,
         eligibility={"field": "task_family", "equals": "performance"},
-        target_evaluator="route-success-v1", control_policy_identity="control",
-        treatment_policy_identity="treatment", canary_fraction=0.5)
+        target_evaluator="route-success-v1", control_policy_identity="control-policy-v1",
+        treatment_policy_identity="treatment-policy-v1", canary_fraction=0.5)
     return candidate, plan
 
 
@@ -84,7 +84,7 @@ def main() -> int:
             "agent_instance_id": "agent-a", "model": "model-a", "harness": "test",
             "task_family": "performance", "task_shape": "performance", "domain_tags": [],
             "phase": None, "environment": "test", "toolset": "fixture",
-            "statework_versions": "{}", "framework_version": "1.4.0",
+            "statework_versions": {}, "framework_version": "1.4.0",
             "guard_pack_hash": "guard-pack", "policy_hash": cohort,
             "routing_experiment_plan": plan, "routing_cohort": cohort,
             "candidate_profile_hash": plan["candidate_profile_hash"],
@@ -114,6 +114,12 @@ def main() -> int:
             candidate, [{"profile_hash": candidate["profile_hash"],
                          "trajectory_id": "post-2", "eligible": True}])
         assert updated["status"] == "stale"
+        rolled = RoutingLifecycleStore(Path(raw) / "state.json").rollback(
+            updated, reason="regression observed", receipt_ref="rollback-1")
+        assert rolled["status"] == "rolled_back" and rolled["lifecycle_reason"] == "regression observed"
+        rejected = RoutingLifecycleStore(Path(raw) / "state.json").reject(
+            rolled, reason="operator rejected intervention", evidence_refs=["evt-reject"])
+        assert rejected["status"] == "stale" and rejected["lifecycle_reason"] == "operator rejected intervention"
     print("ok: post-deployment trajectory budget expires a profile")
 
     compiler = GuardCompiler(token_budget=200)

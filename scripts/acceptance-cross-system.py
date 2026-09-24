@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CFW_ROOT = ROOT.parent / "CognitiveFrameWorks"
 sys.path.insert(0, str(ROOT))
 from lib.feedback_loop import (Guard, GuardRegistry, ReceiptBuilder,  # noqa: E402
-                               ReceiptRegistry, guard_semantic_hash)
+                               ReceiptRegistry, TrialEvidence, guard_semantic_hash)
 from lib.receipts import DEFAULT_PRODUCTION_CRITERION  # noqa: E402
 
 
@@ -44,6 +44,19 @@ def load_module(name: str, path: Path):
     if name == "cross_runtime":
         assert module.resolve_runtime is sys.modules["cross_resolve_runtime"]
     return module
+
+
+def trial_map(values, policy):
+    return {
+        trial_id: TrialEvidence(
+            trial_id=trial_id, trajectory_id=f"trajectory-{trial_id}",
+            probe_id="registered-probe", probe_version="1",
+            policy_hash=policy, execution_policy_hash=policy,
+            session_id=f"session-{trial_id}", task_id=f"task-{trial_id}",
+            attempt_id="attempt-1", outcome=outcome,
+            host_evidence_ref=f"evt-{trial_id}")
+        for trial_id, outcome in values.items()
+    }
 
 
 def main() -> int:
@@ -64,9 +77,9 @@ def main() -> int:
                                          guard_semantic_hash=guard_semantic_hash(guard),
                                          criterion=DEFAULT_PRODUCTION_CRITERION)
         validation_outputs = {
-            **{f"b{i}": "FAIL" for i in range(10)},
-            **{f"i{i}": "PASS" for i in range(10)},
-            **{f"h{i}": "PASS" for i in range(10)},
+            **trial_map({f"b{i}": "FAIL" for i in range(10)}, "baseline-policy"),
+            **trial_map({f"i{i}": "PASS" for i in range(10)}, "candidate-policy"),
+            **trial_map({f"h{i}": "PASS" for i in range(10)}, "holdout-policy"),
         }
         validation = receipt_builder.build(
             guard_key="G-cross-system@1",
@@ -108,14 +121,14 @@ def main() -> int:
         resolve_runtime.runtime_state_dir = lambda: runtime_root
 
         canary_request = resolve_runtime.TaskRequest(
-            task_id="canary-task", subject_ref="claim", shape="implement",
+            task_id="canary-task", application_id="digital-psychology", subject_ref="claim", shape="implement",
             domain_tags=("debug",), model="no-model", harness="cross-system")
         canary_bundle = resolve_runtime.resolve(canary_request)
         canary_keys = {g["key"] for g in canary_bundle.guard_pack["guards"]}
         assert "G-cross-system@1" in canary_keys, canary_keys
         noncanary_bundle = resolve_runtime.resolve(
             resolve_runtime.TaskRequest(
-                task_id="noncanary-task", subject_ref="claim", shape="implement",
+                task_id="noncanary-task", application_id="digital-psychology", subject_ref="claim", shape="implement",
                 domain_tags=("debug",), model="no-model", harness="cross-system"))
         assert "G-cross-system@1" not in {
             g["key"] for g in noncanary_bundle.guard_pack["guards"]}
@@ -139,9 +152,9 @@ def main() -> int:
             "tool_result", "contradiction", "blocker"}
 
         canary_outputs = {
-            **{f"cb{i}": "FAIL" for i in range(10)},
-            **{f"c{i}": "PASS" for i in range(10)},
-            **{f"ch{i}": "PASS" for i in range(10)},
+            **trial_map({f"cb{i}": "FAIL" for i in range(10)}, "active-policy"),
+            **trial_map({f"c{i}": "PASS" for i in range(10)}, "canary-policy"),
+            **trial_map({f"ch{i}": "PASS" for i in range(10)}, "holdout-policy"),
         }
         canary = receipt_builder.build(
             guard_key="G-cross-system@1",

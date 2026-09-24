@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from lib.feedback_loop import (  # noqa: E402
     EpisodeBuilder, Guard, GuardRegistry, ProbeRunner, ReceiptBuilder,
-    ReceiptRegistry, guard_semantic_hash, load_events,
+    ReceiptRegistry, TrialEvidence, guard_semantic_hash, load_events,
 )
 from lib.receipts import DEFAULT_PRODUCTION_CRITERION  # noqa: E402
 
@@ -104,10 +104,29 @@ def main() -> int:
             evaluator_version_hash="bad_action_is_structurally_blocked@1",
             guard_semantic_hash=guard_semantic_hash(guard),
             criterion=DEFAULT_PRODUCTION_CRITERION)
+
+        def validation_trials(prefix, outcome, policy_hash):
+            values = {}
+            for index in range(10):
+                trial_id = f"{prefix}{index}"
+                values[trial_id] = TrialEvidence(
+                    trial_id=trial_id,
+                    trajectory_id=f"validation-trajectory-{trial_id}",
+                    probe_id="bad_action_is_structurally_blocked",
+                    probe_version="1",
+                    policy_hash=policy_hash,
+                    execution_policy_hash=policy_hash,
+                    session_id=f"validation-session-{trial_id}",
+                    task_id=f"validation-task-{trial_id}",
+                    attempt_id="attempt-1",
+                    outcome=outcome,
+                    host_evidence_ref=f"validation-evidence-{trial_id}")
+            return values
+
         validation_outputs = {
-            **{f"vb{i}": "FAIL" for i in range(10)},
-            **{f"vi{i}": "PASS" for i in range(10)},
-            **{f"vh{i}": "PASS" for i in range(10)},
+            **validation_trials("vb", "FAIL", "baseline-policy"),
+            **validation_trials("vi", "PASS", "candidate-policy"),
+            **validation_trials("vh", "PASS", "holdout-policy"),
         }
         validation = lifecycle_builder.build(
             guard_key="G-three-system@1", kind="validation",
@@ -149,7 +168,7 @@ def main() -> int:
             for index in range(count):
                 task_id = f"{prefix}-{index}"
                 request = resolve_runtime.TaskRequest(
-                    task_id=task_id, subject_ref=f"subject:{task_id}", shape="quick",
+                    task_id=task_id, application_id="digital-psychology", subject_ref=f"subject:{task_id}", shape="quick",
                     model="model-a", harness="offline-harness", toolset="fixture",
                     observation_context={})
                 bundle = resolve_runtime.resolve(request)
@@ -177,23 +196,31 @@ def main() -> int:
 
         def outputs(groups, evaluator="bad_action_is_structurally_blocked"):
             values = {}
-            for task_id, _bundle, events in groups:
+            for task_id, bundle, events in groups:
                 builder = EpisodeBuilder()
                 for event in events:
                     builder.add(event)
                 built = builder.build()
                 assert built, task_id
-                values[task_id] = runner.run(
-                    evaluator, events).outcome
+                result = runner.run(evaluator, events)
+                first = built[0].events[0]
+                policy_hash = bundle.pinned["policy_hash"]
+                values[task_id] = TrialEvidence(
+                    trial_id=task_id, trajectory_id=f"{task_id}:{built[0].episode_id}",
+                    probe_id=result.probe_id, probe_version="1",
+                    policy_hash=policy_hash, execution_policy_hash=policy_hash,
+                    session_id=first.session_id or f"session:{task_id}",
+                    task_id=task_id, attempt_id=first.attempt_id,
+                    outcome=result.outcome, host_evidence_ref=first.event_id)
             return values
 
         control_outputs = outputs(task_groups["control"])
         treatment_outputs = outputs(task_groups["treatment"])
         holdout_outputs = outputs(task_groups["holdout"],
                                   evaluator="completion_has_boundary_evidence")
-        assert set(control_outputs.values()) == {"FAIL"}
-        assert set(treatment_outputs.values()) == {"PASS"}
-        assert set(holdout_outputs.values()) == {"PASS"}
+        assert {item.outcome for item in control_outputs.values()} == {"FAIL"}
+        assert {item.outcome for item in treatment_outputs.values()} == {"PASS"}
+        assert {item.outcome for item in holdout_outputs.values()} == {"PASS"}
 
         receipt_builder = ReceiptBuilder(
             evaluator_version_hash="bad_action_is_structurally_blocked@1",

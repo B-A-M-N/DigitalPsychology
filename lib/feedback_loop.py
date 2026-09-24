@@ -24,6 +24,7 @@ it never imports this module.
 from __future__ import annotations
 
 import hashlib
+import copy
 import fcntl
 import json
 import os
@@ -31,6 +32,7 @@ import re
 import sqlite3
 import tempfile
 import uuid
+from importlib.resources import files as resource_files
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,8 +41,10 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Proto
 from .guard_contracts import guard_semantic_hash
 from .events import CATEGORIES, SCHEMA_VERSION
 from .policy import ALLOWED_TRANSITIONS, GUARD_STATUS, PRIORITY
-from .receipts import (DEFAULT_EXPERIMENT_CRITERION, MIN_EVIDENCE_SAMPLES,
-                       RECEIPT_BUILDER_VERSION, wilson_interval)
+from .receipts import (DEFAULT_EXPERIMENT_CRITERION, DEFAULT_PRODUCTION_CRITERION,
+                       MIN_EVIDENCE_SAMPLES,
+                       RECEIPT_BUILDER_VERSION, RECEIPT_PROVENANCE_VERSION,
+                       is_production_grade_criterion, wilson_interval)
 from .versions import (GUARD_REGISTRY_SCHEMA_VERSION,
                        RECEIPT_REGISTRY_SCHEMA_VERSION)
 
@@ -130,6 +134,55 @@ class ReceiptError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class TrialEvidence:
+    """Host-produced, immutable evidence for one causal trial."""
+
+    trial_id: str
+    trajectory_id: str
+    probe_id: str
+    probe_version: str
+    policy_hash: str
+    execution_policy_hash: str
+    session_id: str
+    task_id: str
+    attempt_id: str
+    outcome: str
+    host_evidence_ref: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "trial_id", "trajectory_id", "probe_id", "probe_version",
+            "policy_hash", "execution_policy_hash", "session_id", "task_id",
+            "attempt_id", "host_evidence_ref",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ReceiptError(f"trial evidence requires non-empty {name}")
+        if self.outcome not in TRI_STATE:
+            raise ReceiptError(f"unknown trial outcome {self.outcome!r}")
+
+    def to_record(self) -> Tuple[str, ...]:
+        return (
+            self.trial_id, self.trajectory_id, self.probe_id, self.probe_version,
+            self.policy_hash, self.execution_policy_hash, self.session_id,
+            self.task_id, self.attempt_id, self.host_evidence_ref, self.outcome,
+        )
+
+
+def _research_trial_evidence(trial_id: str, value: Any) -> TrialEvidence:
+    """Wrap legacy scalar output without making it production evidence."""
+    outcome = PASS if value is True else FAIL if value is False else value
+    if outcome not in TRI_STATE:
+        raise ReceiptError(f"unknown research trial outcome {outcome!r}")
+    marker = f"research-only:{trial_id}"
+    return TrialEvidence(
+        trial_id=trial_id, trajectory_id=marker, probe_id=marker,
+        probe_version="research-only", policy_hash=marker,
+        execution_policy_hash=marker, session_id=marker, task_id=marker,
+        attempt_id=marker, outcome=str(outcome), host_evidence_ref=marker)
+
+
 
 
 @dataclass(frozen=True)
@@ -163,16 +216,19 @@ class ValidationReceipt:
     baseline_outcomes: Tuple[Tuple[str, str], ...] = ()
     intervention_outcomes: Tuple[Tuple[str, str], ...] = ()
     holdout_outcomes: Tuple[Tuple[str, str], ...] = ()
-    # (trial_id, probe_id, probe_version, policy_hash,
-    #  execution_policy_hash, outcome)
-    baseline_trials: Tuple[Tuple[str, str, str, str, str, str], ...] = ()
-    intervention_trials: Tuple[Tuple[str, str, str, str, str, str], ...] = ()
-    holdout_trials: Tuple[Tuple[str, str, str, str, str, str], ...] = ()
+    # (trial_id, trajectory_id, probe_id, probe_version, policy_hash,
+    #  execution_policy_hash, session_id, task_id, attempt_id,
+    #  host_evidence_ref, outcome)
+    baseline_trials: Tuple[Tuple[str, ...], ...] = ()
+    intervention_trials: Tuple[Tuple[str, ...], ...] = ()
+    holdout_trials: Tuple[Tuple[str, ...], ...] = ()
     baseline_ci_lower: Optional[float] = None
     baseline_ci_upper: Optional[float] = None
     intervention_ci_lower: Optional[float] = None
     intervention_ci_upper: Optional[float] = None
-    receipt_signature: str = ""
+    provenance_version: str = RECEIPT_PROVENANCE_VERSION
+    research_only: bool = False
+    content_hash: str = ""
     builder_version: str = ""
     criterion: Mapping[str, Any] = field(default_factory=lambda: dict(DEFAULT_EXPERIMENT_CRITERION))
 
@@ -202,6 +258,8 @@ class ValidationReceipt:
             "baseline_trial_ids": list(self.baseline_trial_ids),
             "intervention_trial_ids": list(self.intervention_trial_ids),
             "holdout_trial_ids": list(self.holdout_trial_ids),
+            "provenance_version": self.provenance_version,
+            "research_only": self.research_only,
             "baseline_count": self.baseline_count,
             "intervention_count": self.intervention_count,
             "holdout_count": self.holdout_count,
@@ -228,40 +286,17 @@ class ValidationReceipt:
             "baseline_ci_upper": self.baseline_ci_upper,
             "intervention_ci_lower": self.intervention_ci_lower,
             "intervention_ci_upper": self.intervention_ci_upper,
-            "receipt_signature": self.receipt_signature,
+            "content_hash": self.content_hash,
             "builder_version": self.builder_version,
             "criterion": dict(self.criterion),
         }
 
 
-def _receipt_signature(receipt: ValidationReceipt) -> str:
+def _receipt_content_hash(receipt: ValidationReceipt) -> str:
     body = json.dumps({k: v for k, v in receipt.to_dict().items()
-                       if k != "receipt_signature"}, sort_keys=True,
+                       if k != "content_hash"}, sort_keys=True,
                       separators=(",", ":"))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-
-def _trial_outcome(value: Any) -> Tuple[str, Dict[str, str]]:
-    """Normalize a probe output without trusting caller-supplied rates."""
-    metadata: Dict[str, str] = {}
-    if isinstance(value, Mapping):
-        outcome = value.get("outcome")
-        for key in ("probe_id", "probe_version", "policy_hash", "execution_policy_hash"):
-            if value.get(key) is not None:
-                metadata[key] = str(value[key])
-    elif hasattr(value, "outcome"):
-        outcome = getattr(value, "outcome")
-        for key in ("probe_id", "probe_version", "policy_hash", "execution_policy_hash"):
-            item = getattr(value, key, None)
-            if item is not None:
-                metadata[key] = str(item)
-    elif isinstance(value, bool):
-        outcome = PASS if value else FAIL
-    else:
-        outcome = value
-    if outcome not in TRI_STATE:
-        raise ReceiptError(f"unknown trial outcome {outcome!r}")
-    return str(outcome), metadata
 
 
 class ReceiptBuilder:
@@ -274,21 +309,34 @@ class ReceiptBuilder:
     """
 
     def __init__(self, *, evaluator_version_hash: str, guard_semantic_hash: str,
-                 criterion: Optional[Mapping[str, Any]] = None) -> None:
+                 criterion: Optional[Mapping[str, Any]] = None,
+                 research_only: bool = False) -> None:
         if not evaluator_version_hash or not guard_semantic_hash:
             raise ReceiptError("receipt builder requires evaluator and guard semantic hashes")
         self.evaluator_version_hash = evaluator_version_hash
         self.guard_semantic_hash = guard_semantic_hash
+        if criterion is DEFAULT_PRODUCTION_CRITERION:
+            supplied_criterion = dict(DEFAULT_PRODUCTION_CRITERION)
+        else:
+            supplied_criterion = dict(criterion or {})
+            if criterion is not None and supplied_criterion == DEFAULT_PRODUCTION_CRITERION:
+                # A copied production-looking mapping is not the trusted
+                # built-in criterion.  Keep it visibly caller-authored so
+                # promotion gates cannot accept a forged production policy.
+                supplied_criterion["caller_authored"] = True
         self.criterion = dict(DEFAULT_EXPERIMENT_CRITERION)
-        self.criterion.update(dict(criterion or {}))
+        self.criterion.update(supplied_criterion)
+        self.research_only = bool(research_only)
+        if self.research_only:
+            self.criterion["research_only"] = True
         if not self.criterion.get("version") or not self.criterion.get("evaluator_version"):
             raise ReceiptError("promotion criteria require version and evaluator_version")
 
     @staticmethod
     def _group(ids: Iterable[str], outputs: Mapping[str, Any],
-               *, policy_hashes: Tuple[str, ...], evaluator_version_hash: str
+               *, policy_hashes: Tuple[str, ...], research_only: bool
                ) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, str], ...],
-                          Tuple[Tuple[str, str, str, str, str, str], ...]]:
+                          Tuple[Tuple[str, ...], ...]]:
         trial_ids = tuple(ids)
         if not trial_ids or len(set(trial_ids)) != len(trial_ids):
             raise ReceiptError("trial IDs must be non-empty and unique within a cohort")
@@ -296,14 +344,23 @@ class ReceiptBuilder:
             missing = [trial_id for trial_id in trial_ids if trial_id not in outputs]
             raise ReceiptError(f"missing probe outputs for trial IDs: {missing}")
         normalized: List[Tuple[str, str]] = []
-        records: List[Tuple[str, str, str, str, str, str]] = []
+        records: List[Tuple[str, ...]] = []
         for trial_id in trial_ids:
-            outcome, metadata = _trial_outcome(outputs[trial_id])
-            normalized.append((trial_id, outcome))
-            probe_id = metadata.get("probe_id") or evaluator_version_hash
-            probe_version = metadata.get("probe_version") or evaluator_version_hash
-            trial_policy = metadata.get("policy_hash") or policy_hashes[0]
-            execution_policy = metadata.get("execution_policy_hash") or trial_policy
+            value = outputs[trial_id]
+            if isinstance(value, TrialEvidence):
+                evidence = value
+            elif research_only:
+                evidence = _research_trial_evidence(trial_id, value)
+            else:
+                raise ReceiptError(
+                    f"trial {trial_id!r} must be a host-produced TrialEvidence object")
+            if evidence.trial_id != trial_id:
+                raise ReceiptError(f"trial {trial_id!r} evidence has a different trial_id")
+            normalized.append((trial_id, evidence.outcome))
+            trial_policy = evidence.policy_hash
+            execution_policy = evidence.execution_policy_hash
+            if not policy_hashes and not research_only:
+                raise ReceiptError("production cohorts require declared policy identities")
             if trial_policy not in policy_hashes:
                 raise ReceiptError(
                     f"trial {trial_id!r} claims policy {trial_policy!r}, "
@@ -312,8 +369,7 @@ class ReceiptBuilder:
                 raise ReceiptError(
                     f"trial {trial_id!r} executed under policy {execution_policy!r}, "
                     f"outside its declared cohort policies {policy_hashes!r}")
-            records.append((trial_id, probe_id, probe_version, trial_policy,
-                            execution_policy, outcome))
+            records.append(evidence.to_record())
         return trial_ids, tuple(normalized), tuple(records)
 
     @staticmethod
@@ -341,16 +397,24 @@ class ReceiptBuilder:
         holdout_hash = holdout_policy_hashes[0]
         baseline_ids, baseline_outcomes, baseline_trials = self._group(
             baseline_trial_ids, trial_outputs, policy_hashes=baseline_policy_hashes,
-            evaluator_version_hash=self.evaluator_version_hash)
+            research_only=self.research_only)
         intervention_ids, intervention_outcomes, intervention_trials = self._group(
             intervention_trial_ids, trial_outputs, policy_hashes=treatment_policy_hashes,
-            evaluator_version_hash=self.evaluator_version_hash)
+            research_only=self.research_only)
         holdout_ids, holdout_outcomes, holdout_trials = self._group(
             holdout_trial_ids, trial_outputs, policy_hashes=holdout_policy_hashes,
-            evaluator_version_hash=self.evaluator_version_hash)
+            research_only=self.research_only)
         groups = [baseline_ids, intervention_ids, holdout_ids]
         if len(set().union(*map(set, groups))) != sum(map(len, groups)):
             raise ReceiptError("trial IDs must be disjoint across cohorts")
+        all_records = [record for group in (baseline_trials, intervention_trials, holdout_trials)
+                       for record in group]
+        trajectory_ids = [record[1] for record in all_records]
+        task_attempts = [(record[7], record[8]) for record in all_records]
+        if len(set(trajectory_ids)) != len(trajectory_ids):
+            raise ReceiptError("trajectory IDs must be unique across cohorts")
+        if len(set(task_attempts)) != len(task_attempts):
+            raise ReceiptError("task/attempt identities must be unique across cohorts")
         baseline_rate, baseline_count = self._rate(baseline_outcomes)
         intervention_rate, intervention_count = self._rate(intervention_outcomes)
         _holdout_rate, holdout_count = self._rate(holdout_outcomes)
@@ -359,7 +423,7 @@ class ReceiptBuilder:
             self.criterion.get("min_applicable", MIN_EVIDENCE_SAMPLES))))
         if min(baseline_count, intervention_count, holdout_count) < minimum:
             raise ReceiptError(f"each cohort needs at least {minimum} applicable trials")
-        available_probes = {(record[1], record[2]) for record in
+        available_probes = {(record[2], record[3]) for record in
                             (*baseline_trials, *intervention_trials, *holdout_trials)}
         required_probes = list(self.criterion.get("regression_probes") or [])
         if self.criterion.get("target_probe"):
@@ -417,8 +481,9 @@ class ReceiptBuilder:
             intervention_ci_upper=int_high, builder_version=RECEIPT_BUILDER_VERSION,
             baseline_trials=baseline_trials, intervention_trials=intervention_trials,
             holdout_trials=holdout_trials,
-            criterion=self.criterion)
-        return replace(payload, receipt_signature=_receipt_signature(payload))
+            provenance_version=RECEIPT_PROVENANCE_VERSION,
+            research_only=self.research_only, criterion=self.criterion)
+        return replace(payload, content_hash=_receipt_content_hash(payload))
 
 
 class ReceiptRegistry:
@@ -434,9 +499,14 @@ class ReceiptRegistry:
             self.revision = int(data.get("revision", 0) or 0)
             for item in data.get("receipts", []):
                 rid = item.get("receipt_id") or item.get("id")
-                rcpt = ValidationReceipt(**{k: v for k, v in item.items() if k not in {"id", "receipt_id"}},
+                legacy_content_hash = item.get("receipt_signature")
+                rcpt = ValidationReceipt(**{k: v for k, v in item.items()
+                                           if k not in {"id", "receipt_id", "receipt_signature", "content_hash"}},
+                                         content_hash=item.get("content_hash") or legacy_content_hash or "",
                                          receipt_id=rid)
                 self._receipts[rcpt.receipt_id] = rcpt
+        self._committed_receipts = dict(self._receipts)
+        self._committed_revision = self.revision
 
     def save(self) -> None:
         if self.path is None:
@@ -444,16 +514,25 @@ class ReceiptRegistry:
         data = {"schema_version": RECEIPT_REGISTRY_SCHEMA_VERSION,
                 "revision": self.revision + 1,
                 "receipts": [r.to_dict() for r in sorted(self._receipts.values(), key=lambda r: r.receipt_id)]}
-        _durable_json_write(self.path, data, expected_revision=self.revision)
+        try:
+            _durable_json_write(self.path, data, expected_revision=self.revision)
+        except Exception:
+            # A failed CAS/write must not leave the live object claiming
+            # authority that durable storage rejected.
+            self._receipts = dict(self._committed_receipts)
+            self.revision = self._committed_revision
+            raise
         self.revision += 1
+        self._committed_receipts = dict(self._receipts)
+        self._committed_revision = self.revision
 
     def add(self, receipt: ValidationReceipt) -> None:
         if receipt.receipt_id in self._receipts:
             raise ReceiptError(f"duplicate receipt id {receipt.receipt_id}")
         if not receipt.builder_version or receipt.builder_version != RECEIPT_BUILDER_VERSION:
             raise ReceiptError("receipts must be emitted by ReceiptBuilder")
-        if receipt.receipt_signature != _receipt_signature(receipt):
-            raise ReceiptError("receipt signature does not match its content")
+        if receipt.content_hash != _receipt_content_hash(receipt):
+            raise ReceiptError("receipt content hash does not match its content")
         self._receipts[receipt.receipt_id] = receipt
 
     def get(self, receipt_id: str) -> Optional[ValidationReceipt]:
@@ -465,7 +544,11 @@ class ReceiptRegistry:
             return False
         if receipt.builder_version != RECEIPT_BUILDER_VERSION:
             return False
-        if receipt.receipt_signature != _receipt_signature(receipt):
+        if receipt.research_only:
+            return False
+        if receipt.provenance_version != RECEIPT_PROVENANCE_VERSION:
+            return False
+        if receipt.content_hash != _receipt_content_hash(receipt):
             return False
         if not receipt.guard_semantic_hash:
             return False
@@ -487,9 +570,9 @@ class ReceiptRegistry:
                 return False
             for record, trial_id, outcome_pair in zip(records, ids, outcomes):
                 _outcome_id, outcome = outcome_pair
-                if len(record) != 6 or record[0] != trial_id or record[5] != outcome:
+                if len(record) != 11 or record[0] != trial_id or record[10] != outcome:
                     return False
-                if not all(isinstance(value, str) and value for value in record[1:5]):
+                if not all(isinstance(value, str) and value for value in record[1:]):
                     return False
         declared_policy_groups = [
             set(receipt.baseline_policy_hashes),
@@ -497,9 +580,14 @@ class ReceiptRegistry:
             set(receipt.holdout_policy_hashes),
         ]
         for records, allowed in zip(trial_groups, declared_policy_groups):
-            if not allowed or any(record[3] not in allowed or record[4] not in allowed
+            if not allowed or any(record[4] not in allowed or record[5] not in allowed
                                   for record in records):
                 return False
+        all_records = [record for group in trial_groups for record in group]
+        if len({record[1] for record in all_records}) != len(all_records):
+            return False
+        if len({(record[7], record[8]) for record in all_records}) != len(all_records):
+            return False
         applicable_counts = [sum(outcome != NOT_APPLICABLE for _trial_id, outcome in outcomes)
                              for outcomes in outcome_groups]
         if [receipt.baseline_count, receipt.intervention_count, receipt.holdout_count] != applicable_counts:
@@ -524,7 +612,7 @@ class ReceiptRegistry:
         if not criterion.get("version") or not criterion.get("evaluator_version"):
             return False
         trial_records = [record for group in trial_groups for record in group]
-        available_probes = {(record[1], record[2]) for record in trial_records}
+        available_probes = {(record[2], record[3]) for record in trial_records}
         target_probe = criterion.get("target_probe")
         required_probes = list(criterion.get("regression_probes") or [])
         if target_probe:
@@ -552,6 +640,8 @@ class ReceiptRegistry:
             if int_low is None or base_high is None or int_low <= base_high:
                 return False
         if not receipt.evidence_hash or not receipt.evaluator_version_hash:
+            return False
+        if not receipt.content_hash:
             return False
         if not receipt.baseline_policy_hashes or not receipt.treatment_policy_hashes or not receipt.holdout_policy_hashes:
             return False
@@ -608,6 +698,16 @@ class Event:
     agent_id: str
     category: str
     event_type: str
+    namespace_id: str = "default"
+    application_id: str = "unknown-application"
+    application_version: Optional[str] = None
+    application_instance_id: Optional[str] = None
+    provider_id: Optional[str] = None
+    model_id: Optional[str] = None
+    model_revision: Optional[str] = None
+    model_capability_hash: Optional[str] = None
+    harness_id: Optional[str] = None
+    harness_version: Optional[str] = None
     agent_instance_id: Optional[str] = None
     session_id: Optional[str] = None
     attempt_id: str = "attempt-1"
@@ -633,6 +733,10 @@ class Event:
     payload: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not self.namespace_id or not self.application_id:
+            raise EventError("event requires namespace_id and application_id")
+        if self.application_instance_id is None:
+            self.application_instance_id = self.application_id
         if self.actor_id is None:
             self.actor_id = self.agent_id
         if self.agent_instance_id is None:
@@ -651,6 +755,9 @@ class Event:
             "schema_version": SCHEMA_VERSION,
             "event_id": self.event_id,
             "timestamp": self.timestamp,
+            "namespace_id": self.namespace_id,
+            "application_id": self.application_id,
+            "application_instance_id": self.application_instance_id,
             "agent_instance_id": self.agent_instance_id,
             "session_id": self.session_id,
             "task_id": self.task_id,
@@ -662,6 +769,11 @@ class Event:
             "category": self.category,
             "event_type": self.event_type,
         }
+        for k in ("application_version", "provider_id", "model_id", "model_revision",
+                  "model_capability_hash", "harness_id", "harness_version"):
+            value = getattr(self, k)
+            if value is not None:
+                d[k] = value
         for k in ("parent_event", "subject", "input_state", "output_state", "evidence_refs",
                   "uncertainty", "authority_source", "scope", "supersedes", "invalidates",
                   "interaction_id", "parent_session_id", "delegator_agent_id",
@@ -683,8 +795,18 @@ class EventSchema:
     @classmethod
     def load(cls) -> Dict[str, Any]:
         if cls._schema is None:
-            path = Path(__file__).resolve().parents[1] / "schemas" / "behavior-event.schema.json"
-            cls._schema = json.loads(path.read_text(encoding="utf-8"))
+            resource = None
+            for package in ("digital_psychology", "lib"):
+                try:
+                    candidate = resource_files(package).joinpath("schemas/behavior-event.schema.json")
+                    if candidate.is_file():
+                        resource = candidate
+                        break
+                except (ModuleNotFoundError, FileNotFoundError):
+                    continue
+            if resource is None:
+                resource = Path(__file__).resolve().parents[1] / "schemas" / "behavior-event.schema.json"
+            cls._schema = json.loads(resource.read_text(encoding="utf-8"))
         return cls._schema
 
     @classmethod
@@ -732,18 +854,30 @@ class NDJSONSink:
 
 
 class SQLiteSink:
-    """Concurrent-writer-safe event store using SQLite WAL."
+    """Concurrent-writer-safe event store using SQLite WAL.
 
-    Table: events(event_id PRIMARY KEY, task_id, agent_id, timestamp, payload).
+    Event identity is scoped to the producer origin.  Replay of the same
+    origin/event payload is idempotent; the same event id from another origin
+    is not treated as globally unique.
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        self._conn = sqlite3.connect(str(self.path), timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("""CREATE TABLE IF NOT EXISTS events (
-            event_id TEXT PRIMARY KEY,
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            namespace_id TEXT NOT NULL,
+            application_id TEXT NOT NULL,
+            application_instance_id TEXT NOT NULL,
+            provider_id TEXT,
+            model_id TEXT,
+            model_revision TEXT,
+            model_capability_hash TEXT,
+            harness_id TEXT,
+            harness_version TEXT,
+            event_id TEXT NOT NULL,
             agent_instance_id TEXT NOT NULL,
             session_id TEXT NOT NULL,
             task_id TEXT NOT NULL,
@@ -752,31 +886,118 @@ class SQLiteSink:
             agent_id TEXT NOT NULL,
             behavioral_subject TEXT NOT NULL,
             timestamp TEXT NOT NULL,
-            payload TEXT NOT NULL
+            payload TEXT NOT NULL,
+            UNIQUE(namespace_id, application_instance_id, event_id)
         )""")
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(events)")}
-        for name in ("agent_instance_id", "session_id", "attempt_id", "segment_id", "behavioral_subject"):
+        if "row_id" not in columns:
+            # The pre-origin schema used event_id as the global primary key.
+            # Rebuild it transactionally so two producer origins can reuse an
+            # event id without losing the legacy rows.
+            self._conn.execute("ALTER TABLE events RENAME TO events_legacy")
+            self._conn.execute("""CREATE TABLE events (
+                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace_id TEXT NOT NULL,
+                application_id TEXT NOT NULL,
+                application_instance_id TEXT NOT NULL,
+                provider_id TEXT,
+                model_id TEXT,
+                model_revision TEXT,
+                model_capability_hash TEXT,
+                harness_id TEXT,
+                harness_version TEXT,
+                event_id TEXT NOT NULL,
+                agent_instance_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                segment_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                behavioral_subject TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(namespace_id, application_instance_id, event_id)
+            )""")
+            legacy_rows = self._conn.execute(
+                "SELECT event_id, agent_instance_id, session_id, task_id, attempt_id, "
+                "segment_id, agent_id, behavioral_subject, timestamp, payload "
+                "FROM events_legacy").fetchall()
+            for row in legacy_rows:
+                (event_id, agent_instance_id, session_id, task_id, attempt_id,
+                 segment_id, agent_id, behavioral_subject, timestamp, payload) = row
+                try:
+                    payload_data = json.loads(payload)
+                except (TypeError, json.JSONDecodeError):
+                    payload_data = {}
+                if not isinstance(payload_data, dict):
+                    payload_data = {}
+                namespace_id = str(payload_data.get("namespace_id") or "default")
+                application_id = str(payload_data.get("application_id") or "unknown-application")
+                application_instance_id = str(
+                    payload_data.get("application_instance_id") or application_id)
+                for name, value in (("namespace_id", namespace_id),
+                                    ("application_id", application_id),
+                                    ("application_instance_id", application_instance_id),
+                                    ("actor_id", agent_id)):
+                    payload_data.setdefault(name, value)
+                normalized_payload = json.dumps(payload_data, sort_keys=True)
+                self._conn.execute(
+                    "INSERT INTO events (namespace_id, application_id, application_instance_id, "
+                    "event_id, agent_instance_id, session_id, task_id, attempt_id, segment_id, "
+                    "agent_id, behavioral_subject, timestamp, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (namespace_id, application_id, application_instance_id, event_id,
+                     agent_instance_id, session_id, task_id, attempt_id, segment_id,
+                     agent_id, behavioral_subject, timestamp, normalized_payload))
+            self._conn.execute("DROP TABLE events_legacy")
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(events)")}
+        for name, default in (("namespace_id", "default"),
+                              ("application_id", "unknown-application"),
+                              ("application_instance_id", "unknown-application"),
+                              ("agent_instance_id", "legacy"),
+                              ("session_id", "legacy"),
+                              ("attempt_id", "attempt-1"),
+                              ("segment_id", "segment-0"),
+                              ("behavioral_subject", "legacy")):
             if name not in columns:
-                self._conn.execute(f"ALTER TABLE events ADD COLUMN {name} TEXT NOT NULL DEFAULT 'legacy'")
+                self._conn.execute(
+                    f"ALTER TABLE events ADD COLUMN {name} TEXT NOT NULL DEFAULT {json.dumps(default)}")
+        for name in ("provider_id", "model_id", "model_revision",
+                     "model_capability_hash", "harness_id", "harness_version"):
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE events ADD COLUMN {name} TEXT")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_task ON events (task_id)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_agent ON events (agent_id)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_session ON events (agent_instance_id, session_id, task_id, attempt_id)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_origin ON events (namespace_id, application_id, application_instance_id, provider_id, model_id, model_revision, harness_id, harness_version)")
+        self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_events_origin ON events (namespace_id, application_instance_id, event_id)")
         self._conn.commit()
 
     def emit(self, event: Event) -> None:
         data = event.to_dict()
         EventSchema.validate(data)
+        payload = json.dumps(data, sort_keys=True)
+        origin = (data["namespace_id"], data["application_instance_id"], data["event_id"])
         try:
+            existing = self._conn.execute(
+                "SELECT payload FROM events WHERE namespace_id = ? AND application_instance_id = ? AND event_id = ?",
+                origin).fetchone()
+            if existing is not None:
+                if existing[0] != payload:
+                    raise EventError("replayed event identity has different payload")
+                return
             self._conn.execute(
-                "INSERT INTO events (event_id, agent_instance_id, session_id, task_id, attempt_id, segment_id, agent_id, behavioral_subject, timestamp, payload) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (data["event_id"], data["agent_instance_id"], data["session_id"],
+                "INSERT INTO events (namespace_id, application_id, application_instance_id, provider_id, model_id, model_revision, model_capability_hash, harness_id, harness_version, event_id, agent_instance_id, session_id, task_id, attempt_id, segment_id, agent_id, behavioral_subject, timestamp, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (data["namespace_id"], data["application_id"], data["application_instance_id"],
+                 data.get("provider_id"), data.get("model_id"), data.get("model_revision"),
+                 data.get("model_capability_hash"), data.get("harness_id"), data.get("harness_version"),
+                 data["event_id"], data["agent_instance_id"], data["session_id"],
                  data["task_id"], data["attempt_id"], data["segment_id"],
-                 data["agent_id"], data["behavioral_subject"], data["timestamp"],
-                 json.dumps(data, sort_keys=True)),
+                 data["agent_id"], data["behavioral_subject"], data["timestamp"], payload),
             )
             self._conn.commit()
         except sqlite3.IntegrityError as exc:
-            raise EventError(f"duplicate event_id {data['event_id']!r}") from exc
+            raise EventError(
+                f"event identity collision for origin {origin!r}") from exc
 
     def close(self) -> None:
         self._conn.close()
@@ -798,6 +1019,16 @@ class EventFactory:
         return Event(
             event_id=data["event_id"],
             timestamp=data["timestamp"],
+            namespace_id=data.get("namespace_id", "default"),
+            application_id=data.get("application_id", "unknown-application"),
+            application_version=data.get("application_version"),
+            application_instance_id=data.get("application_instance_id"),
+            provider_id=data.get("provider_id"),
+            model_id=data.get("model_id"),
+            model_revision=data.get("model_revision"),
+            model_capability_hash=data.get("model_capability_hash"),
+            harness_id=data.get("harness_id"),
+            harness_version=data.get("harness_version"),
             agent_instance_id=data.get("agent_instance_id"),
             session_id=data.get("session_id"),
             task_id=data["task_id"],
@@ -1356,6 +1587,8 @@ class GuardRegistry:
         self.revision = 0
         if self.path is not None and self.path.exists():
             self._load(self.path)
+        self._committed_guards = copy.deepcopy(self._guards)
+        self._committed_revision = self.revision
         for g in guards or []:
             self.add(g)
 
@@ -1373,8 +1606,15 @@ class GuardRegistry:
         data = {"schema_version": GUARD_REGISTRY_SCHEMA_VERSION,
                 "revision": self.revision + 1,
                 "guards": [guard_to_dict(g) for g in sorted(self._guards.values(), key=lambda g: (g.priority_int, g.key))]}
-        _durable_json_write(self.path, data, expected_revision=self.revision)
+        try:
+            _durable_json_write(self.path, data, expected_revision=self.revision)
+        except Exception:
+            self._guards = copy.deepcopy(self._committed_guards)
+            self.revision = self._committed_revision
+            raise
         self.revision += 1
+        self._committed_guards = copy.deepcopy(self._guards)
+        self._committed_revision = self.revision
 
     def add(self, guard: Guard) -> None:
         """Add newly researched data; only candidates may enter here."""
@@ -1434,6 +1674,10 @@ class GuardRegistry:
             raise KeyError(f"no guard {gid}")
         if new_status not in GUARD_STATUS:
             raise ValueError(f"invalid status {new_status}")
+        # Preserve the historical in-memory API: callers may hold the Guard
+        # returned by by_id() and attach rollout metadata before the next
+        # transition.  Durable save() already snapshots/restores the whole
+        # registry on a failed CAS.
         old_status = guard.status
         allowed = ALLOWED_TRANSITIONS[old_status]
         if new_status not in allowed:
@@ -1442,6 +1686,7 @@ class GuardRegistry:
         if new_status == "validated" and guard.status == "experiment":
             receipt = receipts.get(receipt_id) if receipt_id else None
             if (receipt is None or receipt.guard_semantic_hash != guard_semantic_hash(guard)
+                    or not is_production_grade_criterion(dict(receipt.criterion or {}))
                     or not receipts.verify(receipt_id, "validation", guard.key)):
                 raise ValueError(
                     f"{gid} experiment -> validated requires a verifiable validation receipt; "
@@ -1453,11 +1698,13 @@ class GuardRegistry:
             if guard.validation_receipt_ref and (
                     validation is None
                     or validation.guard_semantic_hash != guard_semantic_hash(guard)
+                    or not is_production_grade_criterion(dict(validation.criterion or {}))
                     or not receipts.verify(guard.validation_receipt_ref, "validation", guard.key)):
                 raise ValueError(f"{gid} validation receipt {guard.validation_receipt_ref} is not verifiable")
         if new_status == "active" and guard.status == "canary":
             receipt = receipts.get(receipt_id) if receipt_id else None
             if (receipt is None or receipt.guard_semantic_hash != guard_semantic_hash(guard)
+                    or not is_production_grade_criterion(dict(receipt.criterion or {}))
                     or not receipts.verify(receipt_id, "canary", guard.key)):
                 raise ValueError(
                     f"{gid} canary -> active requires a verifiable canary receipt; "
@@ -1475,6 +1722,7 @@ class GuardRegistry:
             "receipt_ref": receipt_id,
             "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         })
+        self._guards[guard.key] = guard
 
     def promote_guard(self, gid: str, new_status: str, *,
                       receipt_registry: ReceiptRegistry,

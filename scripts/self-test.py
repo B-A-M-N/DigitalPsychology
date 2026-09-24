@@ -13,7 +13,7 @@ from lib.feedback_loop import (Event, EventError, EventFactory, EpisodeBuilder,
                                Guard, GuardCompiler, GuardRegistry, GuardResolver, NDJSONSink,
                                SQLiteSink,
                                PolicySnapshot, ProbeResult, ProbeRunner,
-                               Retention, load_events)
+                               Retention, TrialEvidence, load_events)
 
 
 def make_event(i, cat, etype, **kw):
@@ -27,6 +27,19 @@ def make_event(i, cat, etype, **kw):
         event_type=etype,
         **kw,
     )
+
+
+def trial_map(values, policy):
+    return {
+        trial_id: TrialEvidence(
+            trial_id=trial_id, trajectory_id=f"trajectory-{trial_id}",
+            probe_id="registered-probe", probe_version="1",
+            policy_hash=policy, execution_policy_hash=policy,
+            session_id=f"session-{trial_id}", task_id=f"task-{trial_id}",
+            attempt_id="attempt-1", outcome=outcome,
+            host_evidence_ref=f"evt-{trial_id}")
+        for trial_id, outcome in values.items()
+    }
 
 
 def main() -> int:
@@ -74,6 +87,7 @@ def main() -> int:
     # 3. Guard lifecycle: candidate -> experiment -> validated requires a
     #    verifiable ValidationReceipt (booleans are never evidence)
     from lib.feedback_loop import ReceiptBuilder, ReceiptRegistry, guard_semantic_hash
+    from lib.receipts import DEFAULT_PRODUCTION_CRITERION
     receipts = ReceiptRegistry()
     reg = GuardRegistry()
     try:
@@ -106,27 +120,34 @@ def main() -> int:
         print("ok: boolean probe record cannot authorize validation")
 
     builder = ReceiptBuilder(evaluator_version_hash="eval-hash-1",
-                             guard_semantic_hash=guard_semantic_hash(base))
-    outputs = {"b1": "FAIL", "b2": "FAIL", "b3": "FAIL",
-               "i1": "PASS", "i2": "PASS", "i3": "PASS",
-               "h1": "PASS", "h2": "PASS", "h3": "PASS"}
+                             guard_semantic_hash=guard_semantic_hash(base),
+                             criterion=DEFAULT_PRODUCTION_CRITERION)
+    outputs = {}
+    outputs.update(trial_map({f"b{i}": "FAIL" for i in range(10)}, "baseline-policy"))
+    outputs.update(trial_map({f"i{i}": "PASS" for i in range(10)}, "candidate-policy"))
+    outputs.update(trial_map({f"h{i}": "PASS" for i in range(10)}, "holdout-policy"))
     vrcpt = builder.build(
         guard_key="G-completion@1", kind="validation",
-        baseline_trial_ids=("b1", "b2", "b3"),
-        intervention_trial_ids=("i1", "i2", "i3"),
-        holdout_trial_ids=("h1", "h2", "h3"), trial_outputs=outputs,
+        baseline_trial_ids=tuple(f"b{i}" for i in range(10)),
+        intervention_trial_ids=tuple(f"i{i}" for i in range(10)),
+        holdout_trial_ids=tuple(f"h{i}" for i in range(10)), trial_outputs=outputs,
         baseline_policy_hashes=("baseline-policy",),
         treatment_policy_hashes=("candidate-policy",),
         holdout_policy_hashes=("holdout-policy",))
     receipts.add(vrcpt)
     provenance_outputs = dict(outputs)
-    provenance_outputs["i1"] = {"outcome": "PASS", "policy_hash": "baseline-policy"}
+    provenance_outputs["i1"] = TrialEvidence(
+        trial_id="i1", trajectory_id="trajectory-i1-wrong", probe_id="registered-probe",
+        probe_version="1", policy_hash="baseline-policy",
+        execution_policy_hash="baseline-policy", session_id="session-i1-wrong",
+        task_id="task-i1-wrong", attempt_id="attempt-1", outcome="PASS",
+        host_evidence_ref="evt-i1-wrong")
     try:
         builder.build(
             guard_key="G-completion@1", kind="validation",
-            baseline_trial_ids=("b1", "b2", "b3"),
-            intervention_trial_ids=("i1", "i2", "i3"),
-            holdout_trial_ids=("h1", "h2", "h3"), trial_outputs=provenance_outputs,
+            baseline_trial_ids=tuple(f"b{i}" for i in range(10)),
+            intervention_trial_ids=tuple(f"i{i}" for i in range(10)),
+            holdout_trial_ids=tuple(f"h{i}" for i in range(10)), trial_outputs=provenance_outputs,
             baseline_policy_hashes=("baseline-policy",),
             treatment_policy_hashes=("candidate-policy",),
             holdout_policy_hashes=("holdout-policy",))
@@ -136,9 +157,9 @@ def main() -> int:
     try:
         builder.build(
             receipt_id="caller-chosen", guard_key="G-completion@1", kind="validation",
-            baseline_trial_ids=("b1", "b2", "b3"),
-            intervention_trial_ids=("i1", "i2", "i3"),
-            holdout_trial_ids=("h1", "h2", "h3"), trial_outputs=outputs,
+            baseline_trial_ids=tuple(f"b{i}" for i in range(10)),
+            intervention_trial_ids=tuple(f"i{i}" for i in range(10)),
+            holdout_trial_ids=tuple(f"h{i}" for i in range(10)), trial_outputs=outputs,
             baseline_policy_hashes=("baseline-policy",),
             treatment_policy_hashes=("candidate-policy",),
             holdout_policy_hashes=("holdout-policy",))
@@ -156,14 +177,15 @@ def main() -> int:
         raise SystemExit("canary->active without canary receipt should reject")
     except ValueError:
         print("ok: canary->active without canary receipt rejected")
-    canary_outputs = {"b1": "FAIL", "b2": "FAIL", "b3": "FAIL",
-                      "c1": "PASS", "c2": "PASS", "c3": "PASS",
-                      "ch1": "PASS", "ch2": "PASS", "ch3": "PASS"}
+    canary_outputs = {}
+    canary_outputs.update(trial_map({f"b{i}": "FAIL" for i in range(10)}, "baseline-policy"))
+    canary_outputs.update(trial_map({f"c{i}": "PASS" for i in range(10)}, "canary-policy"))
+    canary_outputs.update(trial_map({f"ch{i}": "PASS" for i in range(10)}, "holdout-policy"))
     crcpt = builder.build(
         guard_key="G-completion@1", kind="canary",
-        baseline_trial_ids=("b1", "b2", "b3"),
-        intervention_trial_ids=("c1", "c2", "c3"),
-        holdout_trial_ids=("ch1", "ch2", "ch3"), trial_outputs=canary_outputs,
+        baseline_trial_ids=tuple(f"b{i}" for i in range(10)),
+        intervention_trial_ids=tuple(f"c{i}" for i in range(10)),
+        holdout_trial_ids=tuple(f"ch{i}" for i in range(10)), trial_outputs=canary_outputs,
         baseline_policy_hashes=("baseline-policy",),
         treatment_policy_hashes=("canary-policy",),
         holdout_policy_hashes=("holdout-policy",))
@@ -176,15 +198,18 @@ def main() -> int:
     mutated = Guard(id="G-mutated", family="G-mutated", version="1", status="canary",
                     target_behavior="same target", rule="original rule", priority="P1")
     mutated_builder = ReceiptBuilder(evaluator_version_hash="eval-hash-1",
-                                     guard_semantic_hash=guard_semantic_hash(mutated))
+                                     guard_semantic_hash=guard_semantic_hash(mutated),
+                                     criterion=DEFAULT_PRODUCTION_CRITERION)
     mutated_receipt = mutated_builder.build(
         guard_key="G-mutated@1", kind="canary",
-        baseline_trial_ids=("mb1", "mb2", "mb3"),
-        intervention_trial_ids=("mi1", "mi2", "mi3"),
-        holdout_trial_ids=("mh1", "mh2", "mh3"),
-        trial_outputs={"mb1": "FAIL", "mb2": "FAIL", "mb3": "FAIL",
-                       "mi1": "PASS", "mi2": "PASS", "mi3": "PASS",
-                       "mh1": "PASS", "mh2": "PASS", "mh3": "PASS"},
+        baseline_trial_ids=tuple(f"mb{i}" for i in range(10)),
+        intervention_trial_ids=tuple(f"mi{i}" for i in range(10)),
+        holdout_trial_ids=tuple(f"mh{i}" for i in range(10)),
+        trial_outputs={
+            **trial_map({f"mb{i}": "FAIL" for i in range(10)}, "b"),
+            **trial_map({f"mi{i}": "PASS" for i in range(10)}, "i"),
+            **trial_map({f"mh{i}": "PASS" for i in range(10)}, "h"),
+        },
         baseline_policy_hashes=("b",), treatment_policy_hashes=("i",),
         holdout_policy_hashes=("h",))
     mutated.rule = "mutated after receipt"

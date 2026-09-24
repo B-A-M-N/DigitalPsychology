@@ -282,3 +282,9 @@ Digital Psychology
 CFW provides behavioral policy. CSW provides state-aware workflow control. Digital Psychology provides the observation and experimental loop that determines whether those policies are actually doing what they were intended to do.
 
 Together, they form an **adaptive agent control stack**: not a single giant prompt, not an unconstrained self-modifying agent, but a layered system in which behavior can be prescribed, state can be governed, outcomes can be observed, and future policy can improve from evidence.
+
+## FreeInference attribution
+
+This work benefited in some way from inference provided by [freeinference.org](https://freeinference.org/).
+
+These are independent developments that are not reviewed, endorsed, or sponsored by FreeInference. If you find these projects genuinely useful, please consider donating to or sponsoring FreeInference, which provides a vital inference service.

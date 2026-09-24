@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
-RECEIPT_BUILDER_VERSION = "1.0.0"
+RECEIPT_BUILDER_VERSION = "2.0.0"
+RECEIPT_PROVENANCE_VERSION = "1.0.0"
 MIN_EVIDENCE_SAMPLES = 3
 DEFAULT_EXPERIMENT_CRITERION = {
     "version": "criterion-1",
@@ -26,10 +27,13 @@ DEFAULT_PRODUCTION_CRITERION = {
     "min_effect": 0.10,
     "confidence_rule": "wilson_intervention_gt_baseline",
     "regression_probes": [],
+    "authority": "digitalpsychology-built-in-production-v1",
 }
 
 
 def is_production_grade_criterion(criterion: dict) -> bool:
+    if bool(criterion.get("research_only")) or bool(criterion.get("caller_authored")):
+        return False
     minimum = int(criterion.get("minimum_applicable_per_cohort",
                                criterion.get("min_applicable", 0)) or 0)
     return (minimum >= DEFAULT_PRODUCTION_CRITERION["minimum_applicable_per_cohort"]
@@ -37,6 +41,7 @@ def is_production_grade_criterion(criterion: dict) -> bool:
             DEFAULT_PRODUCTION_CRITERION["min_effect"]
             and criterion.get("confidence_rule") ==
             DEFAULT_PRODUCTION_CRITERION["confidence_rule"]
+            and criterion.get("authority") == DEFAULT_PRODUCTION_CRITERION["authority"]
             and bool(criterion.get("version"))
             and bool(criterion.get("evaluator_version")))
 

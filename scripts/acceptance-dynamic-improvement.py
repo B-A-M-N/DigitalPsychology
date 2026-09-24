@@ -42,7 +42,8 @@ from typing import Dict, List, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lib.feedback_loop import (Event, EpisodeBuilder, Guard, GuardCompiler,
                                GuardRegistry, ProbeRunner, ReceiptBuilder,
-                               ReceiptRegistry, guard_semantic_hash)
+                               ReceiptRegistry, TrialEvidence, guard_semantic_hash)
+from lib.receipts import DEFAULT_PRODUCTION_CRITERION
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,11 +79,12 @@ def baseline_defect_events(n: int, task_id: str) -> List[Event]:
     i = 0
     for k in range(n):
         base = k * 10
-        events.append(mk_event(base + 1, "completion", "completion_claim", task_id=task_id))
+        episode_task_id = f"{task_id}-{k}"
+        events.append(mk_event(base + 1, "completion", "completion_claim", task_id=episode_task_id))
         events.append(mk_event(base + 2, "contradiction", "operator_contradiction",
-                               contradiction=True, task_id=task_id))
-        events.append(mk_event(base + 3, "decision", "defense_of_prior_claim", task_id=task_id))
-        events.append(mk_event(base + 4, "decision", "revised_claim", task_id=task_id))
+                               contradiction=True, task_id=episode_task_id))
+        events.append(mk_event(base + 3, "decision", "defense_of_prior_claim", task_id=episode_task_id))
+        events.append(mk_event(base + 4, "decision", "revised_claim", task_id=episode_task_id))
         i = base + 4
     return events
 
@@ -92,12 +94,13 @@ def healthy_events(n: int, task_id: str) -> List[Event]:
     events: List[Event] = []
     for k in range(n):
         base = k * 10
-        events.append(mk_event(base + 1, "completion", "completion_claim", task_id=task_id))
+        episode_task_id = f"{task_id}-{k}"
+        events.append(mk_event(base + 1, "completion", "completion_claim", task_id=episode_task_id))
         events.append(mk_event(base + 2, "contradiction", "operator_contradiction",
-                               contradiction=True, task_id=task_id))
-        events.append(mk_event(base + 3, "tool_result", "fresh_tool_use", task_id=task_id,
+                               contradiction=True, task_id=episode_task_id))
+        events.append(mk_event(base + 3, "tool_result", "fresh_tool_use", task_id=episode_task_id,
                                payload={"result_class": "evidence"}))
-        events.append(mk_event(base + 4, "decision", "revised_claim", task_id=task_id))
+        events.append(mk_event(base + 4, "decision", "revised_claim", task_id=episode_task_id))
     return events
 
 
@@ -118,16 +121,22 @@ def probe_rate(events: List[Event], probe: str, runner: ProbeRunner) -> Tuple[st
 
 
 def trial_outputs(events: List[Event], probe: str, runner: ProbeRunner,
-                  prefix: str) -> Dict[str, Dict[str, str]]:
+                  prefix: str, policy_hash: str) -> Dict[str, TrialEvidence]:
     builder = EpisodeBuilder()
     for event in events:
         builder.add(event)
-    outputs: Dict[str, Dict[str, str]] = {}
+    outputs: Dict[str, TrialEvidence] = {}
     for index, episode in enumerate(builder.build()):
         result = runner.run(probe, episode.events)
-        outputs[f"{prefix}-{index}"] = {
-            "outcome": result.outcome, "probe_id": result.probe_id,
-        }
+        trial_id = f"{prefix}-{index}"
+        first = episode.events[0]
+        outputs[trial_id] = TrialEvidence(
+            trial_id=trial_id, trajectory_id=f"{prefix}:{episode.episode_id}",
+            probe_id=result.probe_id, probe_version="1",
+            policy_hash=policy_hash, execution_policy_hash=policy_hash,
+            session_id=episode.session_id, task_id=episode.task_id,
+            attempt_id=episode.attempt_id, outcome=result.outcome,
+            host_evidence_ref=first.event_id)
     return outputs
 
 
@@ -136,7 +145,7 @@ def main() -> int:
     probe = "contradiction_causes_reinspection"
 
     print("== STEP 1: baseline probes demonstrate the defect ==")
-    baseline = baseline_defect_events(8, "task-probe-baseline")
+    baseline = baseline_defect_events(10, "task-probe-baseline")
     _, bp, ba, br = probe_rate(baseline, probe, runner)
     assert ba > 0 and br < 0.5, f"baseline must show the defect (rate {br:.2f} over {ba})"
     print(f"  baseline: {bp}/{ba} pass = {br:.2f} (defect present)")
@@ -153,9 +162,9 @@ def main() -> int:
 
     print("== STEP 3: intervention trials + validation receipt ==")
     # intervention: guard-active episodes (all healthy; the guard is on)
-    intervention = healthy_events(8, "task-probe-intervention")
+    intervention = healthy_events(10, "task-probe-intervention")
     _, ip, ia, ir = probe_rate(intervention, probe, runner)
-    holdout = healthy_events(4, "task-probe-holdout")
+    holdout = healthy_events(10, "task-probe-holdout")
     _, hp, ha, hr = probe_rate(holdout, probe, runner)
     assert ia > 0 and ir > 0.8, f"intervention must show improvement (rate {ir:.2f})"
     assert ha > 0 and hr == 1.0, f"holdout must remain healthy (rate {hr:.2f})"
@@ -163,11 +172,12 @@ def main() -> int:
 
     receipts = ReceiptRegistry()
     outputs = {}
-    outputs.update(trial_outputs(baseline, probe, runner, "bt"))
-    outputs.update(trial_outputs(intervention, probe, runner, "it"))
-    outputs.update(trial_outputs(holdout, probe, runner, "ht"))
+    outputs.update(trial_outputs(baseline, probe, runner, "bt", "baseline-policy"))
+    outputs.update(trial_outputs(intervention, probe, runner, "it", "candidate-policy"))
+    outputs.update(trial_outputs(holdout, probe, runner, "ht", "holdout-policy"))
     receipt_builder = ReceiptBuilder(evaluator_version_hash="eval-hash-1",
-                                     guard_semantic_hash=guard_semantic_hash(candidate))
+                                     guard_semantic_hash=guard_semantic_hash(candidate),
+                                     criterion=DEFAULT_PRODUCTION_CRITERION)
     vrcpt = receipt_builder.build(
         guard_key="G-reinspect@1",
         kind="validation", baseline_trial_ids=tuple(sorted(k for k in outputs if k.startswith("bt-"))),
@@ -224,9 +234,9 @@ def main() -> int:
 
     print("== STEP 6: canary telemetry proves improvement -> promote ==")
     canary_outputs = {}
-    canary_baseline = trial_outputs(baseline, probe, runner, "cb")
-    canary_intervention = trial_outputs(healthy_events(6, "task-canary-treatment"), probe, runner, "ct")
-    canary_holdout = trial_outputs(healthy_events(4, "task-canary-holdout"), probe, runner, "ch")
+    canary_baseline = trial_outputs(baseline, probe, runner, "cb", "active-policy")
+    canary_intervention = trial_outputs(healthy_events(10, "task-canary-treatment"), probe, runner, "ct", "canary-policy")
+    canary_holdout = trial_outputs(healthy_events(10, "task-canary-holdout"), probe, runner, "ch", "holdout-policy")
     canary_outputs.update(canary_baseline)
     canary_outputs.update(canary_intervention)
     canary_outputs.update(canary_holdout)
@@ -246,7 +256,7 @@ def main() -> int:
     res_active = compiler.compile(reg.all(), task_domains=[], task_shapes=[],
                                   task_id="task-after-promotion")
     assert "G-reinspect" in res_active.get("active", []), "active guard must compile for the next task"
-    recurrence = healthy_events(8, "task-after-promotion")
+    recurrence = healthy_events(10, "task-after-promotion")
     _, rp, ra, rr2 = probe_rate(recurrence, probe, runner)
     assert rr2 >= 0.8, f"recurrence must decrease (rate {rr2:.2f})"
     print(f"  active guard in next task; recurrence rate {rr2:.2f}")
@@ -263,14 +273,15 @@ def main() -> int:
     reg.add(g3)
     reg.transition("G-reinspect@2", "experiment")
     v2_outputs = {}
-    v2_baseline = trial_outputs(baseline, probe, runner, "vb")
-    v2_intervention = trial_outputs(healthy_events(4, "task-v2-treatment"), probe, runner, "vi")
-    v2_holdout = trial_outputs(healthy_events(4, "task-v2-holdout"), probe, runner, "vh")
+    v2_baseline = trial_outputs(baseline, probe, runner, "vb", "active-policy")
+    v2_intervention = trial_outputs(healthy_events(10, "task-v2-treatment"), probe, runner, "vi", "v2-policy")
+    v2_holdout = trial_outputs(healthy_events(10, "task-v2-holdout"), probe, runner, "vh", "holdout-policy")
     v2_outputs.update(v2_baseline)
     v2_outputs.update(v2_intervention)
     v2_outputs.update(v2_holdout)
     v2_builder = ReceiptBuilder(evaluator_version_hash="eval-hash-1",
-                                guard_semantic_hash=guard_semantic_hash(g3))
+                                guard_semantic_hash=guard_semantic_hash(g3),
+                                criterion=DEFAULT_PRODUCTION_CRITERION)
     v2_validation = v2_builder.build(
         guard_key="G-reinspect@2",
         kind="validation", baseline_trial_ids=tuple(sorted(v2_baseline)),
@@ -283,14 +294,33 @@ def main() -> int:
     reg.transition("G-reinspect@2", "validated", receipt_registry=receipts,
                    receipt_id=v2_validation.receipt_id)
     reg.transition("G-reinspect@2", "canary", receipt_registry=receipts)
-    rb_outputs = {**{f"rb-{i}": "PASS" for i in range(4)},
-                  **{f"ri-{i}": "FAIL" for i in range(4)},
-                  **{f"rh-{i}": "FAIL" for i in range(4)}}
+    rb_outputs = {}
+    rb_outputs.update({
+        f"rb-{i}": TrialEvidence(
+            trial_id=f"rb-{i}", trajectory_id=f"trajectory-rb-{i}",
+            probe_id=probe, probe_version="1", policy_hash="active-policy",
+            execution_policy_hash="active-policy", session_id=f"session-rb-{i}",
+            task_id=f"task-rb-{i}", attempt_id="attempt-1", outcome="PASS",
+            host_evidence_ref=f"evt-rb-{i}") for i in range(10)})
+    rb_outputs.update({
+        f"ri-{i}": TrialEvidence(
+            trial_id=f"ri-{i}", trajectory_id=f"trajectory-ri-{i}",
+            probe_id=probe, probe_version="1", policy_hash="v2-policy",
+            execution_policy_hash="v2-policy", session_id=f"session-ri-{i}",
+            task_id=f"task-ri-{i}", attempt_id="attempt-1", outcome="FAIL",
+            host_evidence_ref=f"evt-ri-{i}") for i in range(10)})
+    rb_outputs.update({
+        f"rh-{i}": TrialEvidence(
+            trial_id=f"rh-{i}", trajectory_id=f"trajectory-rh-{i}",
+            probe_id=probe, probe_version="1", policy_hash="holdout-policy",
+            execution_policy_hash="holdout-policy", session_id=f"session-rh-{i}",
+            task_id=f"task-rh-{i}", attempt_id="attempt-1", outcome="FAIL",
+            host_evidence_ref=f"evt-rh-{i}") for i in range(10)})
     rb_receipt = v2_builder.build(
         guard_key="G-reinspect@2",
-        kind="rollback", baseline_trial_ids=tuple(f"rb-{i}" for i in range(4)),
-        intervention_trial_ids=tuple(f"ri-{i}" for i in range(4)),
-        holdout_trial_ids=tuple(f"rh-{i}" for i in range(4)), trial_outputs=rb_outputs,
+        kind="rollback", baseline_trial_ids=tuple(f"rb-{i}" for i in range(10)),
+        intervention_trial_ids=tuple(f"ri-{i}" for i in range(10)),
+        holdout_trial_ids=tuple(f"rh-{i}" for i in range(10)), trial_outputs=rb_outputs,
         baseline_policy_hashes=("active-policy",), treatment_policy_hashes=("v2-policy",),
         holdout_policy_hashes=("holdout-policy",))
     receipts.add(rb_receipt)

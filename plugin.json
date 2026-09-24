@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "description": "Observational agent-behavior measurement, evaluation, and guarded policy-artifact export.",
   "role": "observational",
-  "runtime_boundary": "trusted compiled-guard-pack.json",
-  "runtime_owner": "cognitive-frameworks",
-  "schema_version": "2.1.0"
+  "runtime_boundary": "optional-mcp-service-and-trusted-artifacts",
+  "runtime_owner": "digital-psychology",
+  "protocol_version": "1.0.0",
+  "behavior_event_schema_version": "2.2.0",
+  "routing_profile_schema_version": "1.0.0",
+  "routing_experiment_plan_schema_version": "1.0.0"
 }
