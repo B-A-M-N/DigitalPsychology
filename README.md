@@ -13,6 +13,66 @@ CognitiveFrameWorks already prescribed how an agent should behave. CognitiveStat
 
 DigitalPsychology therefore became an independent measurement discipline. It does not begin by telling the agent what to do. It begins by observing what the agent **actually did**.
 
+## Current implementation
+
+DigitalPsychology is an independent behavioral measurement and learning plane. It does not grant permissions, define legal StateWork transitions, or replace host authority.
+
+Implemented capabilities include:
+
+- **Authenticated event ingestion** with schema validation, host attestations, origin identity, replay safety, and privileged-category protection.
+- **Trajectory reconstruction** that prevents repeated events from one trajectory from becoming independent samples.
+- **Canonical experimental outcomes** (`PASS`, `FAIL`, `NOT_APPLICABLE`) with rejection of unknown values and explicit non-applicable bounds.
+- **Predeclared routing experiments** with control, treatment, and holdout cohorts, host-evaluator provenance, receipt hashes, and independent-trajectory checks.
+- **A bounded slow-loop controller** that derives candidates, validates receipts, promotes bounded profiles, observes lifecycle transitions, and records rejection reasons.
+- **Authoritative lifecycle state** with explicit rollback/rejection transitions, durable deployment revisions, and known-good previous profiles.
+- **Versioned advice-exchange contracts** so the host can record trusted context, eligible choices, requested adjustments, and the final effective routing decision.
+
+DP can remain useful without CFW or CSW installed. CFW and CSW can remain operational without DP; DP is an optional future-task learning layer, never a dependency of the active-task authority plane.
+
+The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
+
+## Five-minute independent quick start
+
+DP can ingest, reconstruct, experiment, and promote a routing profile without CFW or CSW installed.
+
+Install the package and start the MCP command in an environment with the optional `mcp` transport installed:
+
+```bash
+python3 -m pip install -e .
+digital-psychology-mcp
+```
+
+The service stores ordinary state under `DIGITALPSYCHOLOGY_STATE_ROOT` (or the platform state directory). Ordinary, non-privileged events can be ingested without an authentication secret for local fixtures. In a deployment where agents can reach the MCP surface, configure `DIGITALPSYCHOLOGY_INGESTION_SECRET`; privileged categories (`validation`, `state_transition`, `completion`) and operator/repository-owner actors require host attestation.
+
+Run the independent experiment example:
+
+```bash
+python3 scripts/quickstart-standalone.py
+```
+
+Expected output:
+
+```text
+independent trajectories: 30
+candidates: 1
+receipt decision: pass
+promoted profiles: 1
+rejections: []
+```
+
+The fixture uses independent control, treatment, and holdout trajectories. DP derives one candidate profile, builds a host-bound routing receipt, and promotes only after the receipt passes. Repeated events from one trajectory do not count as independent samples.
+
+The slow loop is explicitly invoked; it is not an automatic background worker. The Python API is `BoundedLearningController.run(events, task_context)`, the service method is `DigitalPsychologyService.run_slow_loop(...)`, and the MCP tool is `run_slow_loop(events, task_context)`.
+
+## Optional integrations
+
+- **DP alone:** use the package, SQLite event store, trajectory reconstruction, experiment receipts, and slow-loop service independently.
+- **DP + CFW:** CFW calls `behavioral_advice` with host-computed eligible routes. DP may prefer or suppress only those already legal choices.
+- **DP + CSW:** DP can inform future flow preferences, but CSW remains the source of legal flow and transition eligibility.
+- **CFW + CSW without DP:** both runtime authorities continue to work with no DP service installed.
+
+The diagram above describes the optional combined loop. It is not a requirement for DP ingestion or experimentation.
+
 ## The larger architecture
 
 | System | Primary question | Character |
@@ -283,24 +343,23 @@ CFW provides behavioral policy. CSW provides state-aware workflow control. Digit
 
 Together, they form an **adaptive agent control stack**: not a single giant prompt, not an unconstrained self-modifying agent, but a layered system in which behavior can be prescribed, state can be governed, outcomes can be observed, and future policy can improve from evidence.
 
-## Current implementation
+## Tests, limitations, and release status
 
-DigitalPsychology is an independent behavioral measurement and learning plane. It does not grant permissions, define legal StateWork transitions, or replace host authority.
+Run:
 
-Implemented capabilities include:
+```bash
+python3 scripts/self-test.py
+python3 scripts/test-routing-learning.py
+pytest -q tests
+```
 
-- **Authenticated event ingestion** with schema validation, host attestations, origin identity, replay safety, and privileged-category protection.
-- **Trajectory reconstruction** that prevents repeated events from one trajectory from becoming independent samples.
-- **Canonical experimental outcomes** (`PASS`, `FAIL`, `NOT_APPLICABLE`) with rejection of unknown values and explicit non-applicable bounds.
-- **Predeclared routing experiments** with control, treatment, and holdout cohorts, host-evaluator provenance, receipt hashes, and independent-trajectory checks.
-- **A bounded slow-loop controller** that derives candidates, validates receipts, promotes bounded profiles, observes lifecycle transitions, and records rejection reasons.
-- **Authoritative lifecycle state** with explicit rollback/rejection transitions, durable deployment revisions, and known-good previous profiles.
-- **Versioned advice-exchange contracts** so the host can record trusted context, eligible choices, requested adjustments, and the final effective routing decision.
+The automated release gate is defined by the sibling CFW repository's [`release-gates.json`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/release-gates.json). It covers structural and cross-system behavior. Real-agent improvement claims require CFW's [`acceptance-real-agent.py`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/scripts/acceptance-real-agent.py) with an explicit external model command; deterministic DP tests do not establish that claim.
 
-DP can remain useful without CFW or CSW installed. CFW and CSW can remain operational without DP; DP is an optional future-task learning layer, never a dependency of the active-task authority plane.
+DP's promotion receipts are authoritative for its own experiment artifacts, but real model behavior, tool outcomes, and deployment-specific evaluator quality remain external dependencies. The optional MCP transport is not required for library-only use.
 
-The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
+## License and contribution
 
+These projects are released under the [MIT License](LICENSE). Contributions are welcome through repository issues and pull requests. Please include a focused regression or acceptance check for behavior changes, keep authority boundaries explicit, and do not claim model-performance improvements without the corresponding qualification evidence.
 
 ## FreeInference attribution
 This work benefited in some way from inference provided by [freeinference.org](https://freeinference.org/).

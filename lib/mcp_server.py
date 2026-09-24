@@ -191,10 +191,18 @@ class DigitalPsychologyService:
         return body
 
     def run_slow_loop(self, events: list[Any], task_context: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-        """Run one bounded, receipt-gated learning cycle."""
+        """Run one bounded, receipt-gated learning cycle.
+
+        MCP callers provide JSON event dictionaries; direct Python callers
+        may provide Event instances. A missing profile path uses the trusted
+        service state root rather than dereferencing None.
+        """
         from .routing_lifecycle import RoutingLifecycleStore
-        lifecycle = RoutingLifecycleStore(self.profile_path.parent / "routing-lifecycle.json")
-        report = BoundedLearningController(lifecycle=lifecycle).run(events, task_context)
+        profile_path = self.profile_path or (trusted_state_root() / "active-routing-profile.json")
+        lifecycle = RoutingLifecycleStore(profile_path.parent / "routing-lifecycle.json")
+        parsed_events = [EventFactory.from_dict(dict(event)) if isinstance(event, Mapping) else event
+                         for event in events]
+        report = BoundedLearningController(lifecycle=lifecycle).run(parsed_events, task_context)
         return {"status": report.status, "promoted": report.promoted,
                 "candidate_count": len(report.candidates), "rejected": report.rejected}
 
@@ -241,6 +249,11 @@ def create_server(service: DigitalPsychologyService | None = None):
     def validate_routing_profile(profile: dict[str, Any]) -> dict[str, Any]:
         """Validate a deployable profile and its exact scope contract."""
         return service.validate_routing_profile(profile)
+
+    @server.tool()
+    def run_slow_loop(events: list[dict[str, Any]], task_context: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """Run one bounded observe → derive → receipt-gated promotion cycle."""
+        return service.run_slow_loop(events, task_context)
 
     return server
 
