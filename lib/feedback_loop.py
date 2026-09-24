@@ -34,7 +34,7 @@ import tempfile
 import uuid
 from importlib.resources import files as resource_files
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple
 
@@ -970,7 +970,57 @@ class SQLiteSink:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_session ON events (agent_instance_id, session_id, task_id, attempt_id)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_origin ON events (namespace_id, application_id, application_instance_id, provider_id, model_id, model_revision, harness_id, harness_version)")
         self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_events_origin ON events (namespace_id, application_instance_id, event_id)")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS retention_aggregates (
+            aggregate_id TEXT PRIMARY KEY,
+            namespace_id TEXT NOT NULL,
+            application_instance_id TEXT NOT NULL,
+            bucket_start TEXT NOT NULL,
+            bucket_end TEXT NOT NULL,
+            event_count INTEGER NOT NULL,
+            event_digest TEXT NOT NULL,
+            categories_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        )""")
         self._conn.commit()
+
+    def purge_expired(self, *, retention_days: int, now: Optional[datetime] = None) -> dict[str, Any]:
+        """Delete expired raw payloads while preserving aggregate audit evidence."""
+        if retention_days < 1:
+            raise ValueError("retention_days must be positive")
+        instant = now or datetime.now(timezone.utc)
+        cutoff = instant - timedelta(days=retention_days)
+        cutoff_text = cutoff.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        rows = self._conn.execute(
+            "SELECT row_id, namespace_id, application_instance_id, event_id, payload "
+            "FROM events WHERE timestamp < ? ORDER BY timestamp, row_id", (cutoff_text,)).fetchall()
+        deleted = 0
+        for row in rows:
+            row_id, namespace_id, application_instance_id, event_id, payload = row
+            try:
+                category = str(json.loads(payload).get("category") or "unknown")
+            except (TypeError, json.JSONDecodeError):
+                category = "unknown"
+            aggregate_id = hashlib.sha256(
+                f"{namespace_id}|{application_instance_id}|{category}|{event_id}".encode()).hexdigest()
+            prior = self._conn.execute(
+                "SELECT event_count, event_digest, categories_json FROM retention_aggregates WHERE aggregate_id = ?",
+                (aggregate_id,)).fetchone()
+            count = int(prior[0]) + 1 if prior else 1
+            digest = hashlib.sha256(
+                f"{prior[1] if prior else ''}|{event_id}|{payload}".encode()).hexdigest()
+            categories = json.loads(prior[2]) if prior else {}
+            categories[category] = int(categories.get(category, 0)) + 1
+            self._conn.execute(
+                "INSERT OR REPLACE INTO retention_aggregates "
+                "(aggregate_id, namespace_id, application_instance_id, bucket_start, bucket_end, event_count, event_digest, categories_json, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (aggregate_id, namespace_id, application_instance_id, cutoff_text,
+                 cutoff_text, count, digest, json.dumps(categories, sort_keys=True),
+                 instant.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")))
+            deleted += self._conn.execute("DELETE FROM events WHERE row_id = ?", (row_id,)).rowcount
+        self._conn.commit()
+        return {"cutoff": cutoff_text, "deleted_events": deleted,
+                "aggregate_rows": self._conn.execute("SELECT COUNT(*) FROM retention_aggregates").fetchone()[0]}
 
     def emit(self, event: Event) -> None:
         data = event.to_dict()

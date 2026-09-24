@@ -281,6 +281,10 @@ class DigitalPsychologyService:
             application_instance_id=record.get("application_instance_id"))
         return self._run_slow_loop(events, task_context)
 
+    def purge_expired_events(self, *, retention_days: int) -> dict[str, Any]:
+        """Host-only retention operation; deliberately not an MCP tool."""
+        return self._sink.purge_expired(retention_days=retention_days)
+
     def validate_routing_profile(self, profile: Mapping[str, Any]) -> dict[str, Any]:
         validate_profile(profile, require_deployable=True)
         return {"valid": True, "profile_id": profile["profile_id"],
