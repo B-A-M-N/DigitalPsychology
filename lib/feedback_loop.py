@@ -1079,9 +1079,12 @@ def load_events(path: Path) -> List[Event]:
             ev = EventFactory.from_dict(data)
         except EventError as exc:
             raise EventError(f"{path.name}:{lineno}: {exc}") from exc
-        if ev.event_id in seen:
-            raise EventError(f"{path.name}:{lineno}: duplicate event_id {ev.event_id!r}")
-        seen.add(ev.event_id)
+        identity = (ev.namespace_id, ev.application_instance_id, ev.agent_instance_id,
+                    ev.session_id, ev.task_id, ev.attempt_id, ev.behavioral_subject,
+                    ev.event_id)
+        if identity in seen:
+            raise EventError(f"{path.name}:{lineno}: duplicate composite event identity {identity!r}")
+        seen.add(identity)
         events.append(ev)
     return events
 
@@ -1105,7 +1108,11 @@ class Episode:
     session_id: str = "session-unknown"
     attempt_id: str = "attempt-1"
     behavioral_subject: str = ""
+    namespace_id: str = "default"
+    application_instance_id: str = "unknown-application"
+    role: Optional[str] = None
     interaction_id: Optional[str] = None
+    delegation_id: Optional[str] = None
     events: List[Event] = field(default_factory=list)
     pattern: Optional[str] = None
     characteristic: Optional[str] = None
@@ -1184,14 +1191,15 @@ class EpisodeBuilder:
         # segmentation (concurrent telemetry may arrive out of order)
         keyed: Dict[Tuple[str, str, str, str, str], List[Event]] = {}
         for ev in self._all:
-            keyed.setdefault((ev.agent_instance_id or ev.agent_id,
+            keyed.setdefault((ev.namespace_id, ev.application_instance_id,
+                             ev.agent_instance_id or ev.agent_id,
                              ev.session_id or "session-unknown",
                              ev.task_id, ev.attempt_id or "attempt-1",
                              ev.behavioral_subject or ev.subject or ev.agent_id), []).append(ev)
         out: List[Episode] = []
         counter = 0
-        for (agent_instance_id, session_id, task_id, attempt_id, behavioral_subject) in sorted(keyed):
-            stream = sorted(keyed[(agent_instance_id, session_id, task_id, attempt_id,
+        for (namespace_id, application_instance_id, agent_instance_id, session_id, task_id, attempt_id, behavioral_subject) in sorted(keyed):
+            stream = sorted(keyed[(namespace_id, application_instance_id, agent_instance_id, session_id, task_id, attempt_id,
                                    behavioral_subject)], key=lambda e: (e.timestamp, e.event_id))
             segments: List[Episode] = []
             current: Optional[Episode] = None
@@ -1201,7 +1209,8 @@ class EpisodeBuilder:
                     current = Episode(
                         f"ep-{counter:03d}", task_id, stream[0].agent_id,
                         agent_instance_id, session_id, attempt_id, behavioral_subject,
-                        stream[0].interaction_id)
+                        stream[0].namespace_id, stream[0].application_instance_id, stream[0].role,
+                        stream[0].interaction_id, stream[0].delegation_id)
                     current.add(ev)
                     segments.append(current)
                     continue
@@ -1212,7 +1221,8 @@ class EpisodeBuilder:
                     current = Episode(
                         f"ep-{counter:03d}", task_id, ev.agent_id,
                         agent_instance_id, session_id, attempt_id, behavioral_subject,
-                        ev.interaction_id)
+                        ev.namespace_id, ev.application_instance_id, ev.role,
+                        ev.interaction_id, ev.delegation_id)
                     current.add(ev)
                     segments.append(current)
                     continue
@@ -1225,7 +1235,8 @@ class EpisodeBuilder:
                             current = Episode(
                                 f"ep-{counter:03d}", task_id, ev.agent_id,
                                 agent_instance_id, session_id, attempt_id,
-                                behavioral_subject, ev.interaction_id)
+                                behavioral_subject, ev.namespace_id, ev.application_instance_id,
+                                ev.role, ev.interaction_id, ev.delegation_id)
                             current.add(ev)
                             segments.append(current)
                             continue

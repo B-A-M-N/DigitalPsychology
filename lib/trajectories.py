@@ -22,6 +22,8 @@ class TaskTrajectory:
     task_id: str
     attempt_id: str
     behavioral_subject: str
+    namespace_id: str = "default"
+    application_instance_id: str = "unknown-application"
     episodes: List[Episode] = field(default_factory=list)
 
     @property
@@ -30,6 +32,7 @@ class TaskTrajectory:
 
     def to_dict(self) -> dict[str, Any]:
         return {"trajectory_id": self.trajectory_id, "agent_instance_id": self.agent_instance_id,
+                "namespace_id": self.namespace_id, "application_instance_id": self.application_instance_id,
                 "session_id": self.session_id, "task_id": self.task_id,
                 "attempt_id": self.attempt_id, "behavioral_subject": self.behavioral_subject,
                 "episode_ids": [episode.episode_id for episode in self.episodes],
@@ -132,19 +135,21 @@ def build_trajectories(events: Iterable[Event], *, window_minutes: float = 30.0)
     episodes = builder.build()
     tasks: dict[tuple[str, str, str, str, str], TaskTrajectory] = {}
     for episode in episodes:
-        key = (episode.agent_instance_id, episode.session_id, episode.task_id,
-               episode.attempt_id, episode.behavioral_subject)
+        event = episode.events[0]
+        key = (event.namespace_id, event.application_instance_id, episode.agent_instance_id,
+               episode.session_id, episode.task_id, episode.attempt_id, episode.behavioral_subject)
         trajectory = tasks.setdefault(key, TaskTrajectory(
-            trajectory_id=_id("task", key), agent_instance_id=key[0], session_id=key[1],
-            task_id=key[2], attempt_id=key[3], behavioral_subject=key[4]))
+            trajectory_id=_id("task", key), agent_instance_id=key[2], session_id=key[3],
+            task_id=key[4], attempt_id=key[5], behavioral_subject=key[6],
+            namespace_id=key[0], application_instance_id=key[1]))
         trajectory.episodes.append(episode)
     task_list = sorted(tasks.values(), key=lambda item: item.trajectory_id)
     sessions: dict[tuple[str, str], SessionTrajectory] = {}
     for task in task_list:
         event = task.events[0] if task.events else None
-        key = (task.agent_instance_id, task.session_id)
+        key = (task.namespace_id, task.application_instance_id, task.agent_instance_id, task.session_id)
         session = sessions.setdefault(key, SessionTrajectory(
-            trajectory_id=_id("session", key), agent_instance_id=key[0], session_id=key[1],
+            trajectory_id=_id("session", key), agent_instance_id=key[2], session_id=key[3],
             parent_session_id=event.parent_session_id if event else None,
             interaction_ids=tuple()))
         session.tasks.append(task)

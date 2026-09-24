@@ -53,7 +53,8 @@ def _episode_context(episode, task_context: Dict[str, Dict[str, Any]]) -> Dict[s
     task_id = getattr(episode, "task_id", "")
     attempt_id = getattr(episode, "attempt_id", "")
     if session_id and task_id and attempt_id:
-        return dict(task_context.get(f"{session_id}:{task_id}:{attempt_id}", {}))
+        identity = f"{getattr(episode, 'namespace_id', 'default')}|{getattr(episode, 'application_instance_id', 'unknown-application')}|{getattr(episode, 'agent_instance_id', 'agent')}|{session_id}|{task_id}|{attempt_id}|{getattr(episode, 'behavioral_subject', '')}|{getattr(episode, 'role', None)}|{getattr(episode, 'interaction_id', None)}|{getattr(episode, 'delegation_id', None)}"
+        return dict(task_context.get(identity) or task_context.get(f"{session_id}:{task_id}:{attempt_id}", {}))
     # Legacy imports are deliberately explicit and never silently promoted.
     return dict(task_context.get(f"legacy:{task_id}", {}))
 

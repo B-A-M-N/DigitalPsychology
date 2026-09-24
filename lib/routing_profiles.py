@@ -707,6 +707,34 @@ def build_profile(*, profile_id: str, subject: Mapping[str, Any], context: Mappi
     return data
 
 
+def _composite_event_identity(event: Any) -> tuple[Any, ...]:
+    return (getattr(event, "namespace_id", "default"),
+            getattr(event, "application_instance_id", "unknown-application"),
+            getattr(event, "agent_instance_id", getattr(event, "agent_id", "agent")),
+            getattr(event, "session_id", "session-unknown"), getattr(event, "task_id", ""),
+            getattr(event, "attempt_id", "attempt-1"),
+            getattr(event, "behavioral_subject", ""), getattr(event, "role", None),
+            getattr(event, "interaction_id", None), getattr(event, "delegation_id", None),
+            getattr(event, "event_id", ""))
+
+
+def _composite_context_key(event: Any) -> str:
+    values = _composite_event_identity(event)
+    return "|".join(str(value) for value in values[:-1])
+
+
+def _context_matches_event(event: Any, context: Mapping[str, Any]) -> bool:
+    pairs = (("namespace_id", "namespace_id"),
+             ("application_instance_id", "application_instance_id"),
+             ("agent_instance_id", "agent_instance_id"),
+             ("session_id", "session_id"), ("task_id", "task_id"),
+             ("attempt_id", "attempt_id"),
+             ("behavioral_subject", "behavioral_subject"),
+             ("role", "role"), ("interaction_id", "interaction_id"),
+             ("delegation_id", "delegation_id"))
+    return all(context.get(field) in (None, getattr(event, event_field)) for field, event_field in pairs)
+
+
 def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[str, Any]],
                     *, minimum_samples: int = 10, minimum_effect: float = 0.10,
                     evaluator_version: str = ROUTING_EVALUATOR_VERSION) -> list[dict[str, Any]]:
@@ -721,13 +749,13 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
 
     event_list = list(events)
     _episodes, tasks, _sessions, _agents = build_trajectories(event_list)
-    event_to_session: dict[str, str] = {}
+    event_to_session: dict[tuple[Any, ...], str] = {}
     for task in tasks:
         for event in task.events:
             # The experimental unit is an independent task attempt, not a
             # log line and not a whole long-lived session containing several
             # tasks.
-            event_to_session[event.event_id] = task.trajectory_id
+            event_to_session[_composite_event_identity(event)] = task.trajectory_id
     grouped: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
     for event in event_list:
         if event.event_type != "route_outcome":
@@ -742,11 +770,18 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             outcome = normalize_route_outcome(outcome)
         except RoutingProfileError:
             continue
-        trajectory_id = event_to_session.get(event.event_id)
+        trajectory_id = event_to_session.get(_composite_event_identity(event))
         if not trajectory_id or not payload.get("route_decision_id"):
             continue
-        context_value = task_context.get(
-            f"{event.session_id}:{event.task_id}:{event.attempt_id}")
+        context_value = task_context.get(_composite_context_key(event))
+        if not isinstance(context_value, Mapping):
+            # Sidecars may use the older session/task/attempt key, but the
+            # authenticated identity must still agree before promotion.
+            context_value = task_context.get(
+                f"{event.session_id}:{event.task_id}:{event.attempt_id}")
+        if isinstance(context_value, Mapping) and not _context_matches_event(event, context_value):
+            raise RoutingProfileError(
+                "authenticated event identity disagrees with its experiment context")
         if not isinstance(context_value, Mapping):
             # Schema-v2 routing evidence is never attributed through a
             # task-only fallback; legacy imports must be explicitly adapted
@@ -798,8 +833,8 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                context.get("phase"), context.get("environment"),
                context.get("toolset"), statework_versions_key,
                context.get("framework_version"), context.get("guard_pack_hash"),
-               context.get("role"), comparison_hash, plan.get("plan_hash"),
-               route_type, route)
+               context.get("role"), context.get("interaction_id"), context.get("delegation_id"),
+               comparison_hash, plan.get("plan_hash"), route_type, route)
         bucket = grouped.setdefault(key, {"control": {}, "treatment": {},
                                           "holdout": {}, "plan": plan})
         trial = bucket[cohort].setdefault(trajectory_id, {
@@ -818,6 +853,7 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             "outcome": None,
             "policy_hash": payload.get("policy_hash") or context.get("policy_hash"),
             "event_ids": [],
+            "interaction_ids": [],
         })
         if trial["outcome"] is None:
             trial["outcome"] = outcome
@@ -826,6 +862,8 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                 f"trajectory {trajectory_id!r} contains conflicting terminal outcomes; "
                 "explicit evaluator supersession is required")
         trial["event_ids"].append(event.event_id)
+        if event.interaction_id:
+            trial["interaction_ids"].append(event.interaction_id)
 
     profiles: list[dict[str, Any]] = []
     for key, cohorts in sorted(grouped.items(), key=lambda item: repr(item[0])):
@@ -833,6 +871,15 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
         control = list(cohorts["control"].values())
         treatment = list(cohorts["treatment"].values())
         holdout = list(cohorts["holdout"].values())
+        cohort_interactions = {}
+        for cohort_name, values in (("control", control), ("treatment", treatment), ("holdout", holdout)):
+            for value in values:
+                for interaction_id in value.get("interaction_ids", ()):
+                    cohort_interactions.setdefault(interaction_id, set()).add(cohort_name)
+        shared = {interaction_id for interaction_id, names in cohort_interactions.items() if len(names) > 1}
+        if shared:
+            raise RoutingProfileError(
+                f"shared interaction evidence crosses experimental cohorts: {sorted(shared)}")
         holdout_minimum = int((plan.get("holdout_requirements") or {}).get(
             "minimum_samples", minimum_samples) or 0)
         if (len(control) < minimum_samples or len(treatment) < minimum_samples
@@ -843,14 +890,18 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
          provider_id, model_id, model_revision, model_capability_hash, harness_id,
          harness_version, agent_instance_id, task_family,
          domains, phase, environment, toolset, statework_versions_items, framework_version,
-         guard_pack_hash, role, comparison_hash, _plan_hash, route_type, route) = key
+         guard_pack_hash, role, interaction_id, delegation_id, comparison_hash,
+         _plan_hash, route_type, route) = key
         source_hash = hashlib.sha256(_canonical(trials).encode("utf-8")).hexdigest()
         context = {"task_family": task_family, "task_shape": task_family,
                    "domain_tags": list(domains),
                    "phase": phase, "environment": environment, "toolset": toolset,
                    "statework_versions": dict(statework_versions_items),
                    "framework_version": framework_version,
-                   "guard_pack_hash": guard_pack_hash}
+                   "guard_pack_hash": guard_pack_hash,
+                   "role": role,
+                   "interaction_id": interaction_id,
+                   "delegation_id": delegation_id}
         subject = {
             "namespace_id": namespace_id or "unknown",
             "application_id": application_id or "unknown",
