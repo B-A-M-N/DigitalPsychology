@@ -1,32 +1,32 @@
-# Digital Psychology
+# DigitalPsychology
 
 > **Behavioral science for AI agents.**
 > Observe what agents actually do, determine the conditions under which behavior recurs, experimentally test interventions, and measure whether anything truly improved.
 
-Digital Psychology (DP) is the **behavioral observation, experimentation, and learning layer** of a larger closed-loop architecture for AI agents.
+DigitalPsychology (DP) is the **behavioral observation, experimentation, and learning layer** of a larger closed-loop architecture for AI agents.
 
 It was originally conceived as another behavioral skill pack. That became the wrong abstraction.
 
-CognitiveFrameWorks already prescribed how an agent should behave. CognitiveStateWork encoded what operational behavior and transitions were appropriate in particular workflows. Adding another set of instructions would have created more policy without answering a more fundamental question:
+CognitiveFrameWorks already prescribed how an agent should behave. CognitiveStateWorks encoded what operational behavior and transitions were appropriate in particular workflows. Adding another set of instructions would have created more policy without answering a more fundamental question:
 
 > **Why does the agent continue exhibiting a behavior under particular conditions — and what actually changes it?**
 
-Digital Psychology therefore became an independent measurement discipline. It does not begin by telling the agent what to do. It begins by observing what the agent **actually did**.
+DigitalPsychology therefore became an independent measurement discipline. It does not begin by telling the agent what to do. It begins by observing what the agent **actually did**.
 
 ## The larger architecture
 
 | System | Primary question | Character |
 | --- | --- | --- |
 | **CognitiveFrameWorks** | **How should the agent behave?** | Prescriptive |
-| **CognitiveStateWork** | **What behavior and transitions are appropriate now?** | Prescriptive / state-governed |
-| **Digital Psychology** | **Why is the agent behaving this way under these conditions?** | Observational / experimental |
+| **CognitiveStateWorks** | **What behavior and transitions are appropriate now?** | Prescriptive / state-governed |
+| **DigitalPsychology** | **Why is the agent behaving this way under these conditions?** | Observational / experimental |
 
 Together they form a **closed-loop cognitive-behavioral control architecture**:
 
 ```text
                     PRESCRIPTIVE FAST LOOP
 
-        CognitiveFrameWorks + CognitiveStateWork
+        CognitiveFrameWorks + CognitiveStateWorks
                        │
                        ▼
                      Agent
@@ -39,7 +39,7 @@ Together they form a **closed-loop cognitive-behavioral control architecture**:
                        ▼
                     SLOW LOOP
 
-               Digital Psychology
+               DigitalPsychology
         observe → reconstruct → compare
               → experiment → validate
                        │
@@ -58,7 +58,7 @@ This makes the system adaptive without making it self-modifying in an uncontroll
 
 ## What “why” means here
 
-Digital Psychology does **not** claim privileged access to a model's internal subjective experience. Statements such as `"I became confused"` or `"I thought the test was enough"` are behavioral outputs, not authoritative causal explanations.
+DigitalPsychology does **not** claim privileged access to a model's internal subjective experience. Statements such as `"I became confused"` or `"I thought the test was enough"` are behavioral outputs, not authoritative causal explanations.
 
 “Why” means something more rigorous:
 
@@ -66,7 +66,7 @@ Digital Psychology does **not** claim privileged access to a model's internal su
 
 DP can therefore distinguish possibilities such as agent effect, model effect, harness effect, task effect, tool/environment effect, state/workflow effect, delegation effect, interaction effect, and policy effect without anthropomorphizing the system.
 
-## Why Digital Psychology is separate
+## Why DigitalPsychology is separate
 
 If the system that creates a rule also decides whether the rule worked, confirmation bias becomes architecture.
 
@@ -84,7 +84,7 @@ DP:
  did the failure simply move somewhere else?"
 ```
 
-Digital Psychology remains independent so it can evaluate CognitiveFrameWorks and CognitiveStateWork themselves.
+DigitalPsychology remains independent so it can evaluate CognitiveFrameWorks and CognitiveStateWorks themselves.
 
 ## Behavioral telemetry
 
@@ -234,7 +234,7 @@ DP therefore records interaction and delegation provenance and distinguishes ind
 
 ## Fast loop versus slow loop
 
-Digital Psychology primarily belongs to the **slow loop**.
+DigitalPsychology primarily belongs to the **slow loop**.
 
 ```text
 During a task:  CFW + CSW → govern current execution
@@ -271,20 +271,38 @@ Allowing DP to casually rewrite a running task's policy would make it difficult 
 CognitiveFrameWorks
     HOW should the agent behave?
 
-CognitiveStateWork
+CognitiveStateWorks
     WHAT behavior and transitions are appropriate NOW?
 
-Digital Psychology
+DigitalPsychology
     WHY does this behavior recur under THESE CONDITIONS,
     and WHAT ACTUALLY CHANGES IT?
 ```
 
-CFW provides behavioral policy. CSW provides state-aware workflow control. Digital Psychology provides the observation and experimental loop that determines whether those policies are actually doing what they were intended to do.
+CFW provides behavioral policy. CSW provides state-aware workflow control. DigitalPsychology provides the observation and experimental loop that determines whether those policies are actually doing what they were intended to do.
 
 Together, they form an **adaptive agent control stack**: not a single giant prompt, not an unconstrained self-modifying agent, but a layered system in which behavior can be prescribed, state can be governed, outcomes can be observed, and future policy can improve from evidence.
 
-## FreeInference attribution
+## Current implementation
 
+DigitalPsychology is an independent behavioral measurement and learning plane. It does not grant permissions, define legal StateWork transitions, or replace host authority.
+
+Implemented capabilities include:
+
+- **Authenticated event ingestion** with schema validation, host attestations, origin identity, replay safety, and privileged-category protection.
+- **Trajectory reconstruction** that prevents repeated events from one trajectory from becoming independent samples.
+- **Canonical experimental outcomes** (`PASS`, `FAIL`, `NOT_APPLICABLE`) with rejection of unknown values and explicit non-applicable bounds.
+- **Predeclared routing experiments** with control, treatment, and holdout cohorts, host-evaluator provenance, receipt hashes, and independent-trajectory checks.
+- **A bounded slow-loop controller** that derives candidates, validates receipts, promotes bounded profiles, observes lifecycle transitions, and records rejection reasons.
+- **Authoritative lifecycle state** with explicit rollback/rejection transitions, durable deployment revisions, and known-good previous profiles.
+- **Versioned advice-exchange contracts** so the host can record trusted context, eligible choices, requested adjustments, and the final effective routing decision.
+
+DP can remain useful without CFW or CSW installed. CFW and CSW can remain operational without DP; DP is an optional future-task learning layer, never a dependency of the active-task authority plane.
+
+The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
+
+
+## FreeInference attribution
 This work benefited in some way from inference provided by [freeinference.org](https://freeinference.org/).
 
 These are independent developments that are not reviewed, endorsed, or sponsored by FreeInference. If you find these projects genuinely useful, please consider donating to or sponsoring FreeInference, which provides a vital inference service.
