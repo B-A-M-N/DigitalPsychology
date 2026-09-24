@@ -62,7 +62,7 @@ rejections: []
 
 The fixture uses independent control, treatment, and holdout trajectories. DP derives one candidate profile, builds a host-bound routing receipt, and promotes only after the receipt passes. Repeated events from one trajectory do not count as independent samples.
 
-The slow loop is explicitly invoked; it is not an automatic background worker. The Python API is `BoundedLearningController.run(events, task_context)`, the service method is `DigitalPsychologyService.run_slow_loop(...)`, and the MCP tool is `run_slow_loop(events, task_context)`.
+The slow loop is explicitly invoked; it is not an automatic background worker. In production, the MCP tool accepts only a protected `experiment_id` plus a host authorization, and the service loads event IDs from its authenticated SQLite store. The direct library API remains `BoundedLearningController.run(events, task_context)` for trusted host code; raw `events` and `task_context` are not accepted by the MCP boundary.
 
 ## Optional integrations
 

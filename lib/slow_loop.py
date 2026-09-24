@@ -51,13 +51,8 @@ class BoundedLearningController:
                 if receipt.get("decision") != "pass":
                     raise RoutingProfileError("candidate lacks a passing experiment receipt")
                 active = promote_profile(candidate, receipt, status="active")
-                # This is a deployment observation, not a new source of truth.
-                active = self.lifecycle.observe(active, [{
-                    "profile_hash": active["profile_hash"],
-                    "trajectory_id": f"slow-loop-{active['profile_hash'][:20]}",
-                    "eligible": True,
-                }])
-                validate_profile(active, require_deployable=True)
+                # Publish deployment without counting it as a trajectory.
+                active = self.lifecycle.deploy(active, reason="validated experiment receipt")
                 promoted.append(str(active["profile_hash"]))
             except (RoutingProfileError, TypeError, ValueError) as exc:
                 rejected.append({"profile_id": candidate.get("profile_id"),

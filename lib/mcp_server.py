@@ -42,7 +42,12 @@ class DigitalPsychologyService:
         self.profile_path = profile_path
         self._trusted_producers = {str(k): dict(v) for k, v in (trusted_producers or {}).items()}
         self._attestation_secret = os.environ.get("DIGITALPSYCHOLOGY_INGESTION_SECRET", "").encode()
+        self._promotion_secret = os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode()
         self._sink = SQLiteSink(self.event_db)
+        self._sink._conn.execute("""CREATE TABLE IF NOT EXISTS authenticated_events (
+            namespace_id TEXT NOT NULL, application_instance_id TEXT NOT NULL,
+            event_id TEXT NOT NULL, PRIMARY KEY(namespace_id, application_instance_id, event_id))""")
+        self._sink._conn.commit()
 
     def close(self) -> None:
         self._sink.close()
@@ -52,28 +57,36 @@ class DigitalPsychologyService:
         if privileged and not self._trusted_producers and not self._attestation_secret:
             raise ValueError("privileged behavior events require host attestation")
         if not self._trusted_producers and not self._attestation_secret:
-            return
+            return False
+        if not self._attestation_secret:
+            raise ValueError("trusted producer configuration requires a cryptographic ingestion secret")
         if self._attestation_secret:
             signature = str(data.get("host_attestation", {}).get("signature", ""))
             body = {k: v for k, v in data.items() if k != "host_attestation"}
             expected = hmac.new(self._attestation_secret, _canonical(body).encode(), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(signature, expected):
                 raise ValueError("behavior event host attestation is invalid")
-            return
+            return True
         key = (str(data.get("namespace_id")), str(data.get("application_instance_id")), str(data.get("agent_instance_id")))
         producer = self._trusted_producers.get("|".join(key))
         if not producer or data.get("actor_id") not in set(producer.get("allowed_actors", ())):
             raise ValueError("behavior event producer is not host-authorized")
         if data.get("host_attestation", {}).get("issuer") != producer.get("issuer"):
             raise ValueError("behavior event attestation issuer is invalid")
+        return True
 
     def ingest_behavior_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
         try:
             data = dict(event)
-            self._attest_event(data)
+            authenticated = self._attest_event(data)
             data.pop("host_attestation", None)
             parsed = EventFactory.from_dict(data)
             self._sink.emit(parsed)
+            if authenticated:
+                self._sink._conn.execute(
+                    "INSERT OR IGNORE INTO authenticated_events(namespace_id, application_instance_id, event_id) VALUES (?,?,?)",
+                    (parsed.namespace_id, parsed.application_instance_id, parsed.event_id))
+                self._sink._conn.commit()
         except (EventError, ValueError) as exc:
             raise ValueError(f"behavior event rejected: {exc}") from exc
         data = parsed.to_dict()
@@ -129,16 +142,25 @@ class DigitalPsychologyService:
             revision = data.get("revision")
             if profiles[0].get("lifecycle_revision") != revision:
                 raise RoutingProfileError("active routing profile revision mismatch")
+            current = profiles[0]
+            lifecycle_status = current.get("lifecycle_status") or current.get("status")
+            if current.get("status") in {"stale", "rolled_back"} or lifecycle_status in {"stale", "rolled_back"}:
+                return [], ""
             try:
-                validate_profile(profiles[0], require_deployable=True)
+                validate_profile(current, require_deployable=True)
             except RoutingProfileError:
                 previous = data.get("previous_profile")
-                if not isinstance(previous, Mapping):
-                    raise
+                if (not isinstance(previous, Mapping)
+                        or previous.get("profile_hash") == current.get("profile_hash")
+                        or previous.get("status") in {"stale", "rolled_back"}
+                        or previous.get("lifecycle_status") in {"stale", "rolled_back"}):
+                    return [], ""
                 validate_profile(dict(previous), require_deployable=True)
                 profiles = [dict(previous)]
         elif isinstance(data, Mapping) and isinstance(data.get("profiles"), list):
-            profiles = [dict(item) for item in data["profiles"]]
+            profiles = [dict(item) for item in data["profiles"]
+                        if item.get("status") not in {"stale", "rolled_back"}
+                        and item.get("lifecycle_status") not in {"stale", "rolled_back"}]
         elif isinstance(data, Mapping):
             profiles = [dict(data)]
         else:
@@ -178,7 +200,9 @@ class DigitalPsychologyService:
                 sources.append(str(raw.get("profile_id") or raw.get("profile_hash")))
         body = {
             "status": "ok",
-            "static_policy_hash": static_policy.get("policy_hash"),
+            "static_policy_hash": static_policy.get("policy_hash", static_policy.get("static_policy_hash")),
+            "eligible_choice_hash": static_policy.get("eligible_choice_hash"),
+            "context_identity": static_policy.get("context_identity"),
             "profile_pack_hash": profile_hash,
             "adjustments": adjustments,
             "sources": sorted(set(sources)),
@@ -190,13 +214,8 @@ class DigitalPsychologyService:
         body["advice_id"] = f"advice-{body['semantic_hash'][:20]}"
         return body
 
-    def run_slow_loop(self, events: list[Any], task_context: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-        """Run one bounded, receipt-gated learning cycle.
-
-        MCP callers provide JSON event dictionaries; direct Python callers
-        may provide Event instances. A missing profile path uses the trusted
-        service state root rather than dereferencing None.
-        """
+    def _run_slow_loop(self, events: list[Any], task_context: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+        """Internal authenticated-cycle primitive; never exposed as an MCP tool."""
         from .routing_lifecycle import RoutingLifecycleStore
         profile_path = self.profile_path or (trusted_state_root() / "active-routing-profile.json")
         lifecycle = RoutingLifecycleStore(profile_path.parent / "routing-lifecycle.json")
@@ -205,6 +224,62 @@ class DigitalPsychologyService:
         report = BoundedLearningController(lifecycle=lifecycle).run(parsed_events, task_context)
         return {"status": report.status, "promoted": report.promoted,
                 "candidate_count": len(report.candidates), "rejected": report.rejected}
+
+    def _load_persisted_events(self, event_ids: list[Any], *,
+                              namespace_id: str | None = None,
+                              application_instance_id: str | None = None) -> list[Any]:
+        """Load only authenticated, already-persisted event records."""
+        loaded = []
+        for event_id in event_ids:
+            if namespace_id and application_instance_id:
+                row = self._sink._conn.execute(
+                    "SELECT e.payload FROM events e JOIN authenticated_events a "
+                    "ON a.namespace_id=e.namespace_id AND a.application_instance_id=e.application_instance_id AND a.event_id=e.event_id "
+                    "WHERE e.namespace_id = ? AND e.application_instance_id = ? AND e.event_id = ?",
+                    (str(namespace_id), str(application_instance_id), str(event_id)),
+                ).fetchone()
+            else:
+                row = self._sink._conn.execute(
+                    "SELECT e.payload FROM events e JOIN authenticated_events a ON a.event_id=e.event_id "
+                    "WHERE e.event_id = ? LIMIT 1", (str(event_id),)
+                ).fetchone()
+            if row is None:
+                raise ValueError(f"experiment references an event not present in authenticated store: {event_id!r}")
+            loaded.append(EventFactory.from_dict(json.loads(row[0])))
+        return loaded
+
+    def run_registered_slow_loop(self, experiment_id: str,
+                                 authorization: Mapping[str, Any]) -> dict[str, Any]:
+        """Run a protected experiment record; promotion requires host authorization."""
+        root = trusted_state_root()
+        registry_path = root / "experiments.json"
+        if not registry_path.exists():
+            raise ValueError("experiment registry is unavailable")
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("experiment registry is unreadable") from exc
+        record = registry.get(str(experiment_id)) if isinstance(registry, Mapping) else None
+        if not isinstance(record, Mapping) or record.get("experiment_id") != experiment_id:
+            raise ValueError("unknown or mismatched experiment record")
+        expected = str(record.get("promotion_authorization_id") or "")
+        if not expected or authorization.get("authorization_id") != expected:
+            raise ValueError("experiment promotion authorization is required")
+        if not self._promotion_secret:
+            raise ValueError("experiment promotion requires a separate promotion secret")
+        signature = str(authorization.get("signature") or "")
+        body = {key: value for key, value in authorization.items() if key != "signature"}
+        expected_signature = hmac.new(self._promotion_secret, _canonical(body).encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            raise ValueError("experiment promotion authorization is invalid")
+        event_ids = record.get("event_ids")
+        task_context = record.get("task_context")
+        if not isinstance(event_ids, list) or not isinstance(task_context, Mapping):
+            raise ValueError("experiment record lacks authenticated event IDs or context")
+        events = self._load_persisted_events(
+            event_ids, namespace_id=record.get("namespace_id"),
+            application_instance_id=record.get("application_instance_id"))
+        return self._run_slow_loop(events, task_context)
 
     def validate_routing_profile(self, profile: Mapping[str, Any]) -> dict[str, Any]:
         validate_profile(profile, require_deployable=True)
@@ -251,9 +326,9 @@ def create_server(service: DigitalPsychologyService | None = None):
         return service.validate_routing_profile(profile)
 
     @server.tool()
-    def run_slow_loop(events: list[dict[str, Any]], task_context: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """Run one bounded observe → derive → receipt-gated promotion cycle."""
-        return service.run_slow_loop(events, task_context)
+    def run_registered_slow_loop(experiment_id: str, authorization: dict[str, Any]) -> dict[str, Any]:
+        """Run a protected experiment record after host authorization."""
+        return service.run_registered_slow_loop(experiment_id, authorization)
 
     return server
 

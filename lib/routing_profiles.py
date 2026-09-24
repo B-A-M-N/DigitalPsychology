@@ -364,6 +364,11 @@ def build_routing_experiment_receipt(plan: Mapping[str, Any], trials: Iterable[M
     if (holdout and (len(holdout) - holdout_applicable) / len(holdout) > max_na
             or holdout_applicable < holdout_minimum):
         raise RoutingProfileError("holdout regression evidence is not sufficiently applicable")
+    max_arm_na = float(holdout_requirements.get("max_not_applicable_fraction", 0.25))
+    for arm, values in (("control", control), ("treatment", treatment)):
+        applicable_count = sum(t.get("outcome") != "NOT_APPLICABLE" for t in values)
+        if values and (len(values) - applicable_count) / len(values) > max_arm_na:
+            raise RoutingProfileError(f"{arm} arm has too many non-applicable outcomes")
     control_applicable = [t for t in control if t.get("outcome") != "NOT_APPLICABLE"]
     treatment_applicable = [t for t in treatment if t.get("outcome") != "NOT_APPLICABLE"]
     control_bad = sum(t.get("outcome") == "FAIL" for t in control_applicable)
@@ -371,8 +376,8 @@ def build_routing_experiment_receipt(plan: Mapping[str, Any], trials: Iterable[M
     control_rate = control_bad / len(control_applicable) if control_applicable else 0.0
     treatment_rate = treatment_bad / len(treatment_applicable) if treatment_applicable else 0.0
     effect = control_rate - treatment_rate
-    control_low, control_high = _wilson(control_rate, len(control))
-    treatment_low, treatment_high = _wilson(treatment_rate, len(treatment))
+    control_low, control_high = _wilson(control_rate, len(control_applicable))
+    treatment_low, treatment_high = _wilson(treatment_rate, len(treatment_applicable))
     effect_low, effect_high = control_low - treatment_high, control_high - treatment_low
     regressions = [t["trajectory_id"] for t in holdout if t.get("outcome") == "FAIL"]
     decision = "pass" if (
@@ -413,6 +418,8 @@ def build_routing_experiment_receipt(plan: Mapping[str, Any], trials: Iterable[M
         "minimum_holdout_samples": holdout_minimum,
         "holdout_evaluators": sorted(holdout_requirements.get("evaluators") or ()),
         "holdout_max_not_applicable_fraction": max_na,
+        "control_max_not_applicable_fraction": max_arm_na,
+        "treatment_max_not_applicable_fraction": max_arm_na,
         "minimum_effect": minimum_effect,
         "regressions": regressions,
         "source_evidence_hash": source_hash,
@@ -808,17 +815,17 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             "evaluator_version": payload.get("evaluator_version"),
             "evaluator_hash": payload.get("evaluator_hash"),
             "outcome_source": payload.get("outcome_source"),
-            "outcome": "PASS",
+            "outcome": None,
             "policy_hash": payload.get("policy_hash") or context.get("policy_hash"),
             "event_ids": [],
         })
+        if trial["outcome"] is None:
+            trial["outcome"] = outcome
+        elif outcome != trial["outcome"]:
+            raise RoutingProfileError(
+                f"trajectory {trajectory_id!r} contains conflicting terminal outcomes; "
+                "explicit evaluator supersession is required")
         trial["event_ids"].append(event.event_id)
-        if outcome == "FAIL":
-            trial["outcome"] = "FAIL"
-        elif outcome == "PASS":
-            trial["outcome"] = "PASS"
-        else:
-            trial["outcome"] = "NOT_APPLICABLE"
 
     profiles: list[dict[str, Any]] = []
     for key, cohorts in sorted(grouped.items(), key=lambda item: repr(item[0])):

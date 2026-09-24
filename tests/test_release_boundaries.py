@@ -146,3 +146,59 @@ def test_route_outcomes_are_canonical_and_zero_canary_has_no_cohort() -> None:
         target_evaluator="route-success", control_policy_identity="prepared-control",
         treatment_policy_identity="prepared-treatment", canary_fraction=0.0)
     assert assign_routing_cohort(plan, "trial", {"task_family": "performance"}) is None
+
+def test_mcp_cannot_run_unregistered_raw_promotion_path() -> None:
+    from lib.mcp_server import create_server
+    with tempfile.TemporaryDirectory() as raw:
+        service = DigitalPsychologyService(event_db=Path(raw) / "events.sqlite3")
+        assert not hasattr(service, "run_slow_loop")
+        assert hasattr(service, "run_registered_slow_loop")
+        try:
+            create_server(service)
+        except RuntimeError:
+            pass
+
+
+def test_conflicting_terminal_outcomes_fail_closed() -> None:
+    from lib.feedback_loop import Event
+    from lib.routing_profiles import RoutingProfileError, build_experiment_plan, build_profile, derive_profiles
+    from datetime import datetime, timedelta, timezone
+    candidate = build_profile(
+        profile_id="conflict-test",
+        subject={"namespace_id": "n", "application_id": "a", "application_version": "1",
+                 "application_instance_id": "i", "provider_id": "p", "model_id": "m",
+                 "model_revision": "r", "model_capability_hash": "c", "harness_id": "h",
+                 "harness_version": "v", "agent_instance_id": "agent"},
+        context={"task_family": "performance", "task_shape": "performance", "domain_tags": [],
+                 "phase": None, "environment": "test", "toolset": "fixture",
+                 "statework_versions": {}, "framework_version": "f", "guard_pack_hash": "g"},
+        observations=[], routing_adjustments=[{"route_type": "stage", "route": "flow", "disposition": "suppress",
+                                              "condition": {}, "evidence_refs": ["x"]}],
+        evidence={"event_ids": ["x"], "trajectory_ids": [], "source_hash": "x",
+                  "experiment_id": "e", "candidate_adjustment": {"route_type": "stage", "route": "flow",
+                  "disposition": "suppress", "condition": {}, "evidence_refs": ["x"]}, "receipt_ref": None},
+        criterion={"evaluator_version": "routing-outcome-v2", "minimum_samples": 1,
+                   "minimum_effect": 0.1, "confidence_rule": "x"})
+    plan = build_experiment_plan(experiment_id="e", candidate_profile_hash=candidate["profile_hash"],
+        candidate_profile_id="conflict-test", candidate_adjustment=candidate["routing_adjustments"][0],
+        eligibility={"field": "task_family", "equals": "performance"}, target_evaluator="ev",
+        control_policy_identity="c", treatment_policy_identity="t", canary_fraction=0.5)
+    def ev(eid, outcome):
+        return Event(event_id=eid, timestamp=(datetime(2026,1,1,tzinfo=timezone.utc)+timedelta(seconds=int(eid[-1]))).isoformat(),
+            task_id="task", agent_id="agent", agent_instance_id="agent", session_id="session", attempt_id="attempt-1",
+            category="decision", event_type="route_outcome", namespace_id="n", application_id="a", application_instance_id="i",
+            provider_id="p", model_id="m", model_revision="r", model_capability_hash="c", harness_id="h", harness_version="v",
+            behavioral_subject="s", payload={"route": "flow", "route_type": "stage", "route_decision_id": "d",
+            "evaluator_id": "ev", "evaluator_version": plan["target_evaluator_version"], "evaluator_hash": plan["target_evaluator_hash"],
+            "outcome_source": "evaluator:ev", "outcome": outcome, "candidate_profile_hash": plan["candidate_profile_hash"],
+            "candidate_adjustment_applied": False, "policy_identity": "c", "experiment_plan_hash": plan["plan_hash"],
+            "comparison_context_hash": "same"})
+    contexts = {"session:task:attempt-1": {"namespace_id": "n", "application_id": "a", "application_version": "1",
+        "application_instance_id": "i", "provider_id": "p", "model_id": "m", "model_revision": "r",
+        "model_capability_hash": "c", "harness_id": "h", "harness_version": "v", "agent_instance_id": "agent",
+        "task_family": "performance", "task_shape": "performance", "domain_tags": [], "phase": None,
+        "environment": "test", "toolset": "fixture", "statework_versions": {}, "framework_version": "f",
+        "guard_pack_hash": "g", "routing_experiment_plan": plan, "routing_cohort": "control",
+        "comparison_context_hash": "same"}}
+    with pytest.raises(RoutingProfileError):
+        derive_profiles([ev("e1", "FAIL"), ev("e2", "PASS")], contexts)

@@ -116,6 +116,22 @@ class RoutingLifecycleStore:
             self._save_deployment(updated, state["revision"])
             return updated
 
+    def deploy(self, profile: Mapping[str, Any], *, reason: str = "validated experiment receipt") -> dict[str, Any]:
+        """Publish an active profile without counting deployment as a trajectory."""
+        validate_profile(profile, require_deployable=True)
+        self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.lock_path.touch(mode=0o600, exist_ok=True)
+        with self.lock_path.open("r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = self._load(); revision = int(state.get("revision", 0) or 0) + 1
+            updated = json.loads(json.dumps(dict(profile)))
+            updated["lifecycle_status"] = "active"; updated["lifecycle_revision"] = revision
+            state["profiles"][updated["profile_hash"]] = {"status": "active", "deployment_revision": revision, "reason": reason}
+            state["revision"] = revision; state.setdefault("deployments", []).append({"profile_hash": updated["profile_hash"], "revision": revision, "reason": reason})
+            state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            self._save(state); self._save_deployment(updated, revision)
+            return updated
+
     def _transition(self, profile: Mapping[str, Any], *, status: str,
                     reason: str, evidence: Mapping[str, Any] | None = None) -> dict[str, Any]:
         if status not in {"rolled_back", "stale"}:
