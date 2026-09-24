@@ -732,7 +732,8 @@ def _context_matches_event(event: Any, context: Mapping[str, Any]) -> bool:
              ("behavioral_subject", "behavioral_subject"),
              ("role", "role"), ("interaction_id", "interaction_id"),
              ("delegation_id", "delegation_id"))
-    return all(context.get(field) in (None, getattr(event, event_field)) for field, event_field in pairs)
+    return all(field not in context or context.get(field) == getattr(event, event_field)
+               for field, event_field in pairs)
 
 
 def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[str, Any]],
@@ -757,6 +758,7 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             # tasks.
             event_to_session[_composite_event_identity(event)] = task.trajectory_id
     grouped: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
+    interaction_cohorts: dict[str, str] = {}
     for event in event_list:
         if event.event_type != "route_outcome":
             continue
@@ -792,6 +794,12 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
         cohort = context.get("routing_cohort")
         if not isinstance(plan, Mapping) or cohort not in {"control", "treatment", "holdout"}:
             continue
+        if event.interaction_id:
+            prior_cohort = interaction_cohorts.get(event.interaction_id)
+            if prior_cohort is not None and prior_cohort != cohort:
+                raise RoutingProfileError(
+                    f"shared interaction evidence crosses experimental cohorts: {event.interaction_id}")
+            interaction_cohorts[event.interaction_id] = cohort
         if payload.get("experiment_plan_hash") != plan.get("plan_hash"):
             continue
         if payload.get("outcome_source") != f"evaluator:{plan.get('target_evaluator')}":
