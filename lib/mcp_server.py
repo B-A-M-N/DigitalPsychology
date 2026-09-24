@@ -226,25 +226,25 @@ class DigitalPsychologyService:
                 "candidate_count": len(report.candidates), "rejected": report.rejected}
 
     def _load_persisted_events(self, event_ids: list[Any], *,
-                              namespace_id: str | None = None,
-                              application_instance_id: str | None = None) -> list[Any]:
-        """Load only authenticated, already-persisted event records."""
+                              namespace_id: str,
+                              application_instance_id: str) -> list[Any]:
+        """Load authenticated events by complete, immutable origin."""
+        if not isinstance(namespace_id, str) or not namespace_id:
+            raise ValueError("experiment event origin requires namespace_id")
+        if not isinstance(application_instance_id, str) or not application_instance_id:
+            raise ValueError("experiment event origin requires application_instance_id")
         loaded = []
         for event_id in event_ids:
-            if namespace_id and application_instance_id:
-                row = self._sink._conn.execute(
-                    "SELECT e.payload FROM events e JOIN authenticated_events a "
-                    "ON a.namespace_id=e.namespace_id AND a.application_instance_id=e.application_instance_id AND a.event_id=e.event_id "
-                    "WHERE e.namespace_id = ? AND e.application_instance_id = ? AND e.event_id = ?",
-                    (str(namespace_id), str(application_instance_id), str(event_id)),
-                ).fetchone()
-            else:
-                row = self._sink._conn.execute(
-                    "SELECT e.payload FROM events e JOIN authenticated_events a ON a.event_id=e.event_id "
-                    "WHERE e.event_id = ? LIMIT 1", (str(event_id),)
-                ).fetchone()
+            row = self._sink._conn.execute(
+                "SELECT e.payload FROM events e JOIN authenticated_events a "
+                "ON a.namespace_id=e.namespace_id AND a.application_instance_id=e.application_instance_id AND a.event_id=e.event_id "
+                "WHERE e.namespace_id = ? AND e.application_instance_id = ? AND e.event_id = ?",
+                (str(namespace_id), str(application_instance_id), str(event_id)),
+            ).fetchone()
             if row is None:
-                raise ValueError(f"experiment references an event not present in authenticated store: {event_id!r}")
+                raise ValueError(
+                    "experiment references an event not present in authenticated store: "
+                    f"{namespace_id}|{application_instance_id}|{event_id!r}")
             loaded.append(EventFactory.from_dict(json.loads(row[0])))
         return loaded
 
@@ -277,8 +277,8 @@ class DigitalPsychologyService:
         if not isinstance(event_ids, list) or not isinstance(task_context, Mapping):
             raise ValueError("experiment record lacks authenticated event IDs or context")
         events = self._load_persisted_events(
-            event_ids, namespace_id=record.get("namespace_id"),
-            application_instance_id=record.get("application_instance_id"))
+            event_ids, namespace_id=str(record.get("namespace_id") or ""),
+            application_instance_id=str(record.get("application_instance_id") or ""))
         return self._run_slow_loop(events, task_context)
 
     def purge_expired_events(self, *, retention_days: int) -> dict[str, Any]:

@@ -193,12 +193,13 @@ def test_conflicting_terminal_outcomes_fail_closed() -> None:
             "outcome_source": "evaluator:ev", "outcome": outcome, "candidate_profile_hash": plan["candidate_profile_hash"],
             "candidate_adjustment_applied": False, "policy_identity": "c", "experiment_plan_hash": plan["plan_hash"],
             "comparison_context_hash": "same"})
-    contexts = {"session:task:attempt-1": {"namespace_id": "n", "application_id": "a", "application_version": "1",
+    contexts = {"n|i|agent|session|task|attempt-1|s|None|None|None": {"namespace_id": "n", "application_id": "a", "application_version": "1",
         "application_instance_id": "i", "provider_id": "p", "model_id": "m", "model_revision": "r",
         "model_capability_hash": "c", "harness_id": "h", "harness_version": "v", "agent_instance_id": "agent",
         "task_family": "performance", "task_shape": "performance", "domain_tags": [], "phase": None,
         "environment": "test", "toolset": "fixture", "statework_versions": {}, "framework_version": "f",
-        "guard_pack_hash": "g", "routing_experiment_plan": plan, "routing_cohort": "control",
+        "guard_pack_hash": "g", "role": "", "interaction_id": "", "delegation_id": "",
+        "routing_experiment_plan": plan, "routing_cohort": "control",
         "comparison_context_hash": "same"}}
     with pytest.raises(RoutingProfileError):
         derive_profiles([ev("e1", "FAIL"), ev("e2", "PASS")], contexts)

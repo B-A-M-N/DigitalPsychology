@@ -61,8 +61,9 @@ class SessionTrajectory:
 
 @dataclass
 class InteractionTrajectory:
-    """Delegation topology above individual session trajectories."""
+    """Origin-scoped delegation topology above session trajectories."""
 
+    interaction_identity: tuple[str, str, str]
     interaction_id: str
     session_trajectory_ids: tuple[str, ...]
     agent_instance_ids: tuple[str, ...]
@@ -70,28 +71,31 @@ class InteractionTrajectory:
     event_ids: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
-        return {"interaction_id": self.interaction_id,
+        return {"interaction_identity": list(self.interaction_identity),
+                "interaction_id": self.interaction_id,
                 "session_trajectory_ids": list(self.session_trajectory_ids),
                 "agent_instance_ids": list(self.agent_instance_ids),
                 "roles": list(self.roles), "event_ids": list(self.event_ids)}
 
 
 def build_interaction_trajectories(sessions: Iterable[SessionTrajectory]) -> list[InteractionTrajectory]:
-    grouped: dict[str, dict[str, Any]] = {}
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
     for session in sessions:
-        by_interaction: dict[str, list[Event]] = {}
+        by_interaction: dict[tuple[str, str, str], list[Event]] = {}
         for event in session.events:
             if event.interaction_id:
-                by_interaction.setdefault(event.interaction_id, []).append(event)
-        for interaction_id, events in by_interaction.items():
-            item = grouped.setdefault(interaction_id, {"sessions": set(), "agents": set(),
-                                                       "roles": set(), "events": set()})
+                identity = (str(event.namespace_id), str(event.application_instance_id), str(event.interaction_id))
+                by_interaction.setdefault(identity, []).append(event)
+        for identity, events in by_interaction.items():
+            item = grouped.setdefault(identity, {"sessions": set(), "agents": set(),
+                                                  "roles": set(), "events": set()})
             item["sessions"].add(session.trajectory_id)
             item["agents"].add(session.agent_instance_id)
             item["roles"].update(event.role for event in events if event.role)
             item["events"].update(event.event_id for event in events)
     return [InteractionTrajectory(
-        interaction_id=interaction_id,
+        interaction_identity=identity,
+        interaction_id=identity[2],
         session_trajectory_ids=tuple(sorted(item["sessions"])),
         agent_instance_ids=tuple(sorted(item["agents"])),
         roles=tuple(sorted(item["roles"])),

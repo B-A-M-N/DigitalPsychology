@@ -723,17 +723,18 @@ def _composite_context_key(event: Any) -> str:
     return "|".join(str(value) for value in values[:-1])
 
 
+_PROMOTION_CONTEXT_FIELDS = (
+    "namespace_id", "application_id", "application_instance_id",
+    "agent_instance_id", "session_id", "task_id", "attempt_id",
+    "behavioral_subject", "role", "interaction_id", "delegation_id",
+)
+
+
 def _context_matches_event(event: Any, context: Mapping[str, Any]) -> bool:
-    pairs = (("namespace_id", "namespace_id"),
-             ("application_instance_id", "application_instance_id"),
-             ("agent_instance_id", "agent_instance_id"),
-             ("session_id", "session_id"), ("task_id", "task_id"),
-             ("attempt_id", "attempt_id"),
-             ("behavioral_subject", "behavioral_subject"),
-             ("role", "role"), ("interaction_id", "interaction_id"),
-             ("delegation_id", "delegation_id"))
-    return all(field not in context or context.get(field) == getattr(event, event_field)
-               for field, event_field in pairs)
+    if any(not isinstance(context.get(field), str) or not context.get(field)
+           for field in _PROMOTION_CONTEXT_FIELDS):
+        return False
+    return all(context.get(field) == getattr(event, field) for field in _PROMOTION_CONTEXT_FIELDS)
 
 
 def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[str, Any]],
@@ -758,7 +759,7 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             # tasks.
             event_to_session[_composite_event_identity(event)] = task.trajectory_id
     grouped: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
-    interaction_cohorts: dict[str, str] = {}
+    interaction_cohorts: dict[tuple[str, str, str], str] = {}
     for event in event_list:
         if event.event_type != "route_outcome":
             continue
@@ -776,11 +777,6 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
         if not trajectory_id or not payload.get("route_decision_id"):
             continue
         context_value = task_context.get(_composite_context_key(event))
-        if not isinstance(context_value, Mapping):
-            # Sidecars may use the older session/task/attempt key, but the
-            # authenticated identity must still agree before promotion.
-            context_value = task_context.get(
-                f"{event.session_id}:{event.task_id}:{event.attempt_id}")
         if isinstance(context_value, Mapping) and not _context_matches_event(event, context_value):
             raise RoutingProfileError(
                 "authenticated event identity disagrees with its experiment context")
@@ -794,12 +790,13 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
         cohort = context.get("routing_cohort")
         if not isinstance(plan, Mapping) or cohort not in {"control", "treatment", "holdout"}:
             continue
+        interaction_identity = (str(event.namespace_id), str(event.application_instance_id), str(event.interaction_id or ""))
         if event.interaction_id:
-            prior_cohort = interaction_cohorts.get(event.interaction_id)
+            prior_cohort = interaction_cohorts.get(interaction_identity)
             if prior_cohort is not None and prior_cohort != cohort:
                 raise RoutingProfileError(
-                    f"shared interaction evidence crosses experimental cohorts: {event.interaction_id}")
-            interaction_cohorts[event.interaction_id] = cohort
+                    f"shared interaction evidence crosses experimental cohorts: {interaction_identity}")
+            interaction_cohorts[interaction_identity] = cohort
         if payload.get("experiment_plan_hash") != plan.get("plan_hash"):
             continue
         if payload.get("outcome_source") != f"evaluator:{plan.get('target_evaluator')}":
@@ -841,8 +838,7 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                context.get("phase"), context.get("environment"),
                context.get("toolset"), statework_versions_key,
                context.get("framework_version"), context.get("guard_pack_hash"),
-               context.get("role"), context.get("interaction_id"), context.get("delegation_id"),
-               comparison_hash, plan.get("plan_hash"), route_type, route)
+               context.get("role"), comparison_hash, plan.get("plan_hash"), route_type, route)
         bucket = grouped.setdefault(key, {"control": {}, "treatment": {},
                                           "holdout": {}, "plan": plan})
         trial = bucket[cohort].setdefault(trajectory_id, {
@@ -862,6 +858,7 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             "policy_hash": payload.get("policy_hash") or context.get("policy_hash"),
             "event_ids": [],
             "interaction_ids": [],
+            "event_origins": [],
         })
         if trial["outcome"] is None:
             trial["outcome"] = outcome
@@ -871,7 +868,13 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                 "explicit evaluator supersession is required")
         trial["event_ids"].append(event.event_id)
         if event.interaction_id:
-            trial["interaction_ids"].append(event.interaction_id)
+            trial["interaction_ids"].append(":".join(interaction_identity))
+            trial["event_origins"].append({
+                "namespace_id": event.namespace_id,
+                "application_instance_id": event.application_instance_id,
+                "event_id": event.event_id,
+                "interaction_id": event.interaction_id,
+            })
 
     profiles: list[dict[str, Any]] = []
     for key, cohorts in sorted(grouped.items(), key=lambda item: repr(item[0])):
@@ -898,7 +901,7 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
          provider_id, model_id, model_revision, model_capability_hash, harness_id,
          harness_version, agent_instance_id, task_family,
          domains, phase, environment, toolset, statework_versions_items, framework_version,
-         guard_pack_hash, role, interaction_id, delegation_id, comparison_hash,
+         guard_pack_hash, role, comparison_hash,
          _plan_hash, route_type, route) = key
         source_hash = hashlib.sha256(_canonical(trials).encode("utf-8")).hexdigest()
         context = {"task_family": task_family, "task_shape": task_family,
@@ -907,9 +910,7 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                    "statework_versions": dict(statework_versions_items),
                    "framework_version": framework_version,
                    "guard_pack_hash": guard_pack_hash,
-                   "role": role,
-                   "interaction_id": interaction_id,
-                   "delegation_id": delegation_id}
+                   "role": role}
         subject = {
             "namespace_id": namespace_id or "unknown",
             "application_id": application_id or "unknown",
@@ -944,6 +945,9 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                            "comparison_context_hash": comparison_hash}],
             routing_adjustments=[adjustment],
             evidence={"event_ids": sorted({event_id for trial in trials for event_id in trial["event_ids"]}),
+                      "event_origins": sorted(
+                          [dict(origin) for trial in trials for origin in trial["event_origins"]],
+                          key=lambda item: json.dumps(item, sort_keys=True)),
                       "trajectory_ids": sorted(trial["trajectory_id"] for trial in trials),
                       "source_hash": source_hash,
                       "experiment_id": plan.get("experiment_id"),

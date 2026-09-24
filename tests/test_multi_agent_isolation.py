@@ -1,3 +1,5 @@
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 import pytest
 
@@ -25,9 +27,10 @@ def test_same_event_id_across_origins_is_not_merged():
 def test_mismatched_sidecar_identity_fails_closed():
     event = _event("agent-1")
     plan = {"plan_hash": "p", "target_evaluator": "e", "target_evaluator_version": "1", "target_evaluator_hash": "h", "candidate_profile_hash": "x", "treatment_policy_identity": "t", "control_policy_identity": "c", "holdout_requirements": {"minimum_samples": 1, "evaluators": []}}
-    context = {"namespace_id": "ns", "application_instance_id": "app", "agent_instance_id": "agent-2", "session_id": "same-session", "task_id": "task", "attempt_id": "attempt-1", "behavioral_subject": "subject", "routing_experiment_plan": plan, "routing_cohort": "control", "comparison_context_hash": "c"}
-    with pytest.raises(RoutingProfileError):
-        derive_profiles([event], {"same-session:task:attempt-1": context}, minimum_samples=1)
+    context = {"namespace_id": "ns", "application_id": "app", "application_instance_id": "app", "agent_instance_id": "agent-2", "session_id": "same-session", "task_id": "task", "attempt_id": "attempt-1", "behavioral_subject": "subject", "role": "delegator", "interaction_id": "", "delegation_id": "", "routing_experiment_plan": plan, "routing_cohort": "control", "comparison_context_hash": "c"}
+    key = "ns|app|agent-1|same-session|task|attempt-1|subject|delegator|None|None"
+    with pytest.raises(RoutingProfileError, match="authenticated event identity"):
+        derive_profiles([event], {key: context}, minimum_samples=1)
 
 
 def test_shared_interaction_cannot_cross_cohorts():
@@ -87,3 +90,53 @@ def test_shared_interaction_cannot_cross_cohorts():
         contexts[f"ns|app|{ev.agent_instance_id}|session|task|attempt-1|subject|delegator|shared|d"] = data
     with pytest.raises(RoutingProfileError, match="shared interaction"):
         derive_profiles(events, contexts, minimum_samples=1)
+
+
+def test_legacy_context_is_importable_but_ineligible_for_promotion():
+    event = _event("agent-1", interaction="interaction-1")
+    context = {"namespace_id": "ns", "application_instance_id": "app",
+               "agent_instance_id": "agent-1", "session_id": "same-session",
+               "task_id": "task", "attempt_id": "attempt-1",
+               "behavioral_subject": "subject", "routing_cohort": "control"}
+    assert derive_profiles([event], {"same-session:task:attempt-1": context}, minimum_samples=1) == []
+
+
+def test_reused_interaction_id_is_origin_scoped():
+    events = [_event("agent-1", app="app-a", namespace="ns-a", interaction="shared"),
+              _event("agent-1", app="app-b", namespace="ns-a", interaction="shared")]
+    _episodes, _tasks, _sessions, _agents = build_trajectories(events)
+    from lib.trajectories import build_interaction_trajectories
+    assert len(build_interaction_trajectories(_sessions)) == 2
+
+
+def test_persisted_event_retrieval_requires_complete_origin():
+    from datetime import datetime, timezone
+    from lib.feedback_loop import EventFactory
+    from lib.mcp_server import DigitalPsychologyService
+    with tempfile.TemporaryDirectory() as raw:
+        service = DigitalPsychologyService(event_db=Path(raw) / "events.sqlite3")
+        event = EventFactory.from_dict({
+            "schema_version": "2.2.0", "event_id": "same-event",
+            "timestamp": datetime.now(timezone.utc).isoformat(), "namespace_id": "ns-a",
+            "application_id": "app", "application_instance_id": "instance-a",
+            "task_id": "task", "agent_id": "agent", "actor_id": "agent",
+            "agent_instance_id": "agent", "session_id": "session", "attempt_id": "attempt", "segment_id": "segment-0",
+            "behavioral_subject": "subject", "category": "decision", "event_type": "route_outcome",
+        })
+        service._sink.emit(event)
+        service._sink._conn.execute(
+            "INSERT INTO authenticated_events(namespace_id, application_instance_id, event_id) VALUES (?,?,?)",
+            ("ns-a", "instance-a", "same-event"))
+        service._sink._conn.commit()
+        loaded = service._load_persisted_events(
+            ["same-event"], namespace_id="ns-a", application_instance_id="instance-a")
+        assert loaded[0].event_id == "same-event"
+        for namespace, instance in (("", "instance-a"), ("ns-a", ""), ("ns-b", "instance-a")):
+            try:
+                service._load_persisted_events(
+                    ["same-event"], namespace_id=namespace, application_instance_id=instance)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("incomplete or wrong event origin accepted")
+        service.close()
