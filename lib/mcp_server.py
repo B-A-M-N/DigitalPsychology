@@ -41,6 +41,7 @@ class DigitalPsychologyService:
                  max_ingest_seconds_per_origin: float = 0.25,
                  busy_timeout_ms: int = 250,
                  per_origin_write_limit: int = 100_000,
+                 backpressure_recovery_seconds: float = 5.0,
                  sharing_authority: SharingDecisionAuthority | None = None) -> None:
         root = trusted_state_root()
         self.event_db = event_db or Path(
@@ -53,11 +54,13 @@ class DigitalPsychologyService:
         self._promotion_secret = os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode()
         self._sharing_authority = sharing_authority
         if (max_pending_events_per_origin < 1 or max_ingest_seconds_per_origin <= 0
+                or backpressure_recovery_seconds <= 0
                 or not 10 <= int(busy_timeout_ms) <= 5000 or int(per_origin_write_limit) < 1):
             raise ValueError("per-origin ingestion bounds must be positive")
         self.max_pending_events_per_origin = int(max_pending_events_per_origin)
         self.max_ingest_seconds_per_origin = float(max_ingest_seconds_per_origin)
-        self._pending_origins: dict[tuple[str, str], int] = {}
+        self.backpressure_recovery_seconds = float(backpressure_recovery_seconds)
+        self._pending_origins: dict[tuple[str, str], list[float]] = {}
         self._sink = SQLiteSink(
             self.event_db, busy_timeout_ms=busy_timeout_ms,
             per_origin_daily_write_limit=per_origin_write_limit)
@@ -123,13 +126,20 @@ class DigitalPsychologyService:
             data.pop("host_attestation", None)
             parsed = EventFactory.from_dict(data)
             origin = (parsed.namespace_id, parsed.application_instance_id)
-            if self._pending_origins.get(origin, 0) >= self.max_pending_events_per_origin:
-                raise ValueError("per-origin behavioral ingestion budget is exhausted")
+            now = time.monotonic()
+            recent = [stamp for stamp in self._pending_origins.get(origin, ())
+                      if now - stamp < self.backpressure_recovery_seconds]
+            if recent:
+                self._pending_origins[origin] = recent
+            else:
+                self._pending_origins.pop(origin, None)
+            if len(recent) >= self.max_pending_events_per_origin:
+                raise ValueError("per-origin behavioral ingestion backpressure is active")
             started = time.monotonic()
             self._sink.emit_authenticated(parsed, authenticated=authenticated)
             elapsed = time.monotonic() - started
             if elapsed > self.max_ingest_seconds_per_origin:
-                self._pending_origins[origin] = self._pending_origins.get(origin, 0) + 1
+                self._pending_origins.setdefault(origin, []).append(time.monotonic())
         except (EventError, ValueError) as exc:
             raise ValueError(f"behavior event rejected: {exc}") from exc
         data = parsed.to_dict()
