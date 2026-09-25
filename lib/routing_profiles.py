@@ -773,33 +773,41 @@ def applicable_adjustments(profile: BehavioralRoutingProfile,
                            sharing_authority: SharingDecisionAuthority | None = None) -> list[dict[str, Any]]:
     validate_profile(profile.to_dict(), require_deployable=True,
                      sharing_authority=sharing_authority)
-    for field in ("namespace_id", "application_id", "provider_id", "model_id",
-                  "model_revision", "harness_id", "application_version",
-                  "model_capability_hash", "harness_version"):
-        if not _match_value(profile.subject.get(field), context.get(field), semantics="exact"):
+    scope = getattr(profile, "sharing_scope", "agent_private")
+    common = ("application_version", "provider_id", "model_id", "model_revision",
+              "model_capability_hash", "harness_id", "harness_version")
+    if any(not _match_value(profile.subject.get(field), context.get(field))
+           for field in common):
+        return []
+    if scope == "agent_private":
+        if (not _match_value(profile.subject.get("namespace_id"), context.get("namespace_id"))
+                or not _match_value(profile.subject.get("application_id"), context.get("application_id"))
+                or not _match_value(profile.subject.get("application_instance_id"), context.get("application_instance_id"))
+                or not _match_value(profile.subject.get("agent_instance_id"), context.get("agent_instance_id"))):
             return []
-    sharing_scope = getattr(profile, "sharing_scope", "agent_private")
-    if sharing_scope == "agent_private":
-        if (not _match_value(profile.subject.get("application_instance_id"),
-                             context.get("application_instance_id"), semantics="exact")
-                or not _match_value(profile.subject.get("agent_instance_id"),
-                                    context.get("agent_instance_id"), semantics="exact")):
+    elif scope == "application_shared":
+        if (not _match_value(profile.subject.get("namespace_id"), context.get("namespace_id"))
+                or not _match_value(profile.subject.get("application_id"), context.get("application_id"))):
             return []
-    elif sharing_scope in {"application_shared", "cross_application"}:
-        adopted = set(context.get("adopted_profile_hashes") or ())
-        if profile.profile_hash not in adopted:
-            return []
-        if sharing_scope == "application_shared":
-            if (profile.subject.get("namespace_id") != context.get("namespace_id")
-                    or profile.subject.get("application_id") != context.get("application_id")):
-                return []
-        else:
-            if profile.subject.get("application_id") == context.get("application_id"):
-                return []
-    else:
+    elif scope != "cross_application":
         raise RoutingProfileError("unsupported routing profile sharing scope")
+    if scope != "agent_private":
+        if profile.profile_hash not in set(context.get("adopted_profile_hashes") or ()):
+            return []
+        if scope == "cross_application":
+            allowed = set(context.get("authorized_target_application_ids") or ())
+            if context.get("application_id") not in allowed:
+                return []
+            constraints = profile.context.get("compatibility_constraints")
+            if not isinstance(constraints, Mapping) or not constraints:
+                return []
+            if any(not _match_value(expected, context.get(field))
+                   for field, expected in constraints.items()):
+                return []
     semantics = dict(profile.selector_semantics or {})
     for field, expected in profile.context.items():
+        if field == "compatibility_constraints":
+            continue
         if not _match_value(expected, context.get(field),
                             semantics=str(semantics.get("context", "exact"))):
             return []

@@ -873,7 +873,6 @@ class SQLiteSink:
             raise ValueError("per-origin write limit must be positive")
         self.busy_timeout_ms = int(busy_timeout_ms)
         self.per_origin_daily_write_limit = int(per_origin_daily_write_limit)
-        self._origin_counts: dict[tuple[str, str], int] = {}
         self._conn = sqlite3.connect(str(self.path), timeout=self.busy_timeout_ms / 1000)
         self._conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -982,6 +981,11 @@ class SQLiteSink:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_session ON events (agent_instance_id, session_id, task_id, attempt_id)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_events_origin ON events (namespace_id, application_id, application_instance_id, provider_id, model_id, model_revision, harness_id, harness_version)")
         self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_events_origin ON events (namespace_id, application_instance_id, event_id)")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS origin_daily_quotas (
+            day TEXT NOT NULL, namespace_id TEXT NOT NULL,
+            application_instance_id TEXT NOT NULL, event_count INTEGER NOT NULL,
+            PRIMARY KEY(day, namespace_id, application_instance_id))""")
+        self._conn.commit()
         self._conn.execute("""CREATE TABLE IF NOT EXISTS retention_aggregates (
             aggregate_id TEXT PRIMARY KEY,
             namespace_id TEXT NOT NULL,
@@ -1035,23 +1039,36 @@ class SQLiteSink:
                 "aggregate_rows": self._conn.execute("SELECT COUNT(*) FROM retention_aggregates").fetchone()[0]}
 
     def emit(self, event: Event) -> None:
+        self.emit_authenticated(event, authenticated=False)
+
+    def emit_authenticated(self, event: Event, *, authenticated: bool) -> None:
         data = event.to_dict()
         EventSchema.validate(data)
         payload = json.dumps(data, sort_keys=True)
         origin = (data["namespace_id"], data["application_instance_id"], data["event_id"])
         origin_key = origin[:2]
-        if self._origin_counts.get(origin_key, 0) >= self.per_origin_daily_write_limit:
-            raise EventError(f"per-origin write budget exhausted for {origin_key!r}")
+        today = datetime.now(timezone.utc).date().isoformat()
         deadline = time.monotonic() + min(5.0, max(0.25, self.busy_timeout_ms / 1000 * 8))
         attempt = 0
         while True:
             try:
+                quota = self._conn.execute(
+                    "SELECT event_count FROM origin_daily_quotas WHERE day=? AND namespace_id=? AND application_instance_id=?",
+                    (today, origin[0], origin[1])).fetchone()
+                if quota is not None and int(quota[0]) >= self.per_origin_daily_write_limit:
+                    raise EventError(f"per-origin write budget exhausted for {origin_key!r}")
                 existing = self._conn.execute(
                     "SELECT payload FROM events WHERE namespace_id = ? AND application_instance_id = ? AND event_id = ?",
                     origin).fetchone()
                 if existing is not None:
                     if existing[0] != payload:
                         raise EventError("replayed event identity has different payload")
+                    if authenticated:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO authenticated_events "
+                            "(namespace_id, application_instance_id, event_id) VALUES (?,?,?)",
+                            origin)
+                        self._conn.commit()
                     return
                 self._conn.execute(
                     "INSERT INTO events (namespace_id, application_id, application_instance_id, provider_id, model_id, model_revision, model_capability_hash, harness_id, harness_version, event_id, agent_instance_id, session_id, task_id, attempt_id, segment_id, agent_id, behavioral_subject, timestamp, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1062,8 +1079,16 @@ class SQLiteSink:
                      data["task_id"], data["attempt_id"], data["segment_id"],
                      data["agent_id"], data["behavioral_subject"], data["timestamp"], payload),
                 )
+                if authenticated:
+                    self._conn.execute(
+                        "INSERT INTO authenticated_events "
+                        "(namespace_id, application_instance_id, event_id) VALUES (?,?,?)",
+                        origin)
+                self._conn.execute(
+                    "INSERT INTO origin_daily_quotas(day,namespace_id,application_instance_id,event_count) "
+                    "VALUES (?,?,?,1) ON CONFLICT(day,namespace_id,application_instance_id) "
+                    "DO UPDATE SET event_count=event_count+1", (today, origin[0], origin[1]))
                 self._conn.commit()
-                self._origin_counts[origin_key] = self._origin_counts.get(origin_key, 0) + 1
                 return
             except sqlite3.IntegrityError as exc:
                 self._conn.rollback()
@@ -1071,12 +1096,18 @@ class SQLiteSink:
                     "SELECT payload FROM events WHERE namespace_id = ? AND application_instance_id = ? AND event_id = ?",
                     origin).fetchone()
                 if existing is not None and existing[0] == payload:
+                    if authenticated:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO authenticated_events "
+                            "(namespace_id, application_instance_id, event_id) VALUES (?,?,?)",
+                            origin)
+                        self._conn.commit()
                     return
                 raise EventError(f"event identity collision for origin {origin!r}") from exc
             except sqlite3.OperationalError as exc:
                 self._conn.rollback()
                 message = str(exc).lower()
-                if ("locked" not in message and "busy" not in message
+                if (("locked" not in message and "busy" not in message)
                         or time.monotonic() >= deadline):
                     raise EventError(f"SQLite write failed for origin {origin!r}: {exc}") from exc
                 delay = min(0.25, 0.01 * (2 ** attempt))

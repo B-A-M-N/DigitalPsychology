@@ -47,6 +47,8 @@ class DigitalPsychologyService:
             os.environ.get("DIGITALPSYCHOLOGY_EVENT_DB", root / "events.sqlite3"))
         self.profile_path = profile_path
         self._trusted_producers = {str(k): dict(v) for k, v in (trusted_producers or {}).items()}
+        # Legacy single-host key remains supported only when no producer map
+        # exists. Configured producers use distinct per-key secrets.
         self._attestation_secret = os.environ.get("DIGITALPSYCHOLOGY_INGESTION_SECRET", "").encode()
         self._promotion_secret = os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode()
         self._sharing_authority = sharing_authority
@@ -67,27 +69,51 @@ class DigitalPsychologyService:
     def close(self) -> None:
         self._sink.close()
 
-    def _attest_event(self, data: Mapping[str, Any]) -> None:
-        privileged = data.get("category") in {"validation", "state_transition", "completion"} or data.get("actor_id") in {"operator", "repository_owner", "service_owner"}
-        if privileged and not self._trusted_producers and not self._attestation_secret:
-            raise ValueError("privileged behavior events require host attestation")
-        if not self._trusted_producers and not self._attestation_secret:
-            return False
-        if not self._attestation_secret:
-            raise ValueError("trusted producer configuration requires a cryptographic ingestion secret")
-        if self._attestation_secret:
-            signature = str(data.get("host_attestation", {}).get("signature", ""))
+    def _producer_key(self, key_id: str) -> bytes:
+        raw = os.environ.get(f"DIGITALPSYCHOLOGY_INGESTION_KEY_{key_id}", "")
+        if not raw or not self._trusted_producers:
+            raise ValueError("behavior event producer key is unavailable")
+        return raw.encode()
+
+    def _attest_event(self, data: Mapping[str, Any]) -> bool:
+        privileged = (data.get("category") in {"validation", "state_transition", "completion"}
+                      or data.get("actor_id") in {"operator", "repository_owner", "service_owner"})
+        producer_key = "|".join((str(data.get("namespace_id") or ""),
+                                 str(data.get("application_instance_id") or ""),
+                                 str(data.get("agent_instance_id") or "")))
+        producer = self._trusted_producers.get(producer_key)
+        attestation = data.get("host_attestation")
+        if producer is not None:
+            if not isinstance(attestation, Mapping):
+                raise ValueError("configured producer requires host attestation")
+            key_id = str(attestation.get("key_id") or "")
+            if not key_id or key_id != str(producer.get("key_id") or ""):
+                raise ValueError("behavior event producer key identifier is unauthorized")
+            if attestation.get("issuer") != producer.get("issuer"):
+                raise ValueError("behavior event attestation issuer is invalid")
+            if data.get("actor_id") not in set(producer.get("allowed_actors", ())):
+                raise ValueError("behavior event actor is not producer-authorized")
+            if data.get("category") not in set(producer.get("allowed_categories", ())):
+                raise ValueError("behavior event category is not producer-authorized")
+            if data.get("application_id") != producer.get("application_id"):
+                raise ValueError("behavior event application is not producer-authorized")
             body = {k: v for k, v in data.items() if k != "host_attestation"}
-            expected = hmac.new(self._attestation_secret, _canonical(body).encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(signature, expected):
+            expected = hmac.new(self._producer_key(key_id), _canonical(body).encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(str(attestation.get("signature") or ""), expected):
                 raise ValueError("behavior event host attestation is invalid")
             return True
-        key = (str(data.get("namespace_id")), str(data.get("application_instance_id")), str(data.get("agent_instance_id")))
-        producer = self._trusted_producers.get("|".join(key))
-        if not producer or data.get("actor_id") not in set(producer.get("allowed_actors", ())):
-            raise ValueError("behavior event producer is not host-authorized")
-        if data.get("host_attestation", {}).get("issuer") != producer.get("issuer"):
-            raise ValueError("behavior event attestation issuer is invalid")
+        if self._trusted_producers:
+            raise ValueError("behavior event producer is not configured")
+        if not self._attestation_secret:
+            if privileged:
+                raise ValueError("privileged behavior events require host attestation")
+            return False
+        if not isinstance(attestation, Mapping):
+            raise ValueError("behavior event host attestation is required")
+        body = {k: v for k, v in data.items() if k != "host_attestation"}
+        expected = hmac.new(self._attestation_secret, _canonical(body).encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(str(attestation.get("signature") or ""), expected):
+            raise ValueError("behavior event host attestation is invalid")
         return True
 
     def ingest_behavior_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
@@ -100,15 +126,10 @@ class DigitalPsychologyService:
             if self._pending_origins.get(origin, 0) >= self.max_pending_events_per_origin:
                 raise ValueError("per-origin behavioral ingestion budget is exhausted")
             started = time.monotonic()
-            self._sink.emit(parsed)
+            self._sink.emit_authenticated(parsed, authenticated=authenticated)
             elapsed = time.monotonic() - started
             if elapsed > self.max_ingest_seconds_per_origin:
                 self._pending_origins[origin] = self._pending_origins.get(origin, 0) + 1
-            if authenticated:
-                self._sink._conn.execute(
-                    "INSERT OR IGNORE INTO authenticated_events(namespace_id, application_instance_id, event_id) VALUES (?,?,?)",
-                    (parsed.namespace_id, parsed.application_instance_id, parsed.event_id))
-                self._sink._conn.commit()
         except (EventError, ValueError) as exc:
             raise ValueError(f"behavior event rejected: {exc}") from exc
         data = parsed.to_dict()

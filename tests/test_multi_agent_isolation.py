@@ -423,3 +423,18 @@ def test_shared_profile_requires_authenticated_scope_and_explicit_adoption():
         pass
     else:
         raise AssertionError("forged sharing decision accepted")
+
+
+def test_multi_profile_registry_preserves_independent_active_profiles(tmp_path):
+    from lib.routing_lifecycle import RoutingLifecycleStore
+    store=RoutingLifecycleStore(tmp_path/"state.json")
+    first=store.deploy(_deployable_profile("first-registry"))
+    second=store.deploy(_deployable_profile("second-registry"))
+    entries={item["profile_hash"]:item for item in store.list_registry()}
+    assert first["profile_hash"] in entries and second["profile_hash"] in entries
+    artifact=json.loads((tmp_path/"active-routing-profile.json").read_text())
+    hashes={item["profile_hash"] for item in artifact["profiles"]}
+    assert {first["profile_hash"],second["profile_hash"]} <= hashes
+    store.adopt_profile(second, adopter_agent_id="agent-b", reason="eligible task")
+    refreshed=json.loads((tmp_path/"active-routing-profile.json").read_text())
+    assert len(refreshed["profiles"]) == len(artifact["profiles"])

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import fcntl
+import hashlib
 import os
 import tempfile
 import uuid
@@ -27,6 +28,46 @@ class RoutingLifecycleStore:
         self.path = path
         self.lock_path = path.with_name(path.name + ".lock")
         self.deployment_path = path.with_name("active-routing-profile.json")
+
+    def registry_path(self) -> Path:
+        return self.path.with_name("routing-profile-registry.json")
+
+    def _registry_lock(self):
+        path = self.registry_path(); path.parent.mkdir(parents=True, exist_ok=True)
+        lock = path.with_name(path.name + ".lock"); lock.touch(mode=0o600, exist_ok=True)
+        return lock
+
+    def _load_registry(self) -> dict[str, Any]:
+        path = self.registry_path()
+        if not path.exists(): return {"schema_version":"1.0.0","revision":0,"profiles":{}}
+        data=json.loads(path.read_text())
+        if not isinstance(data,dict) or not isinstance(data.get("profiles"),dict): raise RoutingProfileError("invalid routing profile registry")
+        return data
+
+    def _save_registry(self,state:Mapping[str,Any]) -> None:
+        path=self.registry_path(); fd,tmp=tempfile.mkstemp(dir=path.parent,prefix=".routing-registry-",suffix=".tmp")
+        try:
+            with os.fdopen(fd,"w",encoding="utf-8") as f: json.dump(dict(state),f,indent=2);f.write("\n");f.flush();os.fsync(f.fileno())
+            os.chmod(tmp,0o600);os.replace(tmp,path)
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+
+    def list_registry(self) -> list[dict[str,Any]]:
+        with self._registry_lock().open("r+",encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(),fcntl.LOCK_SH)
+            try:return [dict(v) for v in self._load_registry()["profiles"].values()]
+            finally:fcntl.flock(lock.fileno(),fcntl.LOCK_UN)
+
+    def adopt_profile(self, profile:Mapping[str,Any], *, adopter_agent_id:str, reason:str) -> str:
+        validate_profile(profile,require_deployable=True)
+        if not adopter_agent_id: raise RoutingProfileError("adopter_agent_id is required")
+        ph=str(profile["profile_hash"]); lock=self._registry_lock()
+        with lock.open("r+",encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
+            state=self._load_registry(); entry=dict(state["profiles"].get(ph) or {"profile_hash":ph,"profile":dict(profile),"status":profile.get("status"),"scope":profile.get("sharing_scope","agent_private"),"revisions":[]})
+            entry.setdefault("adopters",{})[str(adopter_agent_id)]={"authorized":True,"reason":reason,"recorded_at":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")}
+            state["profiles"][ph]=entry;state["revision"]=int(state.get("revision",0))+1;state["updated_at"]=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+            self._save_registry(state);return ph
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -136,7 +177,9 @@ class RoutingLifecycleStore:
                 "deployment_lineage_id": prior_lineage, "reason": reason}
             state["revision"] = revision; state.setdefault("deployments", []).append({"profile_hash": updated["profile_hash"], "revision": revision, "reason": reason})
             state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            self._save(state); self._save_deployment(updated, revision)
+            self._save(state)
+            self.adopt_profile(updated, adopter_agent_id="publisher", reason=reason)
+            self._save_deployment(updated, revision)
             return updated
 
     def _transition(self, profile: Mapping[str, Any], *, status: str,
@@ -187,39 +230,20 @@ class RoutingLifecycleStore:
                                 evidence={"evidence_refs": list(evidence_refs)})
 
     def _save_deployment(self, profile: Mapping[str, Any], revision: int) -> None:
-        """Publish the current revision and retain a known-good predecessor."""
         if self.deployment_path == self.path:
             return
-        known_good = None
-        known_good_revision = None
-        if self.deployment_path.exists():
-            try:
-                existing = json.loads(self.deployment_path.read_text(encoding="utf-8"))
-                if isinstance(existing, Mapping) and isinstance(existing.get("known_good_profile"), Mapping):
-                    candidate = dict(existing["known_good_profile"])
-                    if candidate.get("profile_hash") != profile.get("profile_hash"):
-                        known_good = candidate
-                        known_good_revision = existing.get("known_good_revision")
-            except (OSError, json.JSONDecodeError, TypeError):
-                pass
-        payload = {"schema_version": "1.1.0", "revision": revision,
-                   "status": profile.get("status"), "profile": dict(profile),
-                   "deployment_lineage_id": profile.get("deployment_lineage_id")}
-        if profile.get("lifecycle_status") == "active" and profile.get("status") == "active":
-            payload["known_good_profile"] = dict(profile)
-            payload["known_good_revision"] = revision
-        elif known_good is not None:
-            payload["known_good_profile"] = known_good
-            payload["known_good_revision"] = known_good_revision
-        fd, temporary = tempfile.mkstemp(
-            dir=str(self.deployment_path.parent), prefix=".active-routing-profile.", suffix=".tmp")
+        active=[]
+        for entry in self.list_registry():
+            stored=entry.get("profile") or {}
+            if stored.get("status") not in {"stale","rolled_back"} and stored.get("lifecycle_status") not in {"stale","rolled_back"}:
+                active.append(dict(stored))
+        if not any(item.get("profile_hash")==profile.get("profile_hash") for item in active):
+            active.append(dict(profile))
+        payload={"schema_version":"2.0.0","revision":revision,"status":"pack","profiles":active,"profiles_hash":hashlib.sha256(_canonical(active).encode()).hexdigest()}
+        fd,tmp=tempfile.mkstemp(dir=str(self.deployment_path.parent),prefix=".active-routing-profile-",suffix=".tmp")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream, indent=2)
-                stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
-            os.chmod(temporary, 0o600); os.replace(temporary, self.deployment_path)
-            directory_fd = os.open(self.deployment_path.parent, os.O_RDONLY)
-            try: os.fsync(directory_fd)
-            finally: os.close(directory_fd)
+            with os.fdopen(fd,"w",encoding="utf-8") as stream:
+                json.dump(payload,stream,indent=2);stream.write("\n");stream.flush();os.fsync(stream.fileno())
+            os.chmod(tmp,0o600);os.replace(tmp,self.deployment_path)
         finally:
-            if os.path.exists(temporary): os.unlink(temporary)
+            if os.path.exists(tmp): os.unlink(tmp)

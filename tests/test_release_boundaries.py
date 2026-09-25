@@ -226,3 +226,81 @@ def test_sqlite_write_contention_has_a_bounded_busy_timeout(tmp_path):
     finally:
         second.rollback(); second.close(); first.close()
     assert time.monotonic() - started < 1.0
+
+
+def test_configured_producers_require_matching_key_and_authorization(tmp_path, monkeypatch):
+    import hmac
+    from lib.mcp_server import DigitalPsychologyService, _canonical
+    event = _event("instance-a").to_dict()
+    event.update({"actor_id": "agent", "category": "decision"})
+    producer_key = "producer-a-key"
+    monkeypatch.setenv(f"DIGITALPSYCHOLOGY_INGESTION_KEY_{producer_key}", "secret-a")
+    producers = {
+        f"{event['namespace_id']}|{event['application_instance_id']}|{event['agent_instance_id']}": {
+            "key_id": producer_key, "issuer": "host:a", "application_id": event["application_id"],
+            "allowed_actors": ["agent"], "allowed_categories": ["decision"],
+        }
+    }
+    service = DigitalPsychologyService(
+        event_db=tmp_path / "events.sqlite3", trusted_producers=producers)
+    body = {k: v for k, v in event.items() if k != "host_attestation"}
+    signature = hmac.new(b"secret-a", _canonical(body).encode(), hashlib.sha256).hexdigest()
+    accepted = {**event, "host_attestation": {
+        "key_id": producer_key, "issuer": "host:a", "signature": signature}}
+    assert service.ingest_behavior_event(accepted)["accepted"]
+    forged = {**accepted, "host_attestation": {
+        "key_id": producer_key, "issuer": "host:b", "signature": signature}}
+    with pytest.raises(ValueError, match="issuer"):
+        service.ingest_behavior_event(forged)
+    impersonated = dict(event, event_id="forged-origin", application_id="other-app")
+    body = {k: v for k, v in impersonated.items() if k != "host_attestation"}
+    impersonated["host_attestation"] = {
+        "key_id": producer_key, "issuer": "host:a",
+        "signature": hmac.new(b"secret-a", _canonical(body).encode(), hashlib.sha256).hexdigest()}
+    with pytest.raises(ValueError, match="application"):
+        service.ingest_behavior_event(impersonated)
+    # Rotate only this producer's key.
+    monkeypatch.setenv(f"DIGITALPSYCHOLOGY_INGESTION_KEY_{producer_key}", "secret-a-rotated")
+    replay = {**event, "event_id": "after-rotation"}
+    body = {k: v for k, v in replay.items() if k != "host_attestation"}
+    replay["host_attestation"] = {
+        "key_id": producer_key, "issuer": "host:a",
+        "signature": hmac.new(b"secret-a-rotated", _canonical(body).encode(), hashlib.sha256).hexdigest()}
+    assert service.ingest_behavior_event(replay)["accepted"]
+    service.close()
+
+
+def test_authenticated_marker_is_written_in_same_transaction(tmp_path, monkeypatch):
+    from lib.mcp_server import DigitalPsychologyService
+    service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
+    event = _event("instance-a").to_dict()
+    service._sink.emit_authenticated(__import__("lib.feedback_loop", fromlist=["EventFactory"]).EventFactory.from_dict(event), authenticated=True)
+    assert service._sink._conn.execute(
+        "SELECT COUNT(*) FROM authenticated_events WHERE event_id = ?", (event["event_id"],)
+    ).fetchone()[0] == 1
+    service.close()
+
+
+def test_origin_daily_quota_is_durable_and_resets_by_day(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from lib.feedback_loop import SQLiteSink
+    db = tmp_path / "quota.sqlite3"
+    sink = SQLiteSink(db, per_origin_daily_write_limit=1)
+    first = _event("quota-a")
+    sink.emit(first)
+    second = _event("quota-a")
+    second.event_id = "second"
+    with pytest.raises(Exception, match="budget"):
+        sink.emit(second)
+    sink.close()
+    restarted = SQLiteSink(db, per_origin_daily_write_limit=1)
+    with pytest.raises(Exception, match="budget"):
+        restarted.emit(second)
+    restarted.close()
+    conn = __import__("sqlite3").connect(db)
+    day = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+    conn.execute("DELETE FROM origin_daily_quotas WHERE namespace_id=? AND application_instance_id=?",
+                 ("test-namespace", "quota-a"))
+    conn.commit(); conn.close()
+    recovered = SQLiteSink(db, per_origin_daily_write_limit=1)
+    recovered.emit(second); recovered.close()
