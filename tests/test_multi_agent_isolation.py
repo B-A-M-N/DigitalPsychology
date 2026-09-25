@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
@@ -140,3 +141,285 @@ def test_persisted_event_retrieval_requires_complete_origin():
             else:
                 raise AssertionError("incomplete or wrong event origin accepted")
         service.close()
+
+
+def _deployable_profile(profile_id="lineage-test", disposition="prefer"):
+    from lib.routing_profiles import build_profile
+    profile = build_profile(
+        profile_id=profile_id,
+        subject={"namespace_id":"n","application_id":"a","application_version":"1",
+                 "application_instance_id":"i","provider_id":"p","model_id":"m",
+                 "model_revision":"r","model_capability_hash":"c","harness_id":"h",
+                 "harness_version":"v","agent_instance_id":"agent"},
+        context={"task_family":"performance"},
+        observations=[],
+        routing_adjustments=[{"route_type":"stage","route":"flow","disposition":disposition,
+                              "condition":{},"evidence_refs":["e"]}],
+        evidence={"event_ids":["e"],"trajectory_ids":[],"source_hash":"s",
+                  "experiment_id":"exp","candidate_adjustment":{},
+                  "receipt_ref":None},
+        criterion={"evaluator_version":"v","minimum_samples":1,"minimum_effect":0.1,
+                   "confidence_rule":"test"})
+    from lib.routing_profiles import _canonical, profile_semantic_hash, promote_profile
+    import hashlib
+    receipt = {
+        "receipt_id": f"receipt-{profile_id}", "kind": "routing_experiment",
+        "decision": "pass", "profile_candidate_hash": profile_semantic_hash(profile),
+        "source_evidence_hash": profile["evidence"]["source_hash"],
+        "experiment_id": profile["evidence"]["experiment_id"],
+    }
+    receipt["receipt_hash"] = hashlib.sha256(_canonical(receipt).encode()).hexdigest()
+    return promote_profile(profile, receipt, status="validated")
+
+
+def test_lifecycle_lineage_survives_revision_and_restart(tmp_path):
+    from lib.routing_lifecycle import RoutingLifecycleStore
+    store = RoutingLifecycleStore(tmp_path / "state.json")
+    profile = store.deploy(_deployable_profile("lineage-restart"))
+    lineage = profile["deployment_lineage_id"]
+    observed = store.observe(profile, [{"profile_hash": profile["profile_hash"],
+                                         "trajectory_id":"t1","eligible":True}])
+    assert observed["lifecycle_revision"] == profile["lifecycle_revision"] + 1
+    assert observed["deployment_lineage_id"] == lineage
+    restarted = RoutingLifecycleStore(tmp_path / "state.json")
+    assert restarted.observe(observed, [])["deployment_lineage_id"] == lineage
+
+
+def test_fallback_requires_explicit_known_good_profile(tmp_path):
+    from lib.mcp_server import DigitalPsychologyService
+    from lib.routing_lifecycle import RoutingLifecycleStore
+    store = RoutingLifecycleStore(tmp_path / "state.json")
+    first = store.deploy(_deployable_profile("known-good"))
+    second = store.deploy(_deployable_profile("new-profile"))
+    artifact = tmp_path / "active-routing-profile.json"
+    payload = {
+        "revision": second["lifecycle_revision"],
+        "profile": {**second, "status": "stale", "lifecycle_status": "stale"},
+        "previous_profile": first,
+    }
+    artifact.write_text(json.dumps(payload), encoding="utf-8")
+    service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3", profile_path=artifact)
+    try:
+        profiles, _ = service._load_profiles()
+        assert profiles == []
+        payload["known_good_profile"] = first
+        payload["known_good_revision"] = first["lifecycle_revision"]
+        artifact.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            profiles, _ = service._load_profiles()
+        except Exception as exc:
+            raise AssertionError(f"explicit known-good fallback was rejected: {exc}")
+        assert profiles[0]["profile_hash"] == first["profile_hash"]
+    finally:
+        service.close()
+
+
+def test_provenance_and_comparison_context_are_distinct():
+    from lib.routing_profiles import comparison_context, provenance_identity
+    event = _event("agent", interaction="interaction-1")
+    context = {
+        "namespace_id": "ns", "application_id": "app", "application_instance_id": "app",
+        "model_id": "model", "task_family": "performance", "role": "delegate",
+        "interaction_id": "interaction-1", "delegation_id": "d1",
+    }
+    provenance = provenance_identity(event)
+    comparable = comparison_context(context)
+    assert provenance["interaction_id"] == "interaction-1"
+    assert "interaction_id" not in comparable
+    assert "delegation_id" not in comparable
+    assert comparable["model_id"] == "model"
+    assert comparable["task_family"] == "performance"
+
+
+def test_all_inherited_treatment_failures_cannot_create_individual_profile():
+    from lib.routing_profiles import RoutingProfileError, validate_treatment_failure_attribution
+    with pytest.raises(RoutingProfileError, match="inherited from shared premises"):
+        validate_treatment_failure_attribution([
+            {"failure_attribution": "inherited", "premise_digest": "premise-1"},
+            {"failure_attribution": "inherited", "premise_digest": "premise-1"},
+        ])
+    validate_treatment_failure_attribution([
+        {"failure_attribution": "inherited", "premise_digest": "premise-1"},
+        {"failure_attribution": "independent"},
+    ])
+
+
+def _registration_hash(record):
+    from lib.mcp_server import _canonical
+    import hashlib
+    body = dict(record)
+    body.pop("registration_hash", None)
+    return hashlib.sha256(_canonical(body).encode()).hexdigest()
+
+
+def test_experiment_registration_is_unique_hashed_and_revision_bound(tmp_path, monkeypatch):
+    import os
+    from lib.mcp_server import DigitalPsychologyService, _canonical
+    import hashlib
+    monkeypatch.setenv("DIGITALPSYCHOLOGY_STATE_ROOT", str(tmp_path))
+    monkeypatch.setenv("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "promotion-secret")
+    base = {
+        "experiment_id": "exp", "namespace_id": "ns",
+        "application_instance_id": "instance", "registration_revision": "rev-1",
+        "promotion_authorization_id": "auth-1", "event_ids": [], "task_context": {},
+    }
+    base["registration_hash"] = _registration_hash(base)
+    (tmp_path / "experiments.json").write_text(json.dumps({"exp": base}), encoding="utf-8")
+    service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
+    monkeypatch.setattr(service, "_run_slow_loop", lambda events, contexts: {"status": "completed", "events": len(events), "contexts": len(contexts)})
+    authorization = {
+        "authorization_id": "auth-1", "namespace_id": "ns",
+        "application_instance_id": "instance", "registration_revision": "rev-1",
+        "registration_hash": base["registration_hash"],
+    }
+    # Sign only the service-defined authorization body.
+    import hmac
+    body = dict(authorization)
+    authorization["signature"] = hmac.new(b"promotion-secret", _canonical(body).encode(), hashlib.sha256).hexdigest()
+    try:
+        result = service.run_registered_slow_loop("exp", authorization)
+        assert result["status"] == "completed"
+        for mutation in (
+            lambda a: a.pop("namespace_id"),
+            lambda a: a.update(registration_revision="rev-other"),
+        ):
+            broken = dict(authorization)
+            body = {k: v for k, v in broken.items() if k != "signature"}
+            mutation(body)
+            body["signature"] = hmac.new(b"promotion-secret", _canonical(body).encode(), hashlib.sha256).hexdigest()
+            try:
+                service.run_registered_slow_loop("exp", body)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid experiment registration/authorization accepted")
+        # Two exact-origin records are ambiguous even when their IDs differ.
+        duplicate = {**base, "registration_revision": "rev-2"}
+        duplicate["registration_hash"] = _registration_hash(duplicate)
+        (tmp_path / "experiments.json").write_text(json.dumps([base, duplicate]), encoding="utf-8")
+        try:
+            service.run_registered_slow_loop("exp", authorization)
+        except ValueError as exc:
+            assert "unique" in str(exc)
+        else:
+            raise AssertionError("duplicate exact-origin experiment accepted")
+    finally:
+        service.close()
+
+
+def test_slow_loop_report_separates_lifecycle_and_evaluator_feedback(tmp_path, monkeypatch):
+    from lib.slow_loop import BoundedLearningController
+
+    passing = {
+        "profile_id": "passing",
+        "profile_hash": "p" * 64,
+        "evidence": {
+            "experiment_id": "exp-pass",
+            "event_ids": ["event-1"],
+            "trajectory_ids": ["trajectory-1"],
+            "experiment_receipt": {
+                "decision": "pass",
+                "receipt_id": "receipt-1",
+                "baseline_rate": 0.25,
+                "intervention_rate": 0.75,
+                "effect": 0.5,
+                "baseline_count": 4,
+                "intervention_count": 4,
+                "holdout_count": 4,
+            },
+        },
+    }
+    rejected = {
+        "profile_id": "rejected",
+        "profile_hash": "r" * 64,
+        "evidence": {
+            "experiment_id": "exp-reject",
+            "event_ids": ["event-2"],
+            "trajectory_ids": ["trajectory-2"],
+            "experiment_receipt": {"decision": "fail"},
+        },
+    }
+
+    class Lifecycle:
+        def deploy(self, profile, *, reason):
+            return {**profile, "lifecycle_revision": 7}
+
+    monkeypatch.setattr("lib.slow_loop.derive_profiles", lambda *args, **kwargs: [passing, rejected])
+    monkeypatch.setattr("lib.slow_loop.promote_profile", lambda profile, receipt, status: {**profile, "status": status})
+    report = BoundedLearningController(lifecycle=Lifecycle()).run([], {})
+    assert [item["profile_id"] for item in report.deployment_exposures] == ["passing", "rejected"]
+    assert [item["completed"] for item in report.observations_completed] == [True, True]
+    assert report.intervention_effectiveness[0]["effect"] == 0.5
+    assert report.rejection_reasons == [{"profile_id": "rejected", "reason": "candidate lacks a passing experiment receipt"}]
+    assert {item["type"] for item in report.events} >= {
+        "deployment_exposed", "observation_completed", "intervention_effectiveness",
+        "deployment_published", "candidate_rejected", "regression",
+    }
+
+
+def test_shared_profile_requires_authenticated_scope_and_explicit_adoption():
+    import hashlib
+    from lib.routing_profiles import (_canonical, BehavioralRoutingProfile,
+                                      SharingDecisionAuthority, applicable_adjustments, build_profile,
+                                      profile_semantic_hash, promote_profile)
+    profile = build_profile(
+        profile_id="shared", subject={"namespace_id":"ns","application_id":"app",
+        "application_version":"1","application_instance_id":"producer","provider_id":"p",
+        "model_id":"m","model_revision":"1","model_capability_hash":"c",
+        "harness_id":"h","harness_version":"1","agent_instance_id":"producer"},
+        context={"task_family":"performance","role":"delegate"}, observations=[],
+        routing_adjustments=[{"route_type":"stage","route":"flow","disposition":"suppress",
+                              "condition":{},"evidence_refs":["e"]}],
+        evidence={"event_ids":["e"],"trajectory_ids":[],"source_hash":"s",
+                  "experiment_id":"exp","candidate_adjustment":{},"receipt_ref":None},
+        criterion={"evaluator_version":"v","minimum_samples":1,"minimum_effect":0.1,
+                   "confidence_rule":"test"})
+    receipt = {"receipt_id":"r","kind":"routing_experiment","decision":"pass",
+               "profile_candidate_hash":profile_semantic_hash(profile),
+               "source_evidence_hash":"s","experiment_id":"exp"}
+    receipt["receipt_hash"] = hashlib.sha256(_canonical(receipt).encode()).hexdigest()
+    private = promote_profile(profile, receipt, status="validated")
+    consumer = {"namespace_id":"ns","application_id":"app","application_version":"1",
+                "application_instance_id":"consumer","provider_id":"p","model_id":"m",
+                "model_revision":"1","model_capability_hash":"c","harness_id":"h",
+                "harness_version":"1","agent_instance_id":"consumer","task_family":"performance",
+                "role":"delegate","adopted_profile_hashes":(private["profile_hash"],)}
+    private_profile = BehavioralRoutingProfile.from_dict(private, require_deployable=True)
+    assert applicable_adjustments(private_profile, consumer) == []
+    authority = SharingDecisionAuthority.ephemeral(key_id="host-1")
+    decision = authority.sign_decision({
+        "target_scope":"application_shared","profile_candidate_hash":profile["profile_hash"],
+        "authorized_application_id":"app","authorization_id":"auth"})
+    for missing in (None, {"key_id":"host-1"}):
+        try:
+            promote_profile(profile, receipt, status="validated",
+                            sharing_scope="application_shared", promotion_decision=decision,
+                            sharing_authority=missing)
+        except Exception as exc:
+            assert "authority" in str(exc) or "authenticated" in str(exc)
+        else:
+            raise AssertionError("shared promotion accepted without host authority")
+    shared = promote_profile(profile, receipt, status="validated",
+                             sharing_scope="application_shared", promotion_decision=decision,
+                             sharing_authority=authority)
+    shared_context = {**consumer, "adopted_profile_hashes": ()}
+    shared_profile = BehavioralRoutingProfile.from_dict(
+        shared, require_deployable=True, sharing_authority=authority)
+    assert applicable_adjustments(
+        shared_profile, shared_context, sharing_authority=authority) == []
+    shared["adoption"] = {"mode":"explicit","authorized":True}
+    shared["profile_hash"] = profile_semantic_hash(shared)
+    shared_context["adopted_profile_hashes"] = (shared["profile_hash"],)
+    shared_profile = BehavioralRoutingProfile.from_dict(
+        shared, require_deployable=True, sharing_authority=authority)
+    assert applicable_adjustments(
+        shared_profile, shared_context, sharing_authority=authority)[0]["route"] == "flow"
+    forged = dict(decision); forged["authorization_id"] = "other"
+    try:
+        promote_profile(profile, receipt, status="validated",
+                        sharing_scope="application_shared", promotion_decision=forged,
+                        sharing_authority=authority)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("forged sharing decision accepted")

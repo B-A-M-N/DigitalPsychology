@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import stat
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -21,7 +22,7 @@ except ImportError:  # transport is optional; the service remains testable
 
 from .feedback_loop import EventFactory, EventError, SQLiteSink, trusted_state_root
 from .routing_profiles import (BehavioralRoutingProfile, RoutingProfileError,
-                               applicable_adjustments,
+                               SharingDecisionAuthority, applicable_adjustments,
                                validate_profile)
 from .slow_loop import BoundedLearningController
 
@@ -35,7 +36,12 @@ class DigitalPsychologyService:
 
     def __init__(self, *, event_db: Path | None = None,
                  profile_path: Path | None = None,
-                 trusted_producers: Mapping[str, Mapping[str, Any]] | None = None) -> None:
+                 trusted_producers: Mapping[str, Mapping[str, Any]] | None = None,
+                 max_pending_events_per_origin: int = 256,
+                 max_ingest_seconds_per_origin: float = 0.25,
+                 busy_timeout_ms: int = 250,
+                 per_origin_write_limit: int = 100_000,
+                 sharing_authority: SharingDecisionAuthority | None = None) -> None:
         root = trusted_state_root()
         self.event_db = event_db or Path(
             os.environ.get("DIGITALPSYCHOLOGY_EVENT_DB", root / "events.sqlite3"))
@@ -43,7 +49,16 @@ class DigitalPsychologyService:
         self._trusted_producers = {str(k): dict(v) for k, v in (trusted_producers or {}).items()}
         self._attestation_secret = os.environ.get("DIGITALPSYCHOLOGY_INGESTION_SECRET", "").encode()
         self._promotion_secret = os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode()
-        self._sink = SQLiteSink(self.event_db)
+        self._sharing_authority = sharing_authority
+        if (max_pending_events_per_origin < 1 or max_ingest_seconds_per_origin <= 0
+                or not 10 <= int(busy_timeout_ms) <= 5000 or int(per_origin_write_limit) < 1):
+            raise ValueError("per-origin ingestion bounds must be positive")
+        self.max_pending_events_per_origin = int(max_pending_events_per_origin)
+        self.max_ingest_seconds_per_origin = float(max_ingest_seconds_per_origin)
+        self._pending_origins: dict[tuple[str, str], int] = {}
+        self._sink = SQLiteSink(
+            self.event_db, busy_timeout_ms=busy_timeout_ms,
+            per_origin_daily_write_limit=per_origin_write_limit)
         self._sink._conn.execute("""CREATE TABLE IF NOT EXISTS authenticated_events (
             namespace_id TEXT NOT NULL, application_instance_id TEXT NOT NULL,
             event_id TEXT NOT NULL, PRIMARY KEY(namespace_id, application_instance_id, event_id))""")
@@ -81,7 +96,14 @@ class DigitalPsychologyService:
             authenticated = self._attest_event(data)
             data.pop("host_attestation", None)
             parsed = EventFactory.from_dict(data)
+            origin = (parsed.namespace_id, parsed.application_instance_id)
+            if self._pending_origins.get(origin, 0) >= self.max_pending_events_per_origin:
+                raise ValueError("per-origin behavioral ingestion budget is exhausted")
+            started = time.monotonic()
             self._sink.emit(parsed)
+            elapsed = time.monotonic() - started
+            if elapsed > self.max_ingest_seconds_per_origin:
+                self._pending_origins[origin] = self._pending_origins.get(origin, 0) + 1
             if authenticated:
                 self._sink._conn.execute(
                     "INSERT OR IGNORE INTO authenticated_events(namespace_id, application_instance_id, event_id) VALUES (?,?,?)",
@@ -144,19 +166,24 @@ class DigitalPsychologyService:
                 raise RoutingProfileError("active routing profile revision mismatch")
             current = profiles[0]
             lifecycle_status = current.get("lifecycle_status") or current.get("status")
-            if current.get("status") in {"stale", "rolled_back"} or lifecycle_status in {"stale", "rolled_back"}:
-                return [], ""
-            try:
-                validate_profile(current, require_deployable=True)
-            except RoutingProfileError:
-                previous = data.get("previous_profile")
-                if (not isinstance(previous, Mapping)
-                        or previous.get("profile_hash") == current.get("profile_hash")
-                        or previous.get("status") in {"stale", "rolled_back"}
-                        or previous.get("lifecycle_status") in {"stale", "rolled_back"}):
+            current_unavailable = (current.get("status") in {"stale", "rolled_back"}
+                                   or lifecycle_status in {"stale", "rolled_back"})
+            if not current_unavailable:
+                try:
+                    validate_profile(current, require_deployable=True,
+                                    sharing_authority=self._sharing_authority)
+                except RoutingProfileError:
+                    current_unavailable = True
+            if current_unavailable:
+                known_good = data.get("known_good_profile")
+                if (not isinstance(known_good, Mapping)
+                        or known_good.get("profile_hash") == current.get("profile_hash")
+                        or known_good.get("status") not in {"active", "validated"}
+                        or known_good.get("lifecycle_status") not in {"active", "validated"}):
                     return [], ""
-                validate_profile(dict(previous), require_deployable=True)
-                profiles = [dict(previous)]
+                validate_profile(dict(known_good), require_deployable=True,
+                                           sharing_authority=self._sharing_authority)
+                profiles = [dict(known_good)]
         elif isinstance(data, Mapping) and isinstance(data.get("profiles"), list):
             profiles = [dict(item) for item in data["profiles"]
                         if item.get("status") not in {"stale", "rolled_back"}
@@ -166,7 +193,8 @@ class DigitalPsychologyService:
         else:
             raise RoutingProfileError("routing profile artifact must be an object")
         for profile in profiles:
-            validate_profile(profile, require_deployable=True)
+            validate_profile(profile, require_deployable=True,
+                             sharing_authority=self._sharing_authority)
         pack_hash = hashlib.sha256(_canonical(profiles).encode("utf-8")).hexdigest()
         return profiles, pack_hash
 
@@ -184,8 +212,11 @@ class DigitalPsychologyService:
         sources: list[str] = []
         for raw in profiles:
             try:
-                profile = BehavioralRoutingProfile.from_dict(raw, require_deployable=True)
-                matches = applicable_adjustments(profile, context)
+                profile = BehavioralRoutingProfile.from_dict(
+                    raw, require_deployable=True,
+                    sharing_authority=self._sharing_authority)
+                matches = applicable_adjustments(
+                    profile, context, sharing_authority=self._sharing_authority)
             except RoutingProfileError:
                 continue
             for adjustment in matches:
@@ -222,8 +253,18 @@ class DigitalPsychologyService:
         parsed_events = [EventFactory.from_dict(dict(event)) if isinstance(event, Mapping) else event
                          for event in events]
         report = BoundedLearningController(lifecycle=lifecycle).run(parsed_events, task_context)
-        return {"status": report.status, "promoted": report.promoted,
-                "candidate_count": len(report.candidates), "rejected": report.rejected}
+        return {
+            "status": report.status,
+            "promoted": report.promoted,
+            "candidate_count": len(report.candidates),
+            "rejected": report.rejected,
+            "deployment_exposures": report.deployment_exposures,
+            "observations_completed": report.observations_completed,
+            "intervention_effectiveness": report.intervention_effectiveness,
+            "regressions": report.regressions,
+            "rejection_reasons": report.rejection_reasons,
+            "events": report.events,
+        }
 
     def _load_persisted_events(self, event_ids: list[Any], *,
                               namespace_id: str,
@@ -248,6 +289,29 @@ class DigitalPsychologyService:
             loaded.append(EventFactory.from_dict(json.loads(row[0])))
         return loaded
 
+    @staticmethod
+    def _load_experiment_record(registry: Any, *, experiment_id: str,
+                                namespace_id: str, application_instance_id: str) -> dict[str, Any]:
+        """Select one immutable registration from exact origin."""
+        values = (list(registry.values()) if isinstance(registry, Mapping)
+                  else registry if isinstance(registry, list) else [])
+        matches = [item for item in values if isinstance(item, Mapping)
+                   and item.get("experiment_id") == experiment_id
+                   and item.get("namespace_id") == namespace_id
+                   and item.get("application_instance_id") == application_instance_id]
+        if len(matches) != 1:
+            raise ValueError("experiment registration must be unique for its exact origin")
+        record = dict(matches[0])
+        registration_revision = record.get("registration_revision")
+        if not isinstance(registration_revision, str) or not registration_revision:
+            raise ValueError("experiment registration requires an immutable revision")
+        body = dict(record)
+        supplied = body.pop("registration_hash", None)
+        expected = hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
+        if supplied != expected:
+            raise ValueError("experiment registration hash is invalid")
+        return record
+
     def run_registered_slow_loop(self, experiment_id: str,
                                  authorization: Mapping[str, Any]) -> dict[str, Any]:
         """Run a protected experiment record; promotion requires host authorization."""
@@ -259,9 +323,16 @@ class DigitalPsychologyService:
             registry = json.loads(registry_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("experiment registry is unreadable") from exc
-        record = registry.get(str(experiment_id)) if isinstance(registry, Mapping) else None
-        if not isinstance(record, Mapping) or record.get("experiment_id") != experiment_id:
-            raise ValueError("unknown or mismatched experiment record")
+        namespace_id = str(authorization.get("namespace_id") or "")
+        application_instance_id = str(authorization.get("application_instance_id") or "")
+        if not namespace_id or not application_instance_id:
+            raise ValueError("experiment authorization requires its exact origin")
+        record = self._load_experiment_record(
+            registry, experiment_id=experiment_id,
+            namespace_id=namespace_id,
+            application_instance_id=application_instance_id)
+        if authorization.get("registration_revision") != record.get("registration_revision")                 or authorization.get("registration_hash") != record.get("registration_hash"):
+            raise ValueError("experiment promotion authorization is not bound to the immutable registration")
         expected = str(record.get("promotion_authorization_id") or "")
         if not expected or authorization.get("authorization_id") != expected:
             raise ValueError("experiment promotion authorization is required")
@@ -286,7 +357,8 @@ class DigitalPsychologyService:
         return self._sink.purge_expired(retention_days=retention_days)
 
     def validate_routing_profile(self, profile: Mapping[str, Any]) -> dict[str, Any]:
-        validate_profile(profile, require_deployable=True)
+        validate_profile(profile, require_deployable=True,
+                         sharing_authority=self._sharing_authority)
         return {"valid": True, "profile_id": profile["profile_id"],
                 "profile_hash": profile["profile_hash"], "scope_mode": profile["scope_mode"]}
 

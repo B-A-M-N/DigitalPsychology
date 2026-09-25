@@ -6,9 +6,12 @@ the authority that decides whether a preference is safe and applicable.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import os
+import secrets
 from importlib.resources import files as resource_files
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -26,6 +29,8 @@ ROUTING_STATUSES = {"candidate", "validated", "active", "stale", "rolled_back"}
 ROUTING_EXPERIMENT_VERSION = "1.0.0"
 ROUTING_PACK_VERSION = "1.0.0"
 ROUTING_EVALUATOR_VERSION = "1.0.0"
+SHARING_SIGNER_PRIVATE_KEY_ENV = "DIGITALPSYCHOLOGY_SHARING_SIGNER_PRIVATE_KEY"
+SHARING_SIGNER_KEY_ID_ENV = "DIGITALPSYCHOLOGY_SHARING_SIGNER_KEY_ID"
 
 
 class RoutingProfileError(ValueError):
@@ -75,6 +80,8 @@ def profile_semantic_hash(profile: Mapping[str, Any]) -> str:
     data.pop("created_at", None)
     data.pop("lifecycle_revision", None)
     data.pop("lifecycle_status", None)
+    data.pop("deployment_lineage_id", None)
+    data.pop("lifecycle_reason", None)
     # Trial observations and receipts are mutable evidence, not the proposed
     # intervention.  The hash is therefore stable before the experiment runs.
     evidence = dict(data.get("evidence") or {})
@@ -435,8 +442,68 @@ def routing_validation_receipt(profile: Mapping[str, Any], receipt_id: str) -> d
         "promotion cannot manufacture evidence")
 
 
+class SharingDecisionAuthority:
+    """Host-owned signing authority whose private key never enters an artifact."""
+    def __init__(self, private_key: bytes | None = None, *, key_id: str) -> None:
+        if private_key is None:
+            encoded = os.environ.get(SHARING_SIGNER_PRIVATE_KEY_ENV, "")
+            private_key = base64.b64decode(encoded) if encoded else b""
+        if not isinstance(private_key, bytes) or len(private_key) < 32:
+            raise RoutingProfileError("sharing signer requires at least 256 bits of private key material")
+        self._private = private_key
+        self.key_id = str(key_id or os.environ.get(SHARING_SIGNER_KEY_ID_ENV) or "")
+        if not self.key_id or len(self.key_id) > 128:
+            raise RoutingProfileError("sharing signer requires a bounded key identifier")
+
+    @classmethod
+    def ephemeral(cls, *, key_id: str = "ephemeral-host") -> "SharingDecisionAuthority":
+        return cls(secrets.token_bytes(32), key_id=key_id)
+
+    def public_verification(self) -> dict[str, str]:
+        return {"algorithm": "hmac-sha256-host-key", "key_id": self.key_id}
+
+    def sign_decision(self, decision: Mapping[str, Any]) -> dict[str, Any]:
+        signed = dict(decision)
+        signed["verification"] = self.public_verification()
+        body = {key: value for key, value in signed.items() if key != "signature"}
+        signed["signature"] = base64.b64encode(
+            hmac.new(self._private, _canonical(body).encode("utf-8"), hashlib.sha256).digest()
+        ).decode("ascii")
+        return signed
+
+    def verify_decision(self, decision: Mapping[str, Any], *, target_scope: str,
+                        candidate_hash: str) -> bool:
+        verification = decision.get("verification")
+        signature = str(decision.get("signature") or "")
+        if not isinstance(verification, Mapping):
+            return False
+        if (verification.get("algorithm") != "hmac-sha256-host-key"
+                or verification.get("key_id") != self.key_id
+                or decision.get("target_scope") != target_scope
+                or decision.get("profile_candidate_hash") != candidate_hash):
+            return False
+        body = {key: value for key, value in dict(decision).items() if key != "signature"}
+        expected = base64.b64encode(hmac.new(
+            self._private, _canonical(body).encode("utf-8"), hashlib.sha256).digest()
+        ).decode("ascii")
+        return hmac.compare_digest(signature, expected)
+
+
+
+def _verify_sharing_decision(decision: Mapping[str, Any], *, candidate_hash: str,
+                             target_scope: str, authority: SharingDecisionAuthority) -> None:
+    if not authority.verify_decision(
+            decision, target_scope=target_scope, candidate_hash=candidate_hash):
+        raise RoutingProfileError(
+            f"{target_scope} promotion requires an authenticated decision bound to the candidate")
+
+
+
 def promote_profile(profile: Mapping[str, Any], receipt: Mapping[str, Any],
-                    *, status: str = "active") -> dict[str, Any]:
+                    *, status: str = "active",
+                    sharing_scope: str = "agent_private",
+                    promotion_decision: Mapping[str, Any] | None = None,
+                    sharing_authority: SharingDecisionAuthority | None = None) -> dict[str, Any]:
     if status not in {"validated", "active"}:
         raise RoutingProfileError("routing profile promotion requires validated or active status")
     if not isinstance(receipt, Mapping):
@@ -448,6 +515,19 @@ def promote_profile(profile: Mapping[str, Any], receipt: Mapping[str, Any],
         raise RoutingProfileError("routing experiment receipt hash mismatch")
     if receipt.get("kind") != "routing_experiment" or receipt.get("decision") != "pass":
         raise RoutingProfileError("only passing routing experiment receipts may promote")
+    if sharing_scope not in {"agent_private", "application_shared", "cross_application"}:
+        raise RoutingProfileError("unsupported routing profile sharing scope")
+    if sharing_scope != "agent_private":
+        decision = dict(promotion_decision or {})
+        if not isinstance(sharing_authority, SharingDecisionAuthority):
+            raise RoutingProfileError("shared promotion requires a host-owned sharing authority")
+        _verify_sharing_decision(
+            decision, candidate_hash=profile_semantic_hash(profile),
+            target_scope=sharing_scope, authority=sharing_authority)
+        if sharing_scope == "application_shared" and decision.get("authorized_application_id") != profile.get("subject", {}).get("application_id"):
+            raise RoutingProfileError("application-shared promotion target application is incompatible")
+        if sharing_scope == "cross_application" and not decision.get("data_sharing_authorization_id"):
+            raise RoutingProfileError("cross-application promotion requires explicit data-sharing authorization")
     promoted = json.loads(json.dumps(dict(profile)))
     promoted["status"] = "candidate"
     if receipt.get("profile_candidate_hash") != profile_semantic_hash(promoted):
@@ -460,8 +540,13 @@ def promote_profile(profile: Mapping[str, Any], receipt: Mapping[str, Any],
     promoted["status"] = status
     promoted.setdefault("evidence", {})["receipt_ref"] = receipt["receipt_id"]
     promoted["evidence"]["receipt"] = receipt
+    if sharing_scope != "agent_private":
+        promoted["evidence"]["sharing_promotion_decision"] = dict(promotion_decision or {})
+        promoted["sharing_scope"] = sharing_scope
+        promoted["adoption"] = {"mode": "explicit", "authorized": False}
     promoted["profile_hash"] = profile_semantic_hash(promoted)
-    validate_profile(promoted, require_deployable=True)
+    validate_profile(promoted, require_deployable=True,
+                     sharing_authority=sharing_authority)
     return promoted
 
 
@@ -478,7 +563,8 @@ def _schema() -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def validate_profile(profile: Mapping[str, Any], *, require_deployable: bool = False) -> None:
+def validate_profile(profile: Mapping[str, Any], *, require_deployable: bool = False,
+                     sharing_authority: SharingDecisionAuthority | None = None) -> None:
     if jsonschema is None:
         raise RoutingProfileError("jsonschema is required for routing profile validation")
     errors = sorted(jsonschema.Draft202012Validator(_schema()).iter_errors(dict(profile)),
@@ -490,6 +576,18 @@ def validate_profile(profile: Mapping[str, Any], *, require_deployable: bool = F
     if require_deployable and profile.get("status") not in {"validated", "active"}:
         raise RoutingProfileError("only validated or active routing profiles may deploy")
     if require_deployable:
+        sharing_scope = profile.get("sharing_scope", "agent_private")
+        if sharing_scope not in {"agent_private", "application_shared", "cross_application"}:
+            raise RoutingProfileError("unsupported routing profile sharing scope")
+        if sharing_scope != "agent_private":
+            decision = (profile.get("evidence") or {}).get("sharing_promotion_decision") or {}
+            evidence = profile.get("evidence") or {}
+            receipt = evidence.get("receipt") or {}
+            if not isinstance(sharing_authority, SharingDecisionAuthority):
+                raise RoutingProfileError("shared profile verification requires a host-owned sharing authority")
+            _verify_sharing_decision(
+                decision, candidate_hash=str(receipt.get("profile_candidate_hash") or ""),
+                target_scope=sharing_scope, authority=sharing_authority)
         scope_mode = profile.get("scope_mode")
         if scope_mode not in {"exact", "validated_generalization"}:
             raise RoutingProfileError("deployable routing profile requires an explicit scope_mode")
@@ -532,7 +630,15 @@ def validate_profile(profile: Mapping[str, Any], *, require_deployable: bool = F
         candidate_evidence = dict(candidate.get("evidence") or {})
         candidate_evidence.pop("receipt_ref", None)
         candidate_evidence.pop("receipt", None)
+        candidate_evidence.pop("experiment_receipt", None)
+        candidate_evidence.pop("sharing_promotion_decision", None)
         candidate["evidence"] = candidate_evidence
+        candidate.pop("sharing_scope", None)
+        candidate.pop("adoption", None)
+        candidate.pop("lifecycle_revision", None)
+        candidate.pop("lifecycle_status", None)
+        candidate.pop("deployment_lineage_id", None)
+        candidate.pop("lifecycle_reason", None)
         if receipt.get("profile_candidate_hash") != profile_semantic_hash(candidate):
             raise RoutingProfileError("routing profile receipt is bound to a different candidate")
         if receipt.get("source_evidence_hash") != candidate_evidence.get("source_hash"):
@@ -569,6 +675,9 @@ class BehavioralRoutingProfile:
         default_factory=lambda: {"subject": "exact", "context": "exact"})
     validated_strata: tuple[Mapping[str, Any], ...] = ()
     generalization_receipt: Optional[Mapping[str, Any]] = None
+    sharing_scope: str = "agent_private"
+    adoption: Mapping[str, Any] = field(
+        default_factory=lambda: {"mode": "explicit", "authorized": False})
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -585,6 +694,8 @@ class BehavioralRoutingProfile:
             "validated_strata": [dict(item) for item in self.validated_strata],
             "generalization_receipt": (dict(self.generalization_receipt)
                                         if self.generalization_receipt is not None else None),
+            "sharing_scope": self.sharing_scope,
+            "adoption": dict(self.adoption),
             "subject": dict(self.subject),
             "context": dict(self.context),
             "observations": [dict(item) for item in self.observations],
@@ -596,8 +707,10 @@ class BehavioralRoutingProfile:
         return data
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any], *, require_deployable: bool = False) -> "BehavioralRoutingProfile":
-        validate_profile(data, require_deployable=require_deployable)
+    def from_dict(cls, data: Mapping[str, Any], *, require_deployable: bool = False,
+                  sharing_authority: SharingDecisionAuthority | None = None) -> "BehavioralRoutingProfile":
+        validate_profile(data, require_deployable=require_deployable,
+                         sharing_authority=sharing_authority)
         return cls(
             profile_id=str(data["profile_id"]), status=str(data["status"]),
             subject=dict(data["subject"]), context=dict(data.get("context") or {}),
@@ -615,7 +728,9 @@ class BehavioralRoutingProfile:
                                     {"subject": "exact", "context": "exact"}),
             validated_strata=tuple(dict(item) for item in data.get("validated_strata", [])),
             generalization_receipt=(dict(data["generalization_receipt"])
-                                   if data.get("generalization_receipt") is not None else None))
+                                   if data.get("generalization_receipt") is not None else None),
+            sharing_scope=str(data.get("sharing_scope") or "agent_private"),
+            adoption=dict(data.get("adoption") or {"mode":"explicit","authorized":False}))
 
 
 def _match_value(expected: Any, actual: Any, *, semantics: str = "exact") -> bool:
@@ -654,14 +769,35 @@ def condition_matches(condition: Mapping[str, Any], context: Mapping[str, Any]) 
 
 
 def applicable_adjustments(profile: BehavioralRoutingProfile,
-                           context: Mapping[str, Any]) -> list[dict[str, Any]]:
-    validate_profile(profile.to_dict(), require_deployable=True)
-    for field in ("namespace_id", "application_id", "application_instance_id",
-                  "provider_id", "model_id", "model_revision", "harness_id",
-                  "agent_instance_id", "application_version", "model_capability_hash",
-                  "harness_version"):
+                           context: Mapping[str, Any], *,
+                           sharing_authority: SharingDecisionAuthority | None = None) -> list[dict[str, Any]]:
+    validate_profile(profile.to_dict(), require_deployable=True,
+                     sharing_authority=sharing_authority)
+    for field in ("namespace_id", "application_id", "provider_id", "model_id",
+                  "model_revision", "harness_id", "application_version",
+                  "model_capability_hash", "harness_version"):
         if not _match_value(profile.subject.get(field), context.get(field), semantics="exact"):
             return []
+    sharing_scope = getattr(profile, "sharing_scope", "agent_private")
+    if sharing_scope == "agent_private":
+        if (not _match_value(profile.subject.get("application_instance_id"),
+                             context.get("application_instance_id"), semantics="exact")
+                or not _match_value(profile.subject.get("agent_instance_id"),
+                                    context.get("agent_instance_id"), semantics="exact")):
+            return []
+    elif sharing_scope in {"application_shared", "cross_application"}:
+        adopted = set(context.get("adopted_profile_hashes") or ())
+        if profile.profile_hash not in adopted:
+            return []
+        if sharing_scope == "application_shared":
+            if (profile.subject.get("namespace_id") != context.get("namespace_id")
+                    or profile.subject.get("application_id") != context.get("application_id")):
+                return []
+        else:
+            if profile.subject.get("application_id") == context.get("application_id"):
+                return []
+    else:
+        raise RoutingProfileError("unsupported routing profile sharing scope")
     semantics = dict(profile.selector_semantics or {})
     for field, expected in profile.context.items():
         if not _match_value(expected, context.get(field),
@@ -705,6 +841,43 @@ def build_profile(*, profile_id: str, subject: Mapping[str, Any], context: Mappi
     data["profile_hash"] = profile_semantic_hash(data)
     validate_profile(data)
     return data
+
+
+PROVENANCE_IDENTITY_FIELDS = (
+    "namespace_id", "application_id", "application_instance_id",
+    "agent_instance_id", "session_id", "task_id", "attempt_id",
+    "behavioral_subject", "interaction_id", "delegation_id", "role",
+)
+
+COMPARISON_CONTEXT_FIELDS = (
+    "model_id", "model_revision", "model_capability_hash", "harness_id",
+    "harness_version", "task_family", "task_shape", "domain_tags", "phase",
+    "environment", "toolset", "statework_versions", "framework_version",
+    "guard_pack_hash", "role", "policy_hash",
+)
+
+
+def provenance_identity(event: Any) -> dict[str, Any]:
+    """Exact attribution identity for who did what with whom."""
+    return {field: getattr(event, field, None) for field in PROVENANCE_IDENTITY_FIELDS}
+
+
+def comparison_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Experimental comparability identity, excluding exact interaction lineage."""
+    return {field: context.get(field) for field in COMPARISON_CONTEXT_FIELDS}
+
+
+def validate_treatment_failure_attribution(outcomes: Iterable[Mapping[str, Any]]) -> None:
+    """Reject individual correction profiles built only from inherited failures."""
+    records = [dict(item) for item in outcomes]
+    if not records:
+        return
+    inherited = [item for item in records
+                 if item.get("failure_attribution") == "inherited" and item.get("premise_digest")]
+    if len(inherited) == len(records) and {str(item.get("premise_digest")) for item in inherited}:
+        raise RoutingProfileError(
+            "treatment failures are all inherited from shared premises; "
+            "no individual corrective profile may be promoted")
 
 
 def _composite_event_identity(event: Any) -> tuple[Any, ...]:
@@ -760,6 +933,7 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             event_to_session[_composite_event_identity(event)] = task.trajectory_id
     grouped: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
     interaction_cohorts: dict[tuple[str, str, str], str] = {}
+    inherited_treatment_outcomes: list[dict[str, Any]] = []
     for event in event_list:
         if event.event_type != "route_outcome":
             continue
@@ -807,8 +981,16 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             continue
         if payload.get("candidate_profile_hash") != plan.get("candidate_profile_hash"):
             continue
-        if bool(payload.get("candidate_adjustment_applied")) != (cohort == "treatment"):
+        intervention_assigned = bool(payload.get("intervention_assigned", cohort == "treatment"))
+        if intervention_assigned != (cohort == "treatment"):
             continue
+        intervention_executed = bool(payload.get("intervention_executed", payload.get("candidate_adjustment_applied")))
+        if cohort == "treatment" and outcome == "bad":
+            inherited_treatment_outcomes.append({
+                "failure_attribution": payload.get("failure_attribution"),
+                "premise_digest": payload.get("premise_digest"),
+                "trajectory_id": trajectory_id,
+            })
         expected_policy_identity = (
             plan.get("treatment_policy_identity") if cohort == "treatment"
             else plan.get("control_policy_identity"))
@@ -822,30 +1004,36 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             continue
         statework_versions = json.loads(_canonical(statework_versions_value))
         statework_versions_key = tuple(sorted(statework_versions.items()))
+        comparable = comparison_context({
+            **context,
+            "model_id": context.get("model_id", event.model_id or context.get("model")),
+            "harness_id": context.get("harness_id", event.harness_id or context.get("harness")),
+            "statework_versions": statework_versions,
+        })
         key = (context.get("namespace_id", event.namespace_id),
                context.get("application_id", event.application_id),
                context.get("application_version", event.application_version),
                context.get("application_instance_id", event.application_instance_id),
                context.get("provider_id", event.provider_id),
-               context.get("model_id", event.model_id or context.get("model")),
-               context.get("model_revision", event.model_revision),
-               context.get("model_capability_hash", event.model_capability_hash),
-               context.get("harness_id", event.harness_id or context.get("harness")),
-               context.get("harness_version", event.harness_version),
-               context.get("agent_instance_id", event.agent_instance_id),
-               context.get("task_family") or context.get("task_shape"),
-               tuple(sorted(context.get("domain_tags") or [])),
-               context.get("phase"), context.get("environment"),
-               context.get("toolset"), statework_versions_key,
-               context.get("framework_version"), context.get("guard_pack_hash"),
-               context.get("role"), comparison_hash, plan.get("plan_hash"), route_type, route)
+               comparable.get("model_id"), comparable.get("model_revision"),
+               comparable.get("model_capability_hash"), comparable.get("harness_id"),
+               comparable.get("harness_version"), context.get("agent_instance_id", event.agent_instance_id),
+               comparable.get("task_family") or comparable.get("task_shape"),
+               tuple(sorted(comparable.get("domain_tags") or [])), comparable.get("phase"),
+               comparable.get("environment"), comparable.get("toolset"), statework_versions_key,
+               comparable.get("framework_version"), comparable.get("guard_pack_hash"),
+               comparable.get("role"), comparison_hash, plan.get("plan_hash"), route_type, route)
         bucket = grouped.setdefault(key, {"control": {}, "treatment": {},
                                           "holdout": {}, "plan": plan})
         trial = bucket[cohort].setdefault(trajectory_id, {
             "trajectory_id": trajectory_id,
             "cohort": cohort,
             "candidate_profile_hash": plan.get("candidate_profile_hash"),
-            "candidate_adjustment_applied": cohort == "treatment",
+            "candidate_adjustment_applied": intervention_executed,
+            "intervention_assigned": intervention_assigned,
+            "intervention_executed": intervention_executed,
+            "failure_attribution": payload.get("failure_attribution"),
+            "premise_digest": payload.get("premise_digest"),
             "experiment_plan_hash": plan.get("plan_hash"),
             "policy_identity": expected_policy_identity,
             "comparison_context_hash": comparison_hash,
@@ -876,6 +1064,8 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                 "interaction_id": event.interaction_id,
             })
 
+    validate_treatment_failure_attribution(inherited_treatment_outcomes)
+
     profiles: list[dict[str, Any]] = []
     for key, cohorts in sorted(grouped.items(), key=lambda item: repr(item[0])):
         plan = cohorts["plan"]
@@ -897,6 +1087,10 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                 or len(holdout) < holdout_minimum):
             continue
         trials = control + treatment + holdout
+        inherited_treatment = [item for item in treatment
+                               if item.get("failure_attribution") == "inherited" and item.get("premise_digest")]
+        if treatment and len(inherited_treatment) == len(treatment) and len({item.get("premise_digest") for item in treatment}) == 1:
+            raise RoutingProfileError("treatment failures are all inherited from one shared premise; no individual corrective profile may be promoted")
         (namespace_id, application_id, application_version, application_instance_id,
          provider_id, model_id, model_revision, model_capability_hash, harness_id,
          harness_version, agent_instance_id, task_family,

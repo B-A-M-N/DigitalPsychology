@@ -10,6 +10,7 @@ import json
 import fcntl
 import os
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -79,8 +80,10 @@ class RoutingLifecycleStore:
                 # A stale artifact must never seed a fresh lifecycle counter
                 # under its new semantic hash.
                 return dict(profile)
-            record = dict(state["profiles"].get(profile_hash) or {
-                "trajectory_ids": [], "observations": [], "status": profile.get("status")})
+            prior_record = dict(state["profiles"].get(profile_hash) or {})
+            lineage_id = str(profile.get("deployment_lineage_id") or prior_record.get("deployment_lineage_id") or uuid.uuid4())
+            record = prior_record or {"trajectory_ids": [], "observations": [], "status": profile.get("status")}
+            record["deployment_lineage_id"] = lineage_id
             known = set(record.get("trajectory_ids") or [])
             for observation in observations:
                 if observation.get("profile_hash") != profile_hash:
@@ -111,6 +114,7 @@ class RoutingLifecycleStore:
             state["revision"] = current_revision + 1
             state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             updated["lifecycle_revision"] = state["revision"]
+            updated["deployment_lineage_id"] = lineage_id
             updated["profile_hash"] = profile_semantic_hash(updated)
             self._save(state)
             self._save_deployment(updated, state["revision"])
@@ -125,8 +129,11 @@ class RoutingLifecycleStore:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             state = self._load(); revision = int(state.get("revision", 0) or 0) + 1
             updated = json.loads(json.dumps(dict(profile)))
+            prior_lineage = str(profile.get("deployment_lineage_id") or uuid.uuid4())
             updated["lifecycle_status"] = "active"; updated["lifecycle_revision"] = revision
-            state["profiles"][updated["profile_hash"]] = {"status": "active", "deployment_revision": revision, "reason": reason}
+            updated["deployment_lineage_id"] = prior_lineage
+            state["profiles"][updated["profile_hash"]] = {"status": "active", "deployment_revision": revision,
+                "deployment_lineage_id": prior_lineage, "reason": reason}
             state["revision"] = revision; state.setdefault("deployments", []).append({"profile_hash": updated["profile_hash"], "revision": revision, "reason": reason})
             state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             self._save(state); self._save_deployment(updated, revision)
@@ -157,6 +164,8 @@ class RoutingLifecycleStore:
             updated["status"] = status
             updated["lifecycle_status"] = status
             updated["lifecycle_reason"] = reason
+            lineage_id = str(profile.get("deployment_lineage_id") or record.get("deployment_lineage_id") or uuid.uuid4())
+            updated["deployment_lineage_id"] = lineage_id
             updated["lifecycle_revision"] = current_revision + 1
             updated["profile_hash"] = profile_semantic_hash(updated)
             state["profiles"][profile_hash] = record
@@ -181,22 +190,27 @@ class RoutingLifecycleStore:
         """Publish the current revision and retain a known-good predecessor."""
         if self.deployment_path == self.path:
             return
-        previous = None
-        previous_revision = None
+        known_good = None
+        known_good_revision = None
         if self.deployment_path.exists():
             try:
                 existing = json.loads(self.deployment_path.read_text(encoding="utf-8"))
-                if isinstance(existing, Mapping) and isinstance(existing.get("profile"), Mapping):
-                    candidate = dict(existing["profile"])
+                if isinstance(existing, Mapping) and isinstance(existing.get("known_good_profile"), Mapping):
+                    candidate = dict(existing["known_good_profile"])
                     if candidate.get("profile_hash") != profile.get("profile_hash"):
-                        previous = candidate; previous_revision = existing.get("revision")
+                        known_good = candidate
+                        known_good_revision = existing.get("known_good_revision")
             except (OSError, json.JSONDecodeError, TypeError):
                 pass
-        payload = {"schema_version": "1.0.0", "revision": revision,
-                   "status": profile.get("status"), "profile": dict(profile)}
-        if previous is not None:
-            payload["previous_profile"] = previous
-            payload["previous_revision"] = previous_revision
+        payload = {"schema_version": "1.1.0", "revision": revision,
+                   "status": profile.get("status"), "profile": dict(profile),
+                   "deployment_lineage_id": profile.get("deployment_lineage_id")}
+        if profile.get("lifecycle_status") == "active" and profile.get("status") == "active":
+            payload["known_good_profile"] = dict(profile)
+            payload["known_good_revision"] = revision
+        elif known_good is not None:
+            payload["known_good_profile"] = known_good
+            payload["known_good_revision"] = known_good_revision
         fd, temporary = tempfile.mkstemp(
             dir=str(self.deployment_path.parent), prefix=".active-routing-profile.", suffix=".tmp")
         try:

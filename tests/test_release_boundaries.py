@@ -203,3 +203,26 @@ def test_conflicting_terminal_outcomes_fail_closed() -> None:
         "comparison_context_hash": "same"}}
     with pytest.raises(RoutingProfileError):
         derive_profiles([ev("e1", "FAIL"), ev("e2", "PASS")], contexts)
+
+
+def test_sqlite_write_contention_has_a_bounded_busy_timeout(tmp_path):
+    import sqlite3
+    import time
+    from lib.feedback_loop import SQLiteSink
+    db = tmp_path / "contended.sqlite3"
+    first = SQLiteSink(db, busy_timeout_ms=25)
+    second = sqlite3.connect(str(db), timeout=0.01)
+    second.execute("PRAGMA busy_timeout=10")
+    second.execute("BEGIN IMMEDIATE")
+    second.execute("CREATE TABLE IF NOT EXISTS hold_lock (id INTEGER PRIMARY KEY)")
+    started = time.monotonic()
+    try:
+        try:
+            first._conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            assert "locked" in str(exc).lower() or "busy" in str(exc).lower()
+        else:
+            raise AssertionError("contended writer unexpectedly acquired the SQLite lock")
+    finally:
+        second.rollback(); second.close(); first.close()
+    assert time.monotonic() - started < 1.0

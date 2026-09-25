@@ -30,6 +30,8 @@ import json
 import os
 import re
 import sqlite3
+import random
+import time
 import tempfile
 import uuid
 from importlib.resources import files as resource_files
@@ -861,11 +863,21 @@ class SQLiteSink:
     is not treated as globally unique.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, busy_timeout_ms: int = 250,
+                 per_origin_daily_write_limit: int = 100_000) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path), timeout=30)
+        if not 10 <= int(busy_timeout_ms) <= 5000:
+            raise ValueError("SQLite busy_timeout_ms must be 10..5000")
+        if int(per_origin_daily_write_limit) < 1:
+            raise ValueError("per-origin write limit must be positive")
+        self.busy_timeout_ms = int(busy_timeout_ms)
+        self.per_origin_daily_write_limit = int(per_origin_daily_write_limit)
+        self._origin_counts: dict[tuple[str, str], int] = {}
+        self._conn = sqlite3.connect(str(self.path), timeout=self.busy_timeout_ms / 1000)
+        self._conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("""CREATE TABLE IF NOT EXISTS events (
             row_id INTEGER PRIMARY KEY AUTOINCREMENT,
             namespace_id TEXT NOT NULL,
@@ -1027,27 +1039,49 @@ class SQLiteSink:
         EventSchema.validate(data)
         payload = json.dumps(data, sort_keys=True)
         origin = (data["namespace_id"], data["application_instance_id"], data["event_id"])
-        try:
-            existing = self._conn.execute(
-                "SELECT payload FROM events WHERE namespace_id = ? AND application_instance_id = ? AND event_id = ?",
-                origin).fetchone()
-            if existing is not None:
-                if existing[0] != payload:
-                    raise EventError("replayed event identity has different payload")
+        origin_key = origin[:2]
+        if self._origin_counts.get(origin_key, 0) >= self.per_origin_daily_write_limit:
+            raise EventError(f"per-origin write budget exhausted for {origin_key!r}")
+        deadline = time.monotonic() + min(5.0, max(0.25, self.busy_timeout_ms / 1000 * 8))
+        attempt = 0
+        while True:
+            try:
+                existing = self._conn.execute(
+                    "SELECT payload FROM events WHERE namespace_id = ? AND application_instance_id = ? AND event_id = ?",
+                    origin).fetchone()
+                if existing is not None:
+                    if existing[0] != payload:
+                        raise EventError("replayed event identity has different payload")
+                    return
+                self._conn.execute(
+                    "INSERT INTO events (namespace_id, application_id, application_instance_id, provider_id, model_id, model_revision, model_capability_hash, harness_id, harness_version, event_id, agent_instance_id, session_id, task_id, attempt_id, segment_id, agent_id, behavioral_subject, timestamp, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (data["namespace_id"], data["application_id"], data["application_instance_id"],
+                     data.get("provider_id"), data.get("model_id"), data.get("model_revision"),
+                     data.get("model_capability_hash"), data.get("harness_id"), data.get("harness_version"),
+                     data["event_id"], data["agent_instance_id"], data["session_id"],
+                     data["task_id"], data["attempt_id"], data["segment_id"],
+                     data["agent_id"], data["behavioral_subject"], data["timestamp"], payload),
+                )
+                self._conn.commit()
+                self._origin_counts[origin_key] = self._origin_counts.get(origin_key, 0) + 1
                 return
-            self._conn.execute(
-                "INSERT INTO events (namespace_id, application_id, application_instance_id, provider_id, model_id, model_revision, model_capability_hash, harness_id, harness_version, event_id, agent_instance_id, session_id, task_id, attempt_id, segment_id, agent_id, behavioral_subject, timestamp, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (data["namespace_id"], data["application_id"], data["application_instance_id"],
-                 data.get("provider_id"), data.get("model_id"), data.get("model_revision"),
-                 data.get("model_capability_hash"), data.get("harness_id"), data.get("harness_version"),
-                 data["event_id"], data["agent_instance_id"], data["session_id"],
-                 data["task_id"], data["attempt_id"], data["segment_id"],
-                 data["agent_id"], data["behavioral_subject"], data["timestamp"], payload),
-            )
-            self._conn.commit()
-        except sqlite3.IntegrityError as exc:
-            raise EventError(
-                f"event identity collision for origin {origin!r}") from exc
+            except sqlite3.IntegrityError as exc:
+                self._conn.rollback()
+                existing = self._conn.execute(
+                    "SELECT payload FROM events WHERE namespace_id = ? AND application_instance_id = ? AND event_id = ?",
+                    origin).fetchone()
+                if existing is not None and existing[0] == payload:
+                    return
+                raise EventError(f"event identity collision for origin {origin!r}") from exc
+            except sqlite3.OperationalError as exc:
+                self._conn.rollback()
+                message = str(exc).lower()
+                if ("locked" not in message and "busy" not in message
+                        or time.monotonic() >= deadline):
+                    raise EventError(f"SQLite write failed for origin {origin!r}: {exc}") from exc
+                delay = min(0.25, 0.01 * (2 ** attempt))
+                time.sleep(delay * (0.5 + random.SystemRandom().random()))
+                attempt += 1
 
     def close(self) -> None:
         self._conn.close()
