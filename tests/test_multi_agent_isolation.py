@@ -117,7 +117,7 @@ def test_persisted_event_retrieval_requires_complete_origin():
     with tempfile.TemporaryDirectory() as raw:
         service = DigitalPsychologyService(event_db=Path(raw) / "events.sqlite3")
         event = EventFactory.from_dict({
-            "schema_version": "2.2.0", "event_id": "same-event",
+            "schema_version": "2.3.0", "event_id": "same-event",
             "timestamp": datetime.now(timezone.utc).isoformat(), "namespace_id": "ns-a",
             "application_id": "app", "application_instance_id": "instance-a",
             "task_id": "task", "agent_id": "agent", "actor_id": "agent",

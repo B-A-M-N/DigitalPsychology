@@ -803,16 +803,12 @@ def goal_fidelity_metrics(events: Iterable[Event]) -> Dict[str, Any]:
     verification_count = 0
     for event in ordered:
         payload = event.payload or {}
-        if event.category in {"action", "tool_result"}:
-            tool = str(payload.get("tool_type") or payload.get("route") or "").lower()
-            if tool in {"read", "inspect", "test", "validate", "verify", "render",
-                        "search", "grep", "diagnose"}:
-                verification_count += 1
-            if payload.get("progress_class") in {"GOAL_PROGRESS", "BLOCKER_REMOVED"}:
-                support_since_goal = 0
-            else:
-                support_since_goal += 1
-        if event.event_type == "goal_progress_recorded":
+        if payload.get("progress_class") == "VERIFICATION_PROGRESS":
+            verification_count += 1
+        if event.event_type == "support_action_recorded":
+            support_since_goal += 1
+        if event.event_type == "goal_progress_recorded" or payload.get("progress_class") in {
+                "GOAL_PROGRESS", "BLOCKER_REMOVED"}:
             support_since_goal = 0
     intent_deviation_count = 0
     unnecessary_scope_expansion = 0
