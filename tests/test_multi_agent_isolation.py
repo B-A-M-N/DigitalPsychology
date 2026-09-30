@@ -353,8 +353,11 @@ def test_slow_loop_report_separates_lifecycle_and_evaluator_feedback(tmp_path, m
     assert report.rejection_reasons == [{"profile_id": "rejected", "reason": "candidate lacks a passing experiment receipt"}]
     assert {item["type"] for item in report.events} >= {
         "deployment_exposed", "observation_completed", "intervention_effectiveness",
-        "deployment_published", "candidate_rejected", "regression",
+        "deployment_published", "candidate_rejected",
     }
+    # A passing receipt yields zero regressions: every candidate trajectory is
+    # NOT a regression.
+    assert report.regressions == []
 
 
 def test_shared_profile_requires_authenticated_scope_and_explicit_adoption():
@@ -438,3 +441,94 @@ def test_multi_profile_registry_preserves_independent_active_profiles(tmp_path):
     store.adopt_profile(second, adopter_agent_id="agent-b", reason="eligible task")
     refreshed=json.loads((tmp_path/"active-routing-profile.json").read_text())
     assert len(refreshed["profiles"]) == len(artifact["profiles"])
+
+
+def test_only_holdout_failures_are_reported_as_regressions(monkeypatch):
+    from lib.slow_loop import BoundedLearningController
+
+    candidate = {
+        "profile_id": "with-regression",
+        "profile_hash": "r" * 64,
+        "evidence": {
+            "event_ids": ["e1"],
+            "trajectory_ids": ["t-control", "t-treatment", "t-holdout-ok"],
+            "experiment_receipt": {
+                "decision": "fail", "receipt_id": "rcpt-1",
+                "regressions": ["t-holdout-bad"],
+            },
+        },
+    }
+
+    class Lifecycle:
+        def deploy(self, profile, *, reason):
+            return {**profile, "lifecycle_revision": 1}
+
+    monkeypatch.setattr("lib.slow_loop.derive_profiles", lambda *a, **k: [candidate])
+    monkeypatch.setattr("lib.slow_loop.promote_profile", lambda profile, receipt, status: profile)
+    report = BoundedLearningController(lifecycle=Lifecycle()).run([], {})
+    assert [item["trajectory_id"] for item in report.regressions] == ["t-holdout-bad"]
+    assert {item["type"] for item in report.events} >= {"holdout_regression_observed"}
+
+
+def test_expired_profile_stops_being_advisable_after_restart(tmp_path):
+    import importlib
+    from lib.mcp_server import DigitalPsychologyService
+    store = importlib.import_module("lib.routing_lifecycle")
+    from lib.routing_profiles import (_canonical, build_profile, promote_profile,
+                                      profile_semantic_hash)
+    adjustment = {"route_type": "stage", "route": "flow", "disposition": "prefer",
+                  "condition": {}, "evidence_refs": ["e"],
+                  "expires_after_samples": 2}
+    candidate = build_profile(
+        profile_id="expiry-advisory",
+        subject={"namespace_id": "n", "application_id": "a", "application_version": "1",
+                 "application_instance_id": "i", "provider_id": "p", "model_id": "m",
+                 "model_revision": "r", "model_capability_hash": "c", "harness_id": "h",
+                 "harness_version": "v", "agent_instance_id": "agent"},
+        context={"task_family": "performance"}, observations=[],
+        routing_adjustments=[adjustment],
+        evidence={"event_ids": ["e"], "trajectory_ids": [], "source_hash": "s",
+                  "experiment_id": "exp", "candidate_adjustment": adjustment,
+                  "receipt_ref": None},
+        criterion={"evaluator_version": "v", "minimum_samples": 1,
+                   "minimum_effect": 0.1, "confidence_rule": "test"})
+    receipt = {"receipt_id": "receipt-expiry", "kind": "routing_experiment",
+               "decision": "pass", "profile_candidate_hash": profile_semantic_hash(candidate),
+               "source_evidence_hash": "s", "experiment_id": "exp"}
+    receipt["receipt_hash"] = __import__("hashlib").sha256(
+        _canonical(receipt).encode()).hexdigest()
+    profile = promote_profile(candidate, receipt, status="validated")
+    lifecycle = store.RoutingLifecycleStore(tmp_path / "state.json")
+    profile = lifecycle.deploy(profile)
+    for index in range(2):
+        observed = lifecycle.observe(profile, [{"profile_hash": profile["profile_hash"],
+                                                "trajectory_id": f"t{index}", "eligible": True}])
+    assert observed["status"] == "stale"
+    deployment = tmp_path / "active-routing-profile.json"
+    pack = json.loads(deployment.read_text())
+    assert all(item.get("status") != "active" for item in pack["profiles"])
+    service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3",
+                                      profile_path=deployment)
+    try:
+        profiles, _ = service._load_profiles()
+        assert profiles == []
+        advice = service.behavioral_advice(
+            context={"application_id": "a"}, eligible_routes=[{"route_type": "stage", "route": "flow"}],
+            static_policy={"policy_hash": "p"})
+        assert advice["adjustments"] == []
+    finally:
+        service.close()
+
+
+def test_circular_cross_agent_agreement_is_not_independent_evidence():
+    from lib.routing_profiles import RoutingProfileError, validate_treatment_failure_attribution
+    with pytest.raises(RoutingProfileError, match="circular"):
+        validate_treatment_failure_attribution([
+            {"agent_instance_id": "agent-a", "premise_digest": "premise-1"},
+            {"agent_instance_id": "agent-b", "premise_digest": "premise-1"},
+        ])
+    # Independent premises are fine.
+    validate_treatment_failure_attribution([
+        {"agent_instance_id": "agent-a", "premise_digest": "premise-1"},
+        {"agent_instance_id": "agent-b", "premise_digest": "premise-2"},
+    ])

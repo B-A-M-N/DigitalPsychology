@@ -116,10 +116,15 @@ class BoundedLearningController:
                     "profile_id": candidate_id(candidate),
                     "reason": reason,
                 })
-            for trajectory_id in list(evidence.get("trajectory_ids") or []):
-                regression = {"profile_id": profile_id, "trajectory_id": trajectory_id}
+            # Only actual holdout failures are regressions. Labeling every
+            # candidate trajectory as one contradicted the receipt's own
+            # semantics and poisoned the feedback plane.
+            receipt = dict(evidence.get("experiment_receipt") or {})
+            for trajectory_id in receipt.get("regressions", ()):
+                regression = {"profile_id": profile_id, "trajectory_id": trajectory_id,
+                              "receipt_id": receipt.get("receipt_id")}
                 regressions.append(regression)
-                feedback_events.append({"type": "regression", **regression})
+                feedback_events.append({"type": "holdout_regression_observed", **regression})
         return SlowLoopReport(
             status="completed" if not rejected else "completed_with_rejections",
             candidates=candidates, promoted=promoted, rejected=rejected,

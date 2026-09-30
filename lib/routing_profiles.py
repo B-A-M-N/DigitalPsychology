@@ -876,7 +876,14 @@ def comparison_context(context: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def validate_treatment_failure_attribution(outcomes: Iterable[Mapping[str, Any]]) -> None:
-    """Reject individual correction profiles built only from inherited failures."""
+    """Reject correction profiles built only from non-independent failures.
+
+    Two cases make a result non-independent:
+
+    * every failure was inherited from a shared premise, and
+    * agents appear to agree only because they share an ancestor decision or
+      premise (circular validation), which is not independent evidence.
+    """
     records = [dict(item) for item in outcomes]
     if not records:
         return
@@ -886,6 +893,17 @@ def validate_treatment_failure_attribution(outcomes: Iterable[Mapping[str, Any]]
         raise RoutingProfileError(
             "treatment failures are all inherited from shared premises; "
             "no individual corrective profile may be promoted")
+    # Cross-agent agreement on one shared premise is corroboration of nothing:
+    # A agreeing with B, and B agreeing with A, is one opinion, not two.
+    shared_premise = [item for item in records if item.get("premise_digest")]
+    premise_digests = {str(item.get("premise_digest")) for item in shared_premise}
+    if len(shared_premise) == len(records) and len(premise_digests) == 1:
+        agents = {str(item.get("agent_instance_id")) for item in records
+                  if item.get("agent_instance_id")}
+        if len(agents) > 1:
+            raise RoutingProfileError(
+                "cross-agent agreement on a single shared premise is circular "
+                "validation, not independent evidence")
 
 
 def _composite_event_identity(event: Any) -> tuple[Any, ...]:

@@ -58,16 +58,69 @@ class RoutingLifecycleStore:
             try:return [dict(v) for v in self._load_registry()["profiles"].values()]
             finally:fcntl.flock(lock.fileno(),fcntl.LOCK_UN)
 
-    def adopt_profile(self, profile:Mapping[str,Any], *, adopter_agent_id:str, reason:str) -> str:
+    @staticmethod
+    def _lineage_of(entry:Mapping[str,Any]) -> str:
+        return str(entry.get("deployment_lineage_id") or entry.get("profile_hash") or "")
+
+    def adopt_profile(self, profile:Mapping[str,Any], *, adopter_agent_id:str, reason:str,
+                      source_profile_hash:str|None=None) -> str:
+        """Register/sync a deployment under its immutable source lineage.
+
+        The mutable artifact hash changes when lifecycle status changes, so the
+        registry entry is keyed by the *source* profile hash and the deployment
+        lineage id. Registry lifecycle status is authoritative; the stored
+        artifact is only a projection of it.
+        """
         validate_profile(profile,require_deployable=True)
         if not adopter_agent_id: raise RoutingProfileError("adopter_agent_id is required")
-        ph=str(profile["profile_hash"]); lock=self._registry_lock()
+        ph=str(source_profile_hash or profile["profile_hash"]); lock=self._registry_lock()
         with lock.open("r+",encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
-            state=self._load_registry(); entry=dict(state["profiles"].get(ph) or {"profile_hash":ph,"profile":dict(profile),"status":profile.get("status"),"scope":profile.get("sharing_scope","agent_private"),"revisions":[]})
-            entry.setdefault("adopters",{})[str(adopter_agent_id)]={"authorized":True,"reason":reason,"recorded_at":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")}
-            state["profiles"][ph]=entry;state["revision"]=int(state.get("revision",0))+1;state["updated_at"]=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+            state=self._load_registry()
+            entry=dict(state["profiles"].get(ph) or {"profile_hash":ph,"profile":dict(profile),
+                "status":profile.get("status"),"scope":profile.get("sharing_scope","agent_private"),
+                "revisions":[]})
+            # Always synchronize, never only-on-first-adopt.
+            entry["profile"]=dict(profile)
+            entry["artifact_hash"]=str(profile["profile_hash"])
+            entry["status"]=str(profile.get("lifecycle_status") or profile.get("status") or "active")
+            entry["scope"]=str(profile.get("sharing_scope","agent_private"))
+            entry.setdefault("deployment_lineage_id",str(profile.get("deployment_lineage_id") or ph))
+            entry.setdefault("adopters",{})[str(adopter_agent_id)]={"authorized":True,"reason":reason,
+                "recorded_at":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")}
+            state["profiles"][ph]=entry;state["revision"]=int(state.get("revision",0))+1
+            state["updated_at"]=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
             self._save_registry(state);return ph
+
+    def set_lifecycle_status(self, *, source_profile_hash:str, status:str,
+                             artifact:Mapping[str,Any]|None=None, reason:str="") -> None:
+        """Make registry lifecycle state authoritative for a lineage.
+
+        A stale or rolled-back lineage must never reappear in advice, even
+        though its immutable artifact still says ``active``.
+        """
+        ph=str(source_profile_hash); lock=self._registry_lock()
+        with lock.open("r+",encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
+            state=self._load_registry(); entry=dict(state["profiles"].get(ph) or {"profile_hash":ph,"revisions":[]})
+            entry["status"]=status
+            if reason: entry["status_reason"]=reason
+            if artifact is not None:
+                entry["profile"]=dict(artifact)
+                entry["artifact_hash"]=str(artifact.get("profile_hash") or "")
+            entry["status_revision"]=int(state.get("revision",0))+1
+            state["profiles"][ph]=entry
+            state["revision"]=int(state.get("revision",0))+1
+            state["updated_at"]=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+            self._save_registry(state)
+
+    def is_active(self, *, source_profile_hash:str) -> bool:
+        entry=self.list_registry_by_hash().get(str(source_profile_hash))
+        if not entry: return False
+        return str(entry.get("status")) not in {"stale","rolled_back","candidate"}
+
+    def list_registry_by_hash(self) -> dict[str,dict[str,Any]]:
+        return {str(entry.get("profile_hash")):entry for entry in self.list_registry()}
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -158,6 +211,12 @@ class RoutingLifecycleStore:
             updated["deployment_lineage_id"] = lineage_id
             updated["profile_hash"] = profile_semantic_hash(updated)
             self._save(state)
+            if updated.get("status") == "stale":
+                # The expired lineage must stop being advisory-eligible even
+                # though the immutable artifact still records "active".
+                self.set_lifecycle_status(source_profile_hash=profile_hash,
+                                          status="stale", artifact=updated,
+                                          reason="sample budget exhausted")
             self._save_deployment(updated, state["revision"])
             return updated
 
@@ -173,12 +232,14 @@ class RoutingLifecycleStore:
             prior_lineage = str(profile.get("deployment_lineage_id") or uuid.uuid4())
             updated["lifecycle_status"] = "active"; updated["lifecycle_revision"] = revision
             updated["deployment_lineage_id"] = prior_lineage
-            state["profiles"][updated["profile_hash"]] = {"status": "active", "deployment_revision": revision,
+            source_hash = str(updated["profile_hash"])
+            state["profiles"][source_hash] = {"status": "active", "deployment_revision": revision,
                 "deployment_lineage_id": prior_lineage, "reason": reason}
             state["revision"] = revision; state.setdefault("deployments", []).append({"profile_hash": updated["profile_hash"], "revision": revision, "reason": reason})
             state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             self._save(state)
-            self.adopt_profile(updated, adopter_agent_id="publisher", reason=reason)
+            self.adopt_profile(updated, adopter_agent_id="publisher", reason=reason,
+                               source_profile_hash=source_hash)
             self._save_deployment(updated, revision)
             return updated
 
@@ -216,6 +277,8 @@ class RoutingLifecycleStore:
             state.setdefault("events", []).append({"profile_hash": profile_hash, **event})
             state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             self._save(state)
+            self.set_lifecycle_status(source_profile_hash=profile_hash,
+                                      status=status, artifact=updated, reason=reason)
             self._save_deployment(updated, state["revision"])
             return updated
 
@@ -232,13 +295,22 @@ class RoutingLifecycleStore:
     def _save_deployment(self, profile: Mapping[str, Any], revision: int) -> None:
         if self.deployment_path == self.path:
             return
+        # Authoritative lifecycle truth lives in the registry, not in the
+        # immutable artifact (whose hash changes when status changes).
         active=[]
         for entry in self.list_registry():
-            stored=entry.get("profile") or {}
-            if stored.get("status") not in {"stale","rolled_back"} and stored.get("lifecycle_status") not in {"stale","rolled_back"}:
-                active.append(dict(stored))
-        if not any(item.get("profile_hash")==profile.get("profile_hash") for item in active):
-            active.append(dict(profile))
+            status=str(entry.get("status"))
+            if status in {"stale","rolled_back","candidate"}:
+                continue
+            stored=dict(entry.get("profile") or {})
+            if not stored:
+                continue
+            stored["lifecycle_status"]=status
+            active.append(stored)
+        if (str(profile.get("lifecycle_status") or profile.get("status")) not in
+                {"stale","rolled_back","candidate"}):
+            if not any(item.get("profile_hash")==profile.get("profile_hash") for item in active):
+                active.append(dict(profile))
         payload={"schema_version":"2.0.0","revision":revision,"status":"pack","profiles":active,"profiles_hash":hashlib.sha256(_canonical(active).encode()).hexdigest()}
         fd,tmp=tempfile.mkstemp(dir=str(self.deployment_path.parent),prefix=".active-routing-profile-",suffix=".tmp")
         try:
