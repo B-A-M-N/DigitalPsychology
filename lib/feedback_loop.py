@@ -710,6 +710,7 @@ class Event:
     model_capability_hash: Optional[str] = None
     harness_id: Optional[str] = None
     harness_version: Optional[str] = None
+    goal_contract_hash: Optional[str] = None
     agent_instance_id: Optional[str] = None
     session_id: Optional[str] = None
     attempt_id: str = "attempt-1"
@@ -772,7 +773,8 @@ class Event:
             "event_type": self.event_type,
         }
         for k in ("application_version", "provider_id", "model_id", "model_revision",
-                  "model_capability_hash", "harness_id", "harness_version"):
+                  "model_capability_hash", "harness_id", "harness_version",
+                  "goal_contract_hash"):
             value = getattr(self, k)
             if value is not None:
                 d[k] = value
@@ -786,6 +788,60 @@ class Event:
         if self.payload:
             d["payload"] = dict(self.payload)
         return d
+
+
+def goal_fidelity_metrics(events: Iterable[Event]) -> Dict[str, Any]:
+    """Summarize host-attested goal movement and support work for one attempt."""
+    ordered = sorted(events, key=lambda event: (event.timestamp, event.event_id))
+    actions = [event for event in ordered
+               if event.category in {"action", "tool_result"}]
+    goal_events = [event for event in ordered
+                   if (event.payload.get("progress_class") in {
+                       "GOAL_PROGRESS", "BLOCKER_REMOVED"}
+                       or event.event_type == "goal_progress_recorded")]
+    support_since_goal = 0
+    verification_count = 0
+    for event in ordered:
+        payload = event.payload or {}
+        if event.category in {"action", "tool_result"}:
+            tool = str(payload.get("tool_type") or payload.get("route") or "").lower()
+            if tool in {"read", "inspect", "test", "validate", "verify", "render",
+                        "search", "grep", "diagnose"}:
+                verification_count += 1
+            if payload.get("progress_class") in {"GOAL_PROGRESS", "BLOCKER_REMOVED"}:
+                support_since_goal = 0
+            else:
+                support_since_goal += 1
+        if event.event_type == "goal_progress_recorded":
+            support_since_goal = 0
+    intent_deviation_count = 0
+    unnecessary_scope_expansion = 0
+    for event in ordered:
+        payload = event.payload or {}
+        signal = f"{event.event_type} {payload.get('summary', '')}".lower()
+        if ("intent_deviation" in signal
+                or payload.get("intent_deviation") is True):
+            intent_deviation_count += 1
+        if ("unnecessary_scope_expansion" in signal
+                or payload.get("unnecessary_scope_expansion") is True
+                or (payload.get("scope_expansion") is True
+                    and payload.get("scope_expansion_necessary") is False)):
+            unnecessary_scope_expansion += 1
+    completion_coverage = [
+        float(event.payload["completion_criterion_coverage"])
+        for event in ordered
+        if event.event_type == "completion_attempted"
+        and isinstance(event.payload.get("completion_criterion_coverage"), (int, float))
+    ]
+    action_count = len(actions)
+    return {
+        "goal_progress_ratio": min(1.0, len(goal_events) / max(1, action_count)),
+        "support_actions_since_goal_progress": support_since_goal,
+        "verification_action_ratio": verification_count / max(1, action_count),
+        "intent_deviation_count": intent_deviation_count,
+        "unnecessary_scope_expansion": unnecessary_scope_expansion,
+        "completion_criterion_coverage": completion_coverage[-1] if completion_coverage else 0.0,
+    }
 
 
 class EventSchema:
@@ -1144,6 +1200,7 @@ class EventFactory:
             model_capability_hash=data.get("model_capability_hash"),
             harness_id=data.get("harness_id"),
             harness_version=data.get("harness_version"),
+            goal_contract_hash=data.get("goal_contract_hash"),
             agent_instance_id=data.get("agent_instance_id"),
             session_id=data.get("session_id"),
             task_id=data["task_id"],

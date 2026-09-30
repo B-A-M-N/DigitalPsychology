@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Mapping, Optional
 
-from .feedback_loop import Episode, EpisodeBuilder, Event
+from .feedback_loop import Episode, EpisodeBuilder, Event, goal_fidelity_metrics
 
 
 def _id(prefix: str, values: Iterable[str]) -> str:
@@ -31,12 +31,16 @@ class TaskTrajectory:
         return [event for episode in self.episodes for event in episode.events]
 
     def to_dict(self) -> dict[str, Any]:
+        goal_hashes = sorted({event.goal_contract_hash for event in self.events
+                              if event.goal_contract_hash})
         return {"trajectory_id": self.trajectory_id, "agent_instance_id": self.agent_instance_id,
                 "namespace_id": self.namespace_id, "application_instance_id": self.application_instance_id,
                 "session_id": self.session_id, "task_id": self.task_id,
                 "attempt_id": self.attempt_id, "behavioral_subject": self.behavioral_subject,
                 "episode_ids": [episode.episode_id for episode in self.episodes],
-                "event_ids": [event.event_id for event in self.events]}
+                "event_ids": [event.event_id for event in self.events],
+                "goal_contract_hash": goal_hashes[0] if len(goal_hashes) == 1 else None,
+                "goal_fidelity_metrics": goal_fidelity_metrics(self.events)}
 
 
 @dataclass

@@ -860,8 +860,10 @@ PROVENANCE_IDENTITY_FIELDS = (
 COMPARISON_CONTEXT_FIELDS = (
     "model_id", "model_revision", "model_capability_hash", "harness_id",
     "harness_version", "task_family", "task_shape", "domain_tags", "phase",
+    "work_mode", "deliverable_kind", "acceptance_criterion_kinds",
+    "verification_policy",
     "environment", "toolset", "statework_versions", "framework_version",
-    "guard_pack_hash", "role", "policy_hash",
+    "guard_pack_hash", "role",
 )
 
 
@@ -1050,7 +1052,8 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
                comparable.get("framework_version"), comparable.get("guard_pack_hash"),
                comparable.get("role"), comparison_hash, plan.get("plan_hash"), route_type, route)
         bucket = grouped.setdefault(key, {"control": {}, "treatment": {},
-                                          "holdout": {}, "plan": plan})
+                                          "holdout": {}, "plan": plan,
+                                          "comparison_context": comparable})
         trial = bucket[cohort].setdefault(trajectory_id, {
             "trajectory_id": trajectory_id,
             "cohort": cohort,
@@ -1126,6 +1129,12 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
         source_hash = hashlib.sha256(_canonical(trials).encode("utf-8")).hexdigest()
         context = {"task_family": task_family, "task_shape": task_family,
                    "domain_tags": list(domains),
+                   "work_mode": bucket["comparison_context"].get("work_mode"),
+                   "deliverable_kind": bucket["comparison_context"].get("deliverable_kind"),
+                   "acceptance_criterion_kinds": bucket["comparison_context"].get(
+                       "acceptance_criterion_kinds") or [],
+                   "verification_policy": bucket["comparison_context"].get(
+                       "verification_policy"),
                    "phase": phase, "environment": environment, "toolset": toolset,
                    "statework_versions": dict(statework_versions_items),
                    "framework_version": framework_version,
