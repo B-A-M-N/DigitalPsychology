@@ -252,6 +252,7 @@ class SystemOneRuntime:
                 rebound = self._rebind(cached, frame)
                 calibrated_answer, calibrated_ids = self._calibrate(frame, rebound)
                 return self._mode_result(mode, calibrated_answer, calibrated_ids,
+                                         question_ids=frame.question_ids,
                                          cache_hit=True)
             if not self.breaker.permits():
                 return SystemOneResult(None, "unavailable", reason="circuit_open")
@@ -296,15 +297,17 @@ class SystemOneRuntime:
                 self._cache.move_to_end(cache_key)
                 while len(self._cache) > self.cache_size:
                     self._cache.popitem(last=False)
-        return self._mode_result(mode, calibrated_answer, calibrated_ids)
+        return self._mode_result(mode, calibrated_answer, calibrated_ids,
+                                 question_ids=frame.question_ids)
 
     @staticmethod
     def _mode_result(mode: str, judgment: SystemOneJudgment,
                      calibrated_ids: tuple[str, ...], *,
+                     question_ids: tuple[str, ...],
                      cache_hit: bool = False) -> SystemOneResult:
-        if mode == "advisory" and not calibrated_ids:
+        if mode == "advisory" and not set(question_ids).issubset(calibrated_ids):
             return SystemOneResult(judgment, "shadow", (), cache_hit,
-                                   reason="uncalibrated")
+                                   reason="uncalibrated_or_shifted_context")
         if mode == "shadow":
             return SystemOneResult(judgment, "shadow", calibrated_ids, cache_hit,
                                    reason="shadow_mode")

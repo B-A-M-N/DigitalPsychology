@@ -118,9 +118,11 @@ class ActivityFact:
     evidence_kinds: Tuple[str, ...] = ()
 
     ACTIVITY_TYPES = frozenset({"action", "tool_result", "validation", "state_transition",
-                                "retry", "goal_progress", "blocker", "operator_correction"})
+                                "workflow_progress", "retry", "goal_progress", "blocker",
+                                "operator_correction"})
     PROGRESS_CLASSES = frozenset({"GOAL_PROGRESS", "BLOCKER_REMOVED", "DIAGNOSTIC_PROGRESS",
-                                  "VERIFICATION_PROGRESS", "RECOVERY_PROGRESS"})
+                                  "VERIFICATION_PROGRESS", "RECOVERY_PROGRESS",
+                                  "WORKFLOW_PROGRESS"})
 
     def __post_init__(self) -> None:
         if not isinstance(self.sequence, int) or self.sequence < 1:

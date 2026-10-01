@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from pathlib import Path
 
 from .system_one_backends import (DisabledSystemOneBackend, LayaSystemOneBackend,
@@ -47,8 +48,13 @@ class SystemOneService:
         """Build a provider-neutral service; optional backends require explicit selection."""
         mode = os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE", "disabled").strip()
         provider = os.environ.get("DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER", "disabled").strip()
-        if provider not in {"disabled", "laya-native", "jev-http"}:
+        if provider not in {"disabled", "laya-native", "loopback-http", "jev-http"}:
             raise ValueError("unsupported DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER")
+        if provider == "jev-http":
+            warnings.warn(
+                "jev-http is deprecated; use DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER=loopback-http",
+                DeprecationWarning, stacklevel=2)
+            provider = "loopback-http"
         if mode == "disabled" or provider == "disabled":
             if mode != "disabled" and provider == "disabled":
                 raise ValueError("an enabled System-1 mode requires an explicit semantic provider")
@@ -65,7 +71,7 @@ class SystemOneService:
                 "provider_protocol_hash": os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_PROVIDER_PROTOCOL_SHA256", ""),
             }
             if any(not value for value in required.values()):
-                raise ValueError("jev-http requires pinned endpoint and provider identity settings")
+                raise ValueError("loopback-http requires pinned endpoint and provider identity settings")
             backend = StatelessLoopbackHTTPBackend(
                 **required,
                 timeout_ms=int(os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_TIMEOUT_MS", "5000")),

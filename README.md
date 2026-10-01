@@ -101,14 +101,33 @@ pinned by the host policy and defaults to 30 seconds for local CPU inference.
 Hosts can choose a shorter deadline for faster devices; a timeout causes one
 provider failure and deterministic fallback.
 
+### Generic loopback HTTP provider
+
+Hosts that run the provider in a separate local process can select the generic
+loopback adapter:
+
+```text
+DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER=loopback-http
+DIGITALPSYCHOLOGY_SYSTEM_ONE_ENDPOINT=http://127.0.0.1:8000/decide
+DIGITALPSYCHOLOGY_SYSTEM_ONE_MODEL_ID=<model-id>
+DIGITALPSYCHOLOGY_SYSTEM_ONE_MODEL_REVISION=<immutable-revision>
+DIGITALPSYCHOLOGY_SYSTEM_ONE_MODEL_SHA256=<model-content-digest>
+DIGITALPSYCHOLOGY_SYSTEM_ONE_PROVIDER_PROTOCOL_SHA256=<protocol-digest>
+```
+
+The endpoint must be loopback HTTP. The old provider value `jev-http` remains
+as a deprecated alias and emits a `DeprecationWarning`.
+
 Advisory mode requires an active calibration bundle. The host builds a
 candidate from later independent validation outcomes, reviews and activates
 it through `SystemOneCalibrationLifecycle`, then points
 `DIGITALPSYCHOLOGY_SYSTEM_ONE_CALIBRATION_PATH` at the exported active bundle.
 Calibration is bound to one question family, model-content identity, protocol,
-and independent `(work mode, deliverable kind)` trajectory cohorts. Missing or
-out-of-scope calibration or a per-question confidence below its threshold leaves
-that question in shadow.
+and independent `(work mode, deliverable kind)` trajectory cohorts. Route
+preference calibration also records the exact candidate count, candidate-set
+digest, and domain-tag digest; a context shift falls back to shadow. Missing or
+out-of-scope calibration or a per-question confidence below its threshold
+leaves that question in shadow.
 
 The diagram above describes the optional combined loop. It is not a requirement for DP ingestion or experimentation.
 

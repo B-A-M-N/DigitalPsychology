@@ -112,6 +112,7 @@ class CalibrationRecord:
     independent_trajectory_count: int = 0
     cohort_counts: tuple[tuple[str, str, int], ...] = ()
     minimum_cohort_trajectories: int = 20
+    candidate_context_counts: tuple[tuple[int, str, str, int], ...] = ()
     protocol_version: str = PROTOCOL_VERSION
     protocol_hash: str = PROTOCOL_HASH
     question_registry_hash: str = QUESTION_REGISTRY_HASH
@@ -170,6 +171,14 @@ class CalibrationRecord:
                 or set(self.work_modes) != {mode for mode, _kind in cohort_pairs}
                 or set(self.deliverable_kinds) != {kind for _mode, kind in cohort_pairs}):
             raise ValueError("calibration applicability cohorts are inconsistent")
+        if any(len(item) != 4 or not isinstance(item[0], int) or item[0] < 1
+               or any(not isinstance(digest, str) or len(digest) != 64
+                      or any(ch not in "0123456789abcdef" for ch in digest)
+                      for digest in item[1:3])
+               or not isinstance(item[3], int) or item[3] < self.minimum_cohort_trajectories
+               or item[3] > self.independent_trajectory_count
+               for item in self.candidate_context_counts):
+            raise ValueError("route candidate calibration contexts are malformed")
         if self.status not in {"candidate", "active", "stale", "rolled_back"}:
             raise ValueError("unsupported calibration lifecycle status")
         if self.drift_status not in {"clear", "warning", "drifted"}:
@@ -194,6 +203,8 @@ class CalibrationRecord:
                 "independent_trajectory_count": self.independent_trajectory_count,
                 "cohort_counts": [list(item) for item in self.cohort_counts],
                 "minimum_cohort_trajectories": self.minimum_cohort_trajectories,
+                "candidate_context_counts": [list(item)
+                                              for item in self.candidate_context_counts],
                 "protocol_version": self.protocol_version, "protocol_hash": self.protocol_hash,
                 "question_registry_hash": self.question_registry_hash,
                 "state_projection_schema_hash": self.state_projection_schema_hash,
@@ -208,7 +219,8 @@ class CalibrationRecord:
                   "validation_count", "training_outcome_digest", "validation_outcome_digest",
                   "validation_accuracy", "validation_brier", "validation_ece", "work_modes",
                   "deliverable_kinds", "independent_trajectory_count", "cohort_counts",
-                  "minimum_cohort_trajectories", "protocol_version", "protocol_hash",
+                  "minimum_cohort_trajectories", "candidate_context_counts",
+                  "protocol_version", "protocol_hash",
                   "question_registry_hash", "state_projection_schema_hash",
                   "minimum_outcomes", "status", "drift_status"}
         if not isinstance(value, Mapping) or set(value) != fields:
@@ -218,6 +230,10 @@ class CalibrationRecord:
         payload["deliverable_kinds"] = tuple(payload["deliverable_kinds"])
         payload["cohort_counts"] = tuple((str(mode), str(kind), int(count))
                                          for mode, kind, count in payload["cohort_counts"])
+        payload["candidate_context_counts"] = tuple(
+            (int(count), str(candidate_digest), str(domain_digest), int(trajectories))
+            for count, candidate_digest, domain_digest, trajectories
+            in payload["candidate_context_counts"])
         return cls(**payload)
 
     @property
@@ -251,7 +267,15 @@ class CalibrationRecord:
             and task["deliverable_kind"] in self.deliverable_kinds
             and dict(((mode, kind), count) for mode, kind, count in self.cohort_counts).get(
                 (str(task["work_mode"]), str(task["deliverable_kind"])), 0)
-            >= self.minimum_cohort_trajectories)
+            >= self.minimum_cohort_trajectories
+            and (self.question_id != "route_preference"
+                 or dict((((count, candidates, domain), sample)
+                          for count, candidates, domain, sample
+                          in self.candidate_context_counts)).get((
+                              len(frame.state.legal_routes),
+                              canonical_hash(sorted(frame.state.legal_routes)),
+                              canonical_hash(sorted(task.get("domain_tags") or ()))), 0)
+                 >= self.minimum_cohort_trajectories))
 
     def with_status(self, status: str) -> "CalibrationRecord":
         from dataclasses import replace
@@ -360,6 +384,16 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
                              "system_one_deliverable_kind")
         if any(not decision_payload.get(field) for field in required_identity):
             continue
+        legal_routes = decision_payload.get("system_one_legal_routes")
+        domain_tags = decision_payload.get("system_one_domain_tags")
+        candidate_context = None
+        if question_id == "route_preference":
+            if (not isinstance(legal_routes, list) or not legal_routes
+                    or not isinstance(domain_tags, list)):
+                continue
+            candidate_context = (
+                len(legal_routes), canonical_hash(sorted(set(map(str, legal_routes)))),
+                canonical_hash(sorted(set(map(str, domain_tags)))))
         rows.append({
             "identity": key[0], "trajectory_id": hashlib.sha256(
                 json.dumps(key[0][:7], separators=(",", ":")).encode("utf-8")).hexdigest(),
@@ -370,6 +404,7 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
             "deliverable_kind": str(decision_payload["system_one_deliverable_kind"]),
             "evidence_ref": payload["system_one_outcome_evidence_ref"],
             "outcome_authority": payload["system_one_outcome_authority"],
+            "candidate_context": candidate_context,
         })
         seen.add(key)
     rows.sort(key=lambda row: (row["identity"], row["decision_id"]))
@@ -459,6 +494,19 @@ def calibration_record_from_events(
         if len(trajectories) >= minimum_cohort_trajectories))
     if not applicable_cohorts:
         raise ValueError("no work-mode/deliverable cohort has enough independent trajectories")
+    candidate_context_counts: tuple[tuple[int, str, str, int], ...] = ()
+    if question_id == "route_preference":
+        contexts: dict[tuple[int, str, str], set[str]] = {}
+        for row in rows:
+            context = row.get("candidate_context")
+            if context is not None:
+                contexts.setdefault(context, set()).add(row["trajectory_id"])
+        candidate_context_counts = tuple(sorted(
+            (count, candidate_digest, domain_digest, len(trajectories))
+            for (count, candidate_digest, domain_digest), trajectories in contexts.items()
+            if len(trajectories) >= minimum_cohort_trajectories))
+        if not candidate_context_counts:
+            raise ValueError("route calibration lacks stable candidate-set/domain cohorts")
     return CalibrationRecord(
         question_id=question_id, backend_id=model_tuple[0], model_id=model_tuple[1],
         model_revision=model_tuple[2], model_content_hash=model_tuple[3],
@@ -472,6 +520,7 @@ def calibration_record_from_events(
         independent_trajectory_count=len(trajectory_ids),
         cohort_counts=applicable_cohorts,
         minimum_cohort_trajectories=minimum_cohort_trajectories,
+        candidate_context_counts=candidate_context_counts,
         minimum_outcomes=max(10, int(minimum_outcomes * 0.2)))
 
 
