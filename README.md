@@ -43,12 +43,18 @@ The automated release gate covers structural and cross-system behavior. Claims a
 
 DP can ingest, reconstruct, experiment, and promote a routing profile without CFW or CSW installed.
 
-Install the package and start the MCP command in an environment with the optional `mcp` transport installed:
+Install the package and configure the MCP client to launch its stdio command:
 
 ```bash
 python3 -m pip install -e .
 digital-psychology-mcp
 ```
+
+The command runs as a child process of the MCP client and waits for protocol
+messages on stdin. Keep stdout reserved for MCP traffic. Starting this
+transport exposes DP's telemetry, advice, profile-validation, and slow-loop
+tools; it does not construct a task runtime session. A trusted host constructs
+the runtime session through the library API below.
 
 The service stores ordinary state under `DIGITALPSYCHOLOGY_STATE_ROOT` (or the platform state directory). Ordinary, non-privileged events can be ingested without an authentication secret for local fixtures. In a deployment where agents can reach the MCP surface, configure `DIGITALPSYCHOLOGY_INGESTION_SECRET`; privileged categories (`validation`, `state_transition`, `completion`) and operator/repository-owner actors require host attestation.
 
@@ -74,11 +80,42 @@ The slow loop is explicitly invoked; it is not an automatic background worker. I
 
 ## Optional integrations
 
-- **DP alone:** use the package, SQLite event store, trajectory reconstruction, experiment receipts, and slow-loop service independently.
-- **DP + CFW:** `CFWRuntimeAdapter` consumes validated CFW signals, applies bounded DP directives through CFW's declared host API, and projects the committed DP context at model/tool-planning boundaries.
-- **DP + CSW:** `CSWRuntimeAdapter` reads CSW-owned active workflow selections and eligible candidates. DP can rank those choices; CSW activates them and remains the source of legal workflow state, evidence, and transitions.
-- **CFW + CSW + DP:** the intended adaptive deployment. CFW provides cognitive components and reversible actuators, CSW supplies authoritative workflow state and legal transitions, and DP coordinates bounded interventions and assigns credit from external evidence.
-- **CFW + CSW without DP:** both runtime authorities continue to work with no DP service installed.
+| Deployment | What runs | What remains authoritative |
+| --- | --- | --- |
+| **DP alone** | Event store, trajectory analysis, experiments, and slow-loop service | DP owns its telemetry and validated profiles; no CFW or CSW is required |
+| **CFW alone** | CFW components, task policy, and action gates | CFW's component and action contracts |
+| **CSW alone** | CSW workflow selection, durable state, and evidence checks | CSW's transition and evidence contracts |
+| **CFW + CSW** | CFW task-local enforcement with CSW workflows | CFW governs component/action policy; CSW governs workflow eligibility, state, evidence, and transitions |
+| **CFW + CSW + DP** | The complete adaptive runtime | DP coordinates behavioral interventions; CFW and CSW retain their authorities |
+
+The full three-system deployment is the intended setup when adaptive behavior
+should be coordinated across components and workflows. CFW and CSW also have
+independent standalone entry points and work together without DP installed.
+
+### Wiring the trusted runtime host
+
+The host supplies explicit CFW and CSW ports to DP. It calls
+`RuntimeHost.open_session(...)` once per scoped task, then reports each
+completed action through `RuntimeSession.process_action(RuntimeObservation)`.
+At model and tool-planning boundaries it requests context through
+`before_model_call(...)` and `before_tool_planning(...)`. CFW's adapter
+validates and applies DP directives; CSW's adapter exposes only its current
+eligible workflows and revision-checked operations.
+
+For multi-criterion goals, the host sends the complete `GoalSetSnapshot`
+(bounded to 256 criteria). DP leases attention to at most three criteria at a
+time and gives every runnable required criterion an attention opportunity
+within 258 actions. The prompt may show the current attention window, while
+the host keeps the full goal set for completion checks.
+
+Every intervention records its cause, target criteria, expected effect,
+baseline, action horizon, and applied-directive receipt. After the horizon,
+DP evaluates objective progress from independent host, CSW, or validator
+evidence. Agent claims and changed files alone do not establish success.
+Targeted progress can earn credit only when the measured window also accounts
+for regressions, newly blocked required work, and attention starvation.
+Overlapping interventions remain unattributed when evidence cannot separate
+their effects. See [intervention credit assignment](docs/intervention-outcome-credit.md).
 
 ### Optional Laya System-1 provider
 
@@ -151,14 +188,16 @@ The diagram above describes the optional combined loop. It is not a requirement 
 Together they form a **closed-loop cognitive-behavioral control architecture**:
 
 ```text
-MCP RUNTIME HOST
-  normalizes events and maintains per-session runtime state
+MCP transport ── public telemetry/advice tools
+
+Trusted host runtime (lib/runtime/)
   ├── CSW: authoritative state snapshots and legal transitions
-  ├── CFW: component signals and cognitive actuators
-  └── DP: BehaviorState policy, fast adaptation, intervention lifecycle
+  ├── CFW: component signals and validated cognitive actuators
+  └── DP: BehaviorState, bounded attention, intervention lifecycle
           ├── optional Laya/Jev semantic judgments
           └── slow-loop experiments and validated behavioral priors
   applies DP decisions only after revision checks and hard-policy resolution
+  scores bounded interventions using independent host evidence
                        │
                        ▼
                      Agent
