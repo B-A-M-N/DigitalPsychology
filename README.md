@@ -1,9 +1,9 @@
 # DigitalPsychology
 
-> **Behavioral science for AI agents.**
-> Observe what agents actually do, determine the conditions under which behavior recurs, experimentally test interventions, and measure whether anything truly improved.
+> **Meta-meta behavioral control for AI agents.**
+> DP manages the behavioral configuration during a task, then measures whether its interventions improve outcomes across tasks.
 
-DigitalPsychology (DP) is the **behavioral observation, experimentation, and learning layer** of a larger closed-loop architecture for AI agents.
+DigitalPsychology (DP) owns the meaning and transition policy of `BehaviorState`. Its fast loop combines runtime outcomes, CognitiveFrameWorks signals, bounded CognitiveStateWorks snapshots, and optional Laya/Jev judgments to choose temporary behavioral interventions. Its slow loop evaluates those interventions over independent trajectories.
 
 It was originally conceived as another behavioral skill pack. That became the wrong abstraction.
 
@@ -11,11 +11,11 @@ CognitiveFrameWorks already prescribed how an agent should behave. CognitiveStat
 
 > **Why does the agent continue exhibiting a behavior under particular conditions — and what actually changes it?**
 
-DigitalPsychology therefore became an independent measurement discipline. It does not begin by telling the agent what to do. It begins by observing what the agent **actually did**.
+DP does not infer subjective experience. It uses observable behavior to decide which cognitive components and workflows should be active, and it records whether those changes helped.
 
 ## Current implementation
 
-DigitalPsychology is an independent behavioral measurement and learning plane. It does not grant permissions, define legal StateWork transitions, or replace host authority.
+DigitalPsychology is the behavioral policy plane. It does not grant permissions, define legal StateWork transitions, validate evidence, or replace host authority. The MCP runtime host persists DP state, checks revisions, intersects directives with hard constraints, applies component settings, and asks CSW to validate workflow changes.
 
 Implemented capabilities include:
 
@@ -26,8 +26,13 @@ Implemented capabilities include:
 - **A bounded slow-loop controller** that derives candidates, validates receipts, promotes bounded profiles, observes lifecycle transitions, and records rejection reasons.
 - **Authoritative lifecycle state** with explicit rollback/rejection transitions, durable deployment revisions, and known-good previous profiles.
 - **Versioned advice-exchange contracts** so the host can record trusted context, eligible choices, requested adjustments, and the final effective routing decision.
+- **A deterministic fast-loop controller** that emits typed `BehavioralDecision`, `BehaviorDirective`, and `BehaviorState` values from bounded CFW/CSW/runtime inputs.
+- **Intervention lifecycle records** with cause, expected effect, start revision, scope, expiry, and measured outcome; cleared or expired interventions emit explicit release directives.
+- **Constrained StateWork preferences** ranked only from the eligible choices supplied by CSW. DP cannot commit or legalize a CSW transition.
 
-DP can remain useful without CFW or CSW installed. CFW and CSW can remain operational without DP; DP is an optional future-task learning layer, never a dependency of the active-task authority plane.
+DP can run without CFW or CSW installed when the host supplies no external signals. CFW and CSW remain operational without DP; an MCP host may use the CFW startup preset and CSW authority without adaptive DP control.
+
+The Python `DigitalPsychologyService.decide_behavior()` method is a trusted-host API and is deliberately not exposed as an agent-facing MCP tool. The host supplies current behavior state, CFW signals, a bounded CSW snapshot, and outcomes, then persists and applies the returned decision with compare-and-swap revision checks. See [the fast-loop contract](docs/behavioral-fast-loop.md). CFW's existing session/controller integration is still being migrated to this boundary.
 
 The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
 
@@ -67,8 +72,8 @@ The slow loop is explicitly invoked; it is not an automatic background worker. I
 ## Optional integrations
 
 - **DP alone:** use the package, SQLite event store, trajectory reconstruction, experiment receipts, and slow-loop service independently.
-- **DP + CFW:** CFW calls `behavioral_advice` with host-computed eligible routes. DP may prefer or suppress only those already legal choices.
-- **DP + CSW:** DP can inform future flow preferences, but CSW remains the source of legal flow and transition eligibility.
+- **DP + CFW:** the host supplies CFW component signals; DP returns bounded settings for the host to apply after the hard-policy resolver.
+- **DP + CSW:** the host supplies a CSW snapshot and its eligible StateWork choices. DP can rank those choices; CSW remains the source of legal workflow state and transitions.
 - **CFW + CSW without DP:** both runtime authorities continue to work with no DP service installed.
 
 ### Optional Laya System-1 provider
@@ -135,41 +140,27 @@ The diagram above describes the optional combined loop. It is not a requirement 
 
 | System | Primary question | Character |
 | --- | --- | --- |
-| **CognitiveFrameWorks** | **How should the agent behave?** | Prescriptive |
-| **CognitiveStateWorks** | **What behavior and transitions are appropriate now?** | Prescriptive / state-governed |
-| **DigitalPsychology** | **Why is the agent behaving this way under these conditions?** | Observational / experimental |
+| **DigitalPsychology** | **How should the behavioral configuration adapt to current evidence?** | Behavioral policy and learning |
+| **CognitiveFrameWorks** | **Which cognitive components and signals are available?** | Component library and startup presets |
+| **CognitiveStateWorks** | **Which workflow states and transitions are legal?** | Authoritative state, evidence, and legality |
 
 Together they form a **closed-loop cognitive-behavioral control architecture**:
 
 ```text
-                    PRESCRIPTIVE FAST LOOP
-
-        CognitiveFrameWorks + CognitiveStateWorks
+MCP RUNTIME HOST
+  normalizes events and maintains per-session runtime state
+  ├── CSW: authoritative state snapshots and legal transitions
+  ├── CFW: component signals and cognitive actuators
+  └── DP: BehaviorState policy, fast adaptation, intervention lifecycle
+          ├── optional Laya/Jev semantic judgments
+          └── slow-loop experiments and validated behavioral priors
+  applies DP decisions only after revision checks and hard-policy resolution
                        │
                        ▼
                      Agent
                        │
                 actions / results
-                       │
-                       ▼
-              behavioral telemetry
-                       │
-                       ▼
-                    SLOW LOOP
-
-               DigitalPsychology
-        observe → reconstruct → compare
-              → experiment → validate
-                       │
-             validated findings
-                       │
-             ┌─────────┴─────────┐
-             ▼                   ▼
-      behavioral guards    routing profiles
-             │                   │
-             └─────────┬─────────┘
-                       ▼
-               future CFW policy
+                       └────────────── feedback to MCP and DP
 ```
 
 This makes the system adaptive without making it self-modifying in an uncontrolled way.

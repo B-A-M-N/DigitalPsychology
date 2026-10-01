@@ -11,33 +11,35 @@ description: >
   under-engineers, constructs God Objects, follows stale assumptions, misuses
   tools, gets trapped in loops, optimizes proxies instead of objectives,
   behaves inconsistently across contexts, or requires behavioral correction —
-  or when measuring whether a framework rule or state guard actually changes
-  agent behavior. Digital Psychology is observational and analytical: it
-  studies observable computational behavior, does not assume consciousness,
-  emotions, subjective experience, or human psychological mechanisms, and is
-  not itself an enforcement framework — its validated findings are exported
-  as rules and guards to the systems that do enforce.
+  or when measuring whether a behavioral intervention changes agent behavior.
+  Digital Psychology owns adaptive behavioral policy and intervention
+  evaluation, but not permissions, evidence truth, or legal workflow
+  transitions. It studies observable computational behavior and does not
+  assume consciousness, emotions, subjective experience, or human psychology.
 ---
 
 # Digital Psychology
 
 ## Agent Behavioral Science
 
-Digital Psychology governs the **analysis of agent behavior**. It is an
-independent discipline — outside CognitiveFrameWorks and CognitiveStateWorks —
-that can study agents using either of those systems, both, or neither.
+Digital Psychology governs the **meta-meta behavioral layer**: it analyzes
+observable behavior and decides how the runtime's cognitive configuration
+should adapt. It remains independent of CognitiveFrameWorks and
+CognitiveStateWorks, and can study or manage agents using either, both, or
+neither.
 
 ```text
-CognitiveFrameWorks     "What reasoning structures should the agent use?"
-CognitiveStateWorks     "What state is the task in, and what transitions are valid?"
-Digital Psychology      "What behavior is this agent actually exhibiting?
-                         Under what conditions? Why might those patterns occur?"
+CognitiveFrameWorks     "Which cognitive components and signals are available?"
+CognitiveStateWorks     "What state is the task in, and which transitions are valid?"
+Digital Psychology      "How should the behavioral configuration adapt to evidence?"
 ```
 
-FrameWorks and StateWorks are **prescriptive**. Digital Psychology is
-**observational and analytical**: it observes, identifies, characterizes,
-compares, and explains behavioral patterns — and measures whether the other
-systems actually change behavior.
+FrameWorks supplies cognitive components and signals. StateWorks owns
+workflow state, evidence, and legal transitions. Digital Psychology observes
+behavior, owns `BehaviorState` semantics and transition policy, and measures
+whether each intervention improved the requested outcome. The MCP runtime
+host persists and applies DP decisions after revision checks and hard-policy
+resolution.
 
 It studies:
 
@@ -172,8 +174,10 @@ OBSERVE → DESCRIBE → CLASSIFY → FORM HYPOTHESIS → PROBE → COMPARE
 → CHARACTERIZE → MONITOR
 ```
 
-Notice what is missing: **FIX AGENT**. Correction is not part of the
-mandatory flow. Digital Psychology can conclude:
+Long-term correction is evidence-led; DP does not automatically promote a
+behavioral change based on one successful task. During a task, the DP fast
+loop can issue a bounded, expiring intervention and observe what follows.
+Digital Psychology can also conclude:
 
 > "This behavior appears triggered by contradictory user feedback after a
 > high-confidence completion claim."
@@ -183,10 +187,11 @@ or:
 > "Agent A exhibits substantially stronger prior-hypothesis preservation
 > than Agent B under identical contradictory evidence."
 
-Then **something else** acts on the finding — a FrameWorks rule, a StateWork
-guard, a harness change, a configuration change. Interventions appear in this
-discipline as *experiments* that test mechanism hypotheses
-(`flows/intervene.md`), not as governance.
+The fast loop may activate, suppress, intensify, or expire CFW components and
+rank StateWork choices from the eligible set supplied by CSW. CSW still
+validates and commits workflow changes; the runtime host still enforces hard
+authority. The slow loop tests whether repeated interventions should become
+behavioral priors (`flows/intervene.md`).
 
 ---
 

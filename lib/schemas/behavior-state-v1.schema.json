@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://digitalpsychology.dev/schemas/behavior-state-v1.schema.json",
+  "title": "DigitalPsychology BehaviorState v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "revision", "cognitive_mode", "framework_modes", "active_stateworks",
+    "focus_criteria", "verification_intensity", "exploration_budget",
+    "retry_policy", "recovery_level", "context_strategy", "response_strategy",
+    "active_interventions", "intervention_history"
+  ],
+  "properties": {
+    "revision": {"type": "integer", "minimum": 0},
+    "cognitive_mode": {"enum": ["DELIVER", "DIAGNOSE", "VERIFY", "RECOVER", "REPLAN", "BLOCKED", "REINSPECT", "READY_TO_COMPLETE"]},
+    "framework_modes": {
+      "type": "object", "maxProperties": 32,
+      "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64},
+      "additionalProperties": {"enum": ["off", "passive", "normal", "elevated", "mandatory", "constrained", "reopen", "recovery", "reset"]},
+      "properties": {"ward": {"const": "mandatory"}},
+      "required": ["ward"]
+    },
+    "active_stateworks": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+    "focus_criteria": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+    "verification_intensity": {"enum": ["passive", "normal", "high", "strict"]},
+    "exploration_budget": {"enum": ["disabled", "low", "normal", "bounded"]},
+    "retry_policy": {"enum": ["normal", "materially_different_only", "no_retry"]},
+    "recovery_level": {"type": "integer", "minimum": 0, "maximum": 3},
+    "context_strategy": {"enum": ["standard", "compact", "criterion_focused"]},
+    "response_strategy": {"enum": ["direct", "detailed", "structured"]},
+    "active_interventions": {
+      "type": "array", "maxItems": 16,
+      "items": {"$ref": "#/$defs/intervention"}
+    },
+    "intervention_history": {
+      "type": "array", "maxItems": 32,
+      "items": {"$ref": "#/$defs/outcome"}
+    }
+  },
+  "$defs": {
+    "interventionTarget": {
+      "type": "object", "additionalProperties": false,
+      "required": ["target", "previous_value", "applied_value"],
+      "properties": {
+        "target": {"type": "string", "minLength": 1, "maxLength": 128},
+        "previous_value": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "applied_value": {"type": "string", "minLength": 1, "maxLength": 2048}
+      }
+    },
+    "intervention": {
+      "type": "object", "additionalProperties": false,
+      "required": ["intervention_id", "cause", "expected_effect", "start_revision", "scope", "expires_after_actions", "actions_elapsed", "targets"],
+      "properties": {
+        "intervention_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "cause": {"type": "string", "minLength": 1, "maxLength": 128},
+        "expected_effect": {"type": "string", "minLength": 1, "maxLength": 512},
+        "start_revision": {"type": "integer", "minimum": 0},
+        "scope": {"type": "string", "minLength": 1, "maxLength": 256},
+        "expires_after_actions": {"type": "integer", "minimum": 1},
+        "actions_elapsed": {"type": "integer", "minimum": 0},
+        "targets": {"type": "array", "minItems": 1, "maxItems": 12, "items": {"$ref": "#/$defs/interventionTarget"}}
+      }
+    },
+    "outcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["intervention_id", "cause", "outcome", "observed_revision", "evidence_refs"],
+      "properties": {
+        "intervention_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "cause": {"type": "string", "minLength": 1, "maxLength": 128},
+        "outcome": {"enum": ["improved", "no_effect", "regressed", "expired", "withdrawn"]},
+        "observed_revision": {"type": "integer", "minimum": 0},
+        "evidence_refs": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+      }
+    }
+  }
+}

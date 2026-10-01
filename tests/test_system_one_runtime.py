@@ -397,7 +397,7 @@ def test_calibration_is_per_question_family_and_changes_probabilities():
                     calibration_bundle=bundle)
     runtime = SystemOneRuntime(FixedBackend(), calibrations=bundle)
     result = runtime.judge(request, mode="advisory")
-    assert result.status == "ok"
+    assert result.status == "shadow"
     assert result.calibrated_question_ids == ("progress_relation",)
     progress = result.judgment.answer("progress_relation")
     retry = result.judgment.answer("retry_relation")
@@ -521,6 +521,6 @@ def test_digital_psychology_service_composes_system_one_without_an_mcp_tool(tmp_
 def test_packaged_protocol_schema_is_canonical_copy():
     schema_path = Path(__file__).parents[1] / "lib" / "schemas" / "system-one-protocol.schema.json"
     schema = json.loads(schema_path.read_text())
-    assert schema["protocol_version"] == "2.1.0"
+    assert schema["protocol_version"] == "2.2.0"
     assert schema["$defs"]["SystemOneFrame"]["additionalProperties"] is False
     assert schema["x-question-registry"] == QUESTION_REGISTRY

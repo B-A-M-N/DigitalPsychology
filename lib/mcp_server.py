@@ -21,6 +21,7 @@ except ImportError:  # transport is optional; the service remains testable
     FastMCP = None
 
 from .feedback_loop import EventFactory, EventError, SQLiteSink, trusted_state_root
+from .fast_loop import BehavioralController, FastLoopInput
 from .routing_profiles import (BehavioralRoutingProfile, RoutingProfileError,
                                SharingDecisionAuthority, applicable_adjustments,
                                validate_profile)
@@ -45,7 +46,8 @@ class DigitalPsychologyService:
                  per_origin_write_limit: int = 100_000,
                  backpressure_recovery_seconds: float = 5.0,
                  sharing_authority: SharingDecisionAuthority | None = None,
-                 system_one_service: SystemOneService | None = None) -> None:
+                 system_one_service: SystemOneService | None = None,
+                 behavioral_controller: BehavioralController | None = None) -> None:
         root = trusted_state_root()
         self.event_db = event_db or Path(
             os.environ.get("DIGITALPSYCHOLOGY_EVENT_DB", root / "events.sqlite3"))
@@ -57,6 +59,7 @@ class DigitalPsychologyService:
         self._promotion_secret = os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode()
         self._sharing_authority = sharing_authority
         self._system_one_service = system_one_service
+        self._behavioral_controller = behavioral_controller or BehavioralController()
         if (max_pending_events_per_origin < 1 or max_ingest_seconds_per_origin <= 0
                 or backpressure_recovery_seconds <= 0
                 or not 10 <= int(busy_timeout_ms) <= 5000 or int(per_origin_write_limit) < 1):
@@ -99,6 +102,23 @@ class DigitalPsychologyService:
         if self._system_one_service is None:
             raise RuntimeError("System-1 service is not configured")
         self._system_one_service.resync(frame)
+
+    def decide_behavior(self, context: FastLoopInput, *,
+                        judgment: Any = None) -> dict[str, Any]:
+        """Host-only fast-loop decision; it is deliberately not an agent tool.
+
+        The runtime host supplies its current DP state, CFW signals, bounded
+        CSW snapshot, and optional DP System-1 result. It must check the
+        expected revision, enforce hard policy floors, persist the returned
+        state, and ask CSW to validate any StateWork preference.
+        """
+        # A raw/shadow System-1 judgment is diagnostic only. Behavioral policy
+        # consumes semantic advice only after the DP service marks the complete
+        # requested question set advisory-ready.
+        if hasattr(judgment, "status"):
+            judgment = judgment.judgment if judgment.status == "ok" else None
+        decision = self._behavioral_controller.decide(context, judgment=judgment)
+        return decision.to_dict()
 
     def _producer_key(self, key_id: str) -> bytes:
         raw = os.environ.get(f"DIGITALPSYCHOLOGY_INGESTION_KEY_{key_id}", "")

@@ -306,7 +306,7 @@ class SystemOneRuntime:
                      question_ids: tuple[str, ...],
                      cache_hit: bool = False) -> SystemOneResult:
         if mode == "advisory" and not set(question_ids).issubset(calibrated_ids):
-            return SystemOneResult(judgment, "shadow", (), cache_hit,
+            return SystemOneResult(judgment, "shadow", calibrated_ids, cache_hit,
                                    reason="uncalibrated_or_shifted_context")
         if mode == "shadow":
             return SystemOneResult(judgment, "shadow", calibrated_ids, cache_hit,
