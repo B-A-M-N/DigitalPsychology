@@ -121,8 +121,8 @@ class ActivityFact:
                                 "workflow_progress", "retry", "goal_progress", "blocker",
                                 "operator_correction"})
     PROGRESS_CLASSES = frozenset({"GOAL_PROGRESS", "BLOCKER_REMOVED", "DIAGNOSTIC_PROGRESS",
-                                  "VERIFICATION_PROGRESS", "RECOVERY_PROGRESS",
-                                  "WORKFLOW_PROGRESS"})
+                                  "VERIFICATION_PROGRESS", "VALIDATION_EVIDENCE",
+                                  "RECOVERY_PROGRESS", "WORKFLOW_PROGRESS"})
 
     def __post_init__(self) -> None:
         if not isinstance(self.sequence, int) or self.sequence < 1:

@@ -804,10 +804,13 @@ def goal_fidelity_metrics(events: Iterable[Event]) -> Dict[str, Any]:
                        or event.event_type == "goal_progress_recorded")]
     support_since_goal = 0
     verification_count = 0
+    validation_evidence_count = 0
     for event in ordered:
         payload = event.payload or {}
         if payload.get("progress_class") == "VERIFICATION_PROGRESS":
             verification_count += 1
+        if payload.get("progress_class") == "VALIDATION_EVIDENCE":
+            validation_evidence_count += 1
         if event.event_type == "support_action_recorded":
             support_since_goal += 1
         if event.event_type == "goal_progress_recorded" or payload.get("progress_class") in {
@@ -837,6 +840,7 @@ def goal_fidelity_metrics(events: Iterable[Event]) -> Dict[str, Any]:
         "goal_progress_ratio": min(1.0, len(goal_events) / max(1, action_count)),
         "support_actions_since_goal_progress": support_since_goal,
         "verification_action_ratio": verification_count / max(1, action_count),
+        "validation_evidence_count": validation_evidence_count,
         "intent_deviation_count": intent_deviation_count,
         "unnecessary_scope_expansion": unnecessary_scope_expansion,
         "completion_criterion_coverage": completion_coverage[-1] if completion_coverage else 0.0,

@@ -314,6 +314,7 @@
             "BLOCKER_REMOVED",
             "DIAGNOSTIC_PROGRESS",
             "VERIFICATION_PROGRESS",
+            "VALIDATION_EVIDENCE",
             "WORKFLOW_PROGRESS",
             "RECOVERY_PROGRESS",
             null
