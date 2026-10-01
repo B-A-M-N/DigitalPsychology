@@ -185,6 +185,18 @@ def test_lifecycle_lineage_survives_revision_and_restart(tmp_path):
     assert restarted.observe(observed, [])["deployment_lineage_id"] == lineage
 
 
+def test_unknown_routing_lifecycle_status_is_not_active(tmp_path):
+    from lib.routing_lifecycle import RoutingLifecycleStore
+
+    store = RoutingLifecycleStore(tmp_path / "state.json")
+    store.set_lifecycle_status(source_profile_hash="profile-x", status="future-status")
+    assert not store.is_active(source_profile_hash="profile-x")
+    store.set_lifecycle_status(source_profile_hash="profile-x", status="active")
+    assert store.is_active(source_profile_hash="profile-x")
+    store.set_lifecycle_status(source_profile_hash="profile-x", status="validated")
+    assert store.is_active(source_profile_hash="profile-x")
+
+
 def test_fallback_requires_explicit_known_good_profile(tmp_path):
     from lib.mcp_server import DigitalPsychologyService
     from lib.routing_lifecycle import RoutingLifecycleStore
