@@ -794,7 +794,10 @@ def goal_fidelity_metrics(events: Iterable[Event]) -> Dict[str, Any]:
     """Summarize host-attested goal movement and support work for one attempt."""
     ordered = sorted(events, key=lambda event: (event.timestamp, event.event_id))
     actions = [event for event in ordered
-               if event.category in {"action", "tool_result"}]
+               if (event.category == "action"
+                   or (event.category == "tool_result"
+                       and event.event_type not in {
+                           "support_action_recorded", "progress_relation_fused"}))]
     goal_events = [event for event in ordered
                    if (event.payload.get("progress_class") in {
                        "GOAL_PROGRESS", "BLOCKER_REMOVED"}
@@ -1229,8 +1232,20 @@ class EventFactory:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Event":
         """Authoritative entry point: schema-validate then construct."""
-        EventSchema.validate(data)
-        return cls.from_validated_dict(data)
+        normalized = dict(data)
+        payload = normalized.get("payload")
+        if isinstance(payload, Mapping):
+            payload = dict(payload)
+            legacy_outcomes = {
+                "good": "PASS", "bad": "FAIL",
+                "not_applicable": "NOT_APPLICABLE",
+            }
+            outcome = payload.get("outcome")
+            if isinstance(outcome, str) and outcome.lower() in legacy_outcomes:
+                payload["outcome"] = legacy_outcomes[outcome.lower()]
+            normalized["payload"] = payload
+        EventSchema.validate(normalized)
+        return cls.from_validated_dict(normalized)
 
 
 def load_events(path: Path) -> List[Event]:

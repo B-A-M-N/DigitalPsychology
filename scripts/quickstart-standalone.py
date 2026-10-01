@@ -71,7 +71,7 @@ for index, cohort in enumerate(cohorts):
                  "evaluator_version": plan["target_evaluator_version"],
                  "evaluator_hash": plan["target_evaluator_hash"],
                  "outcome_source": f"evaluator:{plan['target_evaluator']}",
-                 "outcome": "bad" if cohort == "control" else "good",
+                 "outcome": "FAIL" if cohort == "control" else "PASS",
                  "candidate_profile_hash": plan["candidate_profile_hash"],
                  "candidate_adjustment_applied": applied,
                  "policy_identity": identity, "experiment_plan_hash": plan["plan_hash"],

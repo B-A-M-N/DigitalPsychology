@@ -25,6 +25,8 @@ from .routing_profiles import (BehavioralRoutingProfile, RoutingProfileError,
                                SharingDecisionAuthority, applicable_adjustments,
                                validate_profile)
 from .slow_loop import BoundedLearningController
+from .system_one_contracts import SystemOneFrame, SystemOneIdentity
+from .system_one_service import SystemOneService
 
 
 def _canonical(value: Any) -> str:
@@ -42,7 +44,8 @@ class DigitalPsychologyService:
                  busy_timeout_ms: int = 250,
                  per_origin_write_limit: int = 100_000,
                  backpressure_recovery_seconds: float = 5.0,
-                 sharing_authority: SharingDecisionAuthority | None = None) -> None:
+                 sharing_authority: SharingDecisionAuthority | None = None,
+                 system_one_service: SystemOneService | None = None) -> None:
         root = trusted_state_root()
         self.event_db = event_db or Path(
             os.environ.get("DIGITALPSYCHOLOGY_EVENT_DB", root / "events.sqlite3"))
@@ -53,6 +56,7 @@ class DigitalPsychologyService:
         self._attestation_secret = os.environ.get("DIGITALPSYCHOLOGY_INGESTION_SECRET", "").encode()
         self._promotion_secret = os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode()
         self._sharing_authority = sharing_authority
+        self._system_one_service = system_one_service
         if (max_pending_events_per_origin < 1 or max_ingest_seconds_per_origin <= 0
                 or backpressure_recovery_seconds <= 0
                 or not 10 <= int(busy_timeout_ms) <= 5000 or int(per_origin_write_limit) < 1):
@@ -71,6 +75,30 @@ class DigitalPsychologyService:
 
     def close(self) -> None:
         self._sink.close()
+        if self._system_one_service is not None:
+            self._system_one_service.close()
+
+    def capability(self):
+        """Host-only System-1 capability handshake; not exposed through MCP."""
+        if self._system_one_service is None:
+            raise RuntimeError("System-1 service is not configured")
+        return self._system_one_service.capability()
+
+    def judge(self, frame: SystemOneFrame, *, mode: str | None = None):
+        """Host-only behavioral judgment path; never registered as an agent tool."""
+        if self._system_one_service is None:
+            raise RuntimeError("System-1 service is not configured")
+        return self._system_one_service.judge(frame, mode=mode)
+
+    def reset_identity(self, identity: SystemOneIdentity) -> None:
+        if self._system_one_service is None:
+            raise RuntimeError("System-1 service is not configured")
+        self._system_one_service.reset_identity(identity)
+
+    def resync(self, frame: SystemOneFrame) -> None:
+        if self._system_one_service is None:
+            raise RuntimeError("System-1 service is not configured")
+        self._system_one_service.resync(frame)
 
     def _producer_key(self, key_id: str) -> bytes:
         raw = os.environ.get(f"DIGITALPSYCHOLOGY_INGESTION_KEY_{key_id}", "")
@@ -78,14 +106,14 @@ class DigitalPsychologyService:
             raise ValueError("behavior event producer key is unavailable")
         return raw.encode()
 
-    def _attest_event(self, data: Mapping[str, Any]) -> bool:
+    def _attest_event(self, data: Mapping[str, Any],
+                      attestation: Optional[Mapping[str, Any]]) -> bool:
         privileged = (data.get("category") in {"validation", "state_transition", "completion"}
                       or data.get("actor_id") in {"operator", "repository_owner", "service_owner"})
         producer_key = "|".join((str(data.get("namespace_id") or ""),
                                  str(data.get("application_instance_id") or ""),
                                  str(data.get("agent_instance_id") or "")))
         producer = self._trusted_producers.get(producer_key)
-        attestation = data.get("host_attestation")
         if producer is not None:
             if not isinstance(attestation, Mapping):
                 raise ValueError("configured producer requires host attestation")
@@ -121,9 +149,23 @@ class DigitalPsychologyService:
 
     def ingest_behavior_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
         try:
-            data = dict(event)
-            authenticated = self._attest_event(data)
-            data.pop("host_attestation", None)
+            if not isinstance(event, Mapping):
+                raise ValueError("behavior event transport must be an object")
+            if "event" in event or "attestation" in event:
+                if set(event) != {"event", "attestation"}:
+                    raise ValueError("authenticated behavior event envelope has unknown fields")
+                raw_event = event.get("event")
+                attestation = event.get("attestation")
+                if not isinstance(raw_event, Mapping):
+                    raise ValueError("authenticated behavior event requires an event object")
+                data = dict(raw_event)
+            else:
+                # Compatibility adapter for the 2.3 transport that embedded
+                # attestation beside semantic event fields.
+                data = dict(event)
+                attestation = data.pop("host_attestation", None)
+            authenticated = self._attest_event(
+                data, attestation if isinstance(attestation, Mapping) else None)
             parsed = EventFactory.from_dict(data)
             origin = (parsed.namespace_id, parsed.application_instance_id)
             now = time.monotonic()

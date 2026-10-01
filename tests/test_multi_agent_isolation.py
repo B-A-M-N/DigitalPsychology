@@ -9,7 +9,7 @@ from lib.routing_profiles import RoutingProfileError, derive_profiles
 from lib.trajectories import build_trajectories
 
 
-def _event(agent, *, event_id="same", app="app", namespace="ns", role="delegator", interaction=None, outcome="bad"):
+def _event(agent, *, event_id="same", app="app", namespace="ns", role="delegator", interaction=None, outcome="FAIL"):
     return Event(event_id=event_id, timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(), task_id="task", agent_id=agent, agent_instance_id=agent, session_id="same-session", attempt_id="attempt-1", behavioral_subject="subject", namespace_id=namespace, application_id=app, application_instance_id=app, category="decision", event_type="route_outcome", role=role, interaction_id=interaction, payload={"route": "flow", "route_type": "stage", "route_decision_id": "d", "outcome": outcome, "outcome_source": "evaluator:e", "evaluator_id": "e", "candidate_profile_hash": "x", "candidate_adjustment_applied": False, "policy_identity": "c", "experiment_plan_hash": "p", "comparison_context_hash": "c"})
 
 
@@ -74,7 +74,7 @@ def test_shared_interaction_cannot_cross_cohorts():
             application_id="app", application_instance_id="app", category="decision",
             event_type="route_outcome", role="delegator", interaction_id="shared", delegation_id="d",
             payload={"route": "flow", "route_type": "stage", "route_decision_id": "d",
-            "outcome": "bad" if cohort == "control" else "good", "outcome_source": "evaluator:e",
+            "outcome": "FAIL" if cohort == "control" else "PASS", "outcome_source": "evaluator:e",
             "evaluator_id": "e", "evaluator_version": "1", "evaluator_hash": plan["target_evaluator_hash"],
             "candidate_profile_hash": plan["candidate_profile_hash"],
             "candidate_adjustment_applied": applied, "policy_identity": "t" if applied else "c",
@@ -117,7 +117,7 @@ def test_persisted_event_retrieval_requires_complete_origin():
     with tempfile.TemporaryDirectory() as raw:
         service = DigitalPsychologyService(event_db=Path(raw) / "events.sqlite3")
         event = EventFactory.from_dict({
-            "schema_version": "2.3.0", "event_id": "same-event",
+            "schema_version": "2.4.0", "event_id": "same-event",
             "timestamp": datetime.now(timezone.utc).isoformat(), "namespace_id": "ns-a",
             "application_id": "app", "application_instance_id": "instance-a",
             "task_id": "task", "agent_id": "agent", "actor_id": "agent",

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://digitalpsychology.dev/schemas/authenticated-behavior-event.schema.json",
+  "title": "Authenticated behavior event envelope",
+  "type": "object",
+  "required": [
+    "event",
+    "attestation"
+  ],
+  "properties": {
+    "event": {
+      "$ref": "behavior-event.schema.json"
+    },
+    "attestation": {
+      "type": "object",
+      "required": [
+        "issuer",
+        "key_id",
+        "signature"
+      ],
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "key_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "signature": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

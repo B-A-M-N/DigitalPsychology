@@ -37,13 +37,15 @@ def test_event_round_trip_preserves_goal_contract_hash():
 def test_goal_fidelity_metrics_distinguish_progress_support_and_verification():
     events = [
         _event("e1", "action", "action_requested", 1,
-               payload={"route": "inspect"}),
+               payload={"route": "inspect", "progress_class": "VERIFICATION_PROGRESS"}),
         _event("e2", "tool_result", "tool_result", 2,
                payload={"tool_type": "write"}),
         _event("e3", "decision", "goal_progress_recorded", 3,
                payload={"progress_class": "GOAL_PROGRESS"}),
+        _event("e3b", "tool_result", "support_action_recorded", 3,
+               payload={"progress_class": "DIAGNOSTIC_PROGRESS"}),
         _event("e4", "action", "action_requested", 4,
-               payload={"route": "test"}),
+               payload={"route": "test", "progress_class": "VERIFICATION_PROGRESS"}),
         _event("e5", "completion", "completion_attempted", 5,
                payload={"completion_criterion_coverage": 0.5}),
         _event("e6", "correction", "intent_deviation_detected", 6,

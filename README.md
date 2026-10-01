@@ -71,6 +71,39 @@ The slow loop is explicitly invoked; it is not an automatic background worker. I
 - **DP + CSW:** DP can inform future flow preferences, but CSW remains the source of legal flow and transition eligibility.
 - **CFW + CSW without DP:** both runtime authorities continue to work with no DP service installed.
 
+### Optional Laya System-1 provider
+
+Laya support is opt-in. Install either `digital-psychology[laya]` or
+`digital-psychology[system-one]`; ordinary imports and the default DP MCP
+service do not import Laya, load PyTorch, or download model weights. The
+Laya adapter uses the public `Agent.decide` API and is available only to a
+trusted host through `SystemOneService`; it is not an agent-facing MCP tool.
+
+The checkpoint must already exist on disk and be pinned by its library
+revision and content hash. Set these variables before constructing the
+service with `SystemOneService.from_environment()`:
+
+```text
+DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE=shadow
+DIGITALPSYCHOLOGY_LAYA_MODEL_PATH=/local/path/to/pinned-checkpoint
+DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION=<immutable-upstream-revision>
+DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256=<model-content-digest>
+DIGITALPSYCHOLOGY_LAYA_DEVICE=cpu
+DIGITALPSYCHOLOGY_LAYA_TIMEOUT_MS=30000
+```
+
+The timeout is pinned by the host policy and defaults to 30 seconds for local
+CPU inference. Hosts can choose a shorter deadline for faster devices; a timeout
+causes one provider failure and deterministic fallback.
+
+Advisory mode requires an active calibration bundle. The host builds a
+candidate from later independent validation outcomes, reviews and activates
+it through `SystemOneCalibrationLifecycle`, then points
+`DIGITALPSYCHOLOGY_SYSTEM_ONE_CALIBRATION_PATH` at the exported active bundle.
+Calibration is bound to one question family, model-content identity, protocol,
+work mode, and deliverable kind. Missing or out-of-scope calibration leaves
+that question in shadow.
+
 The diagram above describes the optional combined loop. It is not a requirement for DP ingestion or experimentation.
 
 ## The larger architecture

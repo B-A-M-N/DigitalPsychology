@@ -10,6 +10,10 @@ requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = ["jsonschema>=4.18", "PyYAML>=6.0", "mcp>=1.0"]
 
+[project.optional-dependencies]
+laya = ["laya[serve]==0.3.22"]
+system-one = ["laya[serve]==0.3.22"]
+
 [project.scripts]
 digital-psychology-mcp = "digital_psychology.mcp_server:main"
 

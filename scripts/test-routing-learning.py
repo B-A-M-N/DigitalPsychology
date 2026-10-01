@@ -79,7 +79,7 @@ def main() -> int:
         task = f"task-{cohort}"
         for index in range(100):
             events.append(route_event(index, session, task,
-                                      "bad" if cohort == "control" else "good", plan))
+                                      "FAIL" if cohort == "control" else "PASS", plan))
         contexts[f"{session}:{task}:attempt-1"] = {
             "agent_instance_id": "agent-a", "model": "model-a", "harness": "test",
             "task_family": "performance", "task_shape": "performance", "domain_tags": [],
