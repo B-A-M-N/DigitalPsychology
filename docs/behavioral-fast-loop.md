@@ -20,6 +20,14 @@ For each host action, `RuntimeSession.process_action()` gathers:
 - an optional DP System-1 judgment. Laya is one optional provider; deterministic
   policy works when System-1 is disabled or unavailable.
 
+For a live System-1 path, configure `RuntimeHost(system_one_frame_factory=...)`
+with a host-side builder that returns a validated `SystemOneFrame` for the
+current runtime identity, DP state, observation, CFW signals, and CSW snapshot.
+The DP session dispatches that frame through its internal judge before the fast
+loop runs. Provider selection stays explicit through
+`SystemOneService.from_environment()`; without a configured builder and judge,
+the deterministic policy continues to operate without semantic augmentation.
+
 DP returns a typed `BehavioralDecision` with a state at exactly the next DP
 revision, directives, CSW-eligible StateWork preferences, and independently
 assessed intervention outcomes. DP persists its behavior revision separately
@@ -68,9 +76,16 @@ evidence through trusted CSW/validator authorities. See
 from digital_psychology import CFWRuntimeAdapter, RuntimeHost
 from digital_psychology.runtime.adapters import CSWRuntimeAdapter
 from digital_psychology.mcp_server import DigitalPsychologyService
+from digital_psychology.system_one_service import SystemOneService
 
-service = DigitalPsychologyService(event_db="/var/lib/dp/events.sqlite3")
-host = RuntimeHost(service=service, state_path="/var/lib/dp/behavior-state.sqlite3")
+system_one = SystemOneService.from_environment()
+service = DigitalPsychologyService(
+    event_db="/var/lib/dp/events.sqlite3", system_one_service=system_one)
+host = RuntimeHost(
+    service=service,
+    state_path="/var/lib/dp/behavior-state.sqlite3",
+    system_one_frame_factory=trusted_frame_builder,
+)
 session = host.open_session(
     identity=runtime_identity,
     objective="Render the requested page",

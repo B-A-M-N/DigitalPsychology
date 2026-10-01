@@ -8,7 +8,8 @@ from typing import Any, Sequence
 
 from ..feedback_loop import trusted_state_root
 from .contracts import (BehavioralDecisionService, CFWComponentPort,
-                        CSWWorkflowPort, RuntimeIdentity)
+                        CSWWorkflowPort, RuntimeIdentity,
+                        SystemOneFrameFactory)
 from .session import RuntimeSession
 from .store import BehaviorStateStore
 
@@ -19,8 +20,10 @@ class RuntimeHost:
     SESSION_CACHE_LIMIT = 256
 
     def __init__(self, *, service: BehavioralDecisionService,
-                 state_path: Path | None = None) -> None:
+                 state_path: Path | None = None,
+                 system_one_frame_factory: SystemOneFrameFactory | None = None) -> None:
         self.service = service
+        self.system_one_frame_factory = system_one_frame_factory
         if state_path is None:
             state_path = trusted_state_root() / "behavior-state.sqlite3"
         self.state_store = BehaviorStateStore(Path(state_path))
@@ -61,6 +64,7 @@ class RuntimeHost:
             objective=objective, controller=self.service, cfw=cfw, csw=csw,
             outcome_evidence_authority=outcome_evidence_authority,
             state_store=self.state_store,
+            system_one_frame_factory=self.system_one_frame_factory,
         )
         self._sessions[identity.scope] = session
         if len(self._sessions) > self.SESSION_CACHE_LIMIT:

@@ -11,7 +11,7 @@ from .outcomes import (HostOutcomeFact, InterventionEventContext,
                        OutcomeEvidenceAuthority)
 from .runtime import (BehaviorStateStore, CFWComponentPort, CSWWorkflowPort,
                       RuntimeHost, RuntimeIdentity, RuntimeObservation,
-                      RuntimeSession, RuntimeTurnResult)
+                      RuntimeSession, RuntimeTurnResult, SystemOneFrameFactory)
 from .runtime.adapters import CFWRuntimeAdapter, CSWRuntimeAdapter, CSWWorkflowBinding
 
 __all__ = [
@@ -23,5 +23,5 @@ __all__ = [
     "OutcomeEvidenceAuthority", "BehaviorStateStore", "CFWComponentPort",
     "CSWWorkflowPort", "RuntimeHost", "RuntimeIdentity", "RuntimeObservation",
     "RuntimeSession", "RuntimeTurnResult", "CFWRuntimeAdapter", "CSWRuntimeAdapter",
-    "CSWWorkflowBinding",
+    "CSWWorkflowBinding", "SystemOneFrameFactory",
 ]

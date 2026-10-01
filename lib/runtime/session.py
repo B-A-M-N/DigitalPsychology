@@ -11,8 +11,10 @@ from ..behavior_state import (BehaviorDirective, BehaviorIntervention,
                               CSWBehaviorSnapshot, InterventionOutcome)
 from ..fast_loop import FastLoopInput
 from ..outcomes import InterventionEvaluationFrame, InterventionEventContext
+from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
 from .contracts import (BehavioralDecisionService, CFWComponentPort,
-                        CSWWorkflowPort, RuntimeIdentity, RuntimeObservation)
+                        CSWWorkflowPort, RuntimeIdentity, RuntimeObservation,
+                        SystemOneFrameFactory)
 from .store import BehaviorStateStore, RuntimeStateRecord
 
 
@@ -41,6 +43,7 @@ class RuntimeSession:
                  csw: CSWWorkflowPort,
                  outcome_evidence_authority: Any,
                  state_store: BehaviorStateStore,
+                 system_one_frame_factory: SystemOneFrameFactory | None = None,
                  objective: str = "") -> None:
         self.identity = identity
         self.scope = identity.scope
@@ -58,6 +61,10 @@ class RuntimeSession:
         self.csw = csw
         self.outcome_evidence_authority = outcome_evidence_authority
         self.state_store = state_store
+        self.system_one_frame_factory = system_one_frame_factory
+        if system_one_frame_factory is not None and not callable(
+                getattr(controller, "judge", None)):
+            raise TypeError("System-1 frame construction requires a DP host judge")
         self._lock = RLock()
 
     def process_action(self, observation: RuntimeObservation, *,
@@ -72,9 +79,20 @@ class RuntimeSession:
                 raise ValueError(f"host criteria escape the runtime objective: {sorted(unknown)}")
 
             snapshot = self._csw_snapshot()
+            candidate_statework_ids = self._candidate_statework_ids(snapshot)
             signals = tuple(self.cfw.collect_behavior_signals(observation))
+            available_frameworks = tuple(self.cfw.available_component_ids())
             if len(signals) > 32 or any(not hasattr(item, "code") for item in signals):
                 raise ValueError("CFW adapter returned malformed behavioral signals")
+            if judgment is None and self.system_one_frame_factory is not None:
+                frame = self.system_one_frame_factory(
+                    self.identity, self.objective, self.objective_criteria,
+                    record.state, observation, snapshot, signals)
+                if not isinstance(frame, SystemOneFrame):
+                    raise TypeError("System-1 frame factory must return a validated frame")
+                if frame.identity.to_dict() != self._system_one_identity().to_dict():
+                    raise ValueError("System-1 frame identity escapes the runtime session")
+                judgment = self.controller.judge(frame)
             outcome_assessments = self._assess_ready_interventions(
                 record, observation)
             decision_input = FastLoopInput(
@@ -95,6 +113,7 @@ class RuntimeSession:
                 context_pressure=observation.context_pressure,
                 evidence_refs=observation.evidence_refs,
                 intervention_assessments=tuple(outcome_assessments),
+                available_frameworks=available_frameworks,
             )
             decision = self._parse_decision(
                 self.controller.decide_behavior(decision_input, judgment=judgment))
@@ -109,7 +128,8 @@ class RuntimeSession:
             activated_statework: str | None = None
             updated_snapshot = snapshot
             try:
-                cfw_applied = tuple(self.cfw.apply_behavior_directives(prepared))
+                cfw_applied = tuple(self.cfw.apply_behavior_directives(
+                    prepared, decision.state.to_dict()))
                 if len(cfw_applied) != len(set(cfw_applied)):
                     raise RuntimeError("CFW returned duplicate directive receipts")
                 expected_cfw = {item.directive_id for item in cfw_directives}
@@ -132,13 +152,14 @@ class RuntimeSession:
                     updated_snapshot = self.csw.activate_statework(
                         statework_id,
                         expected_selection_revision=snapshot.revision,
-                        candidate_statework_ids=self.cfw.available_statework_ids())
+                        candidate_statework_ids=candidate_statework_ids)
                     if statework_id not in updated_snapshot.active_stateworks:
                         raise RuntimeError("CSW did not confirm StateWork activation")
                     activated_statework = statework_id
                     applied.add(directive.directive_id)
 
-                confirmed_snapshot = self._csw_snapshot()
+                confirmed_snapshot = self._csw_snapshot(
+                    candidate_statework_ids=candidate_statework_ids)
                 if confirmed_snapshot != updated_snapshot:
                     raise RuntimeError(
                         "CSW selection changed during DP decision application; re-inspect required")
@@ -168,7 +189,7 @@ class RuntimeSession:
                         self.csw.deactivate_statework(
                             activated_statework,
                             expected_selection_revision=updated_snapshot.revision,
-                            candidate_statework_ids=self.cfw.available_statework_ids())
+                            candidate_statework_ids=candidate_statework_ids)
                     except Exception as exc:
                         compensation_errors.append(f"CSW activation rollback failed: {exc}")
                 if compensation_errors:
@@ -212,8 +233,6 @@ class RuntimeSession:
                             evidence_refs: Sequence[str],
                             expected_workflow_revision: int) -> Any:
         """Submit a legal-step request through CSW's current snapshot boundary."""
-        if statework_id not in self.cfw.available_statework_ids():
-            raise ValueError("StateWork is not available in the CFW runtime bundle")
         snapshot = self._csw_snapshot(candidate_statework_ids=(statework_id,))
         if statework_id not in snapshot.active_stateworks:
             raise ValueError("StateWork is not active in the CSW-owned selection")
@@ -229,6 +248,7 @@ class RuntimeSession:
         record = self.state_store.load(self.scope)
         snapshot = self._csw_snapshot()
         projection = self.project_behavior_context(record.state, snapshot)
+        self.cfw.synchronize_behavior_state(record.state.to_dict())
         return self.cfw.before_model_call(
             projection, tool_capable=tool_capable, action_hint=action_hint,
             active_statework_ids=snapshot.active_stateworks)
@@ -238,18 +258,23 @@ class RuntimeSession:
         record = self.state_store.load(self.scope)
         snapshot = self._csw_snapshot()
         projection = self.project_behavior_context(record.state, snapshot)
+        self.cfw.synchronize_behavior_state(record.state.to_dict())
         return self.cfw.before_tool_planning(
             projection, action_hint=action_hint,
             active_statework_ids=snapshot.active_stateworks)
 
     def _csw_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None
                       ) -> CSWBehaviorSnapshot:
-        available = self.cfw.available_statework_ids()
-        candidates = (available if candidate_statework_ids is None
-                      else tuple(candidate_statework_ids))
-        if not set(candidates).issubset(available):
-            raise ValueError("CSW candidate StateWork is not available in the CFW bundle")
-        return self.csw.behavioral_snapshot(candidate_statework_ids=candidates)
+        return self.csw.behavioral_snapshot(
+            candidate_statework_ids=(None if candidate_statework_ids is None
+                                     else tuple(candidate_statework_ids)))
+
+    @staticmethod
+    def _candidate_statework_ids(snapshot: CSWBehaviorSnapshot) -> tuple[str, ...]:
+        """Keep mutations inside CSW's own authoritative snapshot boundary."""
+        values = {item.statework_id for item in snapshot.eligible_stateworks}
+        values.update(snapshot.active_stateworks)
+        return tuple(sorted(values))
 
     def project_behavior_context(self, state: BehaviorState | None = None,
                                  snapshot: CSWBehaviorSnapshot | None = None) -> str:
@@ -271,6 +296,12 @@ class RuntimeSession:
                 "response_strategy": state.response_strategy,
             },
             "csw_active_stateworks": list(snapshot.active_stateworks),
+            "csw_selection_revision": snapshot.revision,
+            "csw_snapshot_id": snapshot.snapshot_id,
+            "csw_workflow_states": dict(snapshot.workflow_states),
+            "csw_workflow_revisions": dict(snapshot.workflow_revisions),
+            "csw_eligible_steps": {
+                key: list(value) for key, value in snapshot.eligible_steps.items()},
             "csw_eligible_stateworks": [item.to_dict()
                                          for item in snapshot.eligible_stateworks],
             "active_interventions": [item.to_dict()
@@ -376,6 +407,19 @@ class RuntimeSession:
             agent_id=identity.agent_id,
             behavioral_subject=identity.behavioral_subject,
             goal_contract_hash=identity.goal_contract_hash,
+        )
+
+    def _system_one_identity(self) -> SystemOneIdentity:
+        identity = self.identity
+        return SystemOneIdentity(
+            namespace_id=identity.namespace_id,
+            application_id=identity.application_id,
+            application_instance_id=identity.application_instance_id,
+            agent_id=identity.agent_id,
+            agent_instance_id=identity.agent_instance_id,
+            session_id=identity.session_id,
+            task_id=identity.task_id,
+            attempt_id=identity.attempt_id,
         )
 
 

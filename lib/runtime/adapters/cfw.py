@@ -23,15 +23,14 @@ class CFWRuntimeAdapter:
     def __init__(self, component_port: Any) -> None:
         self.component_port = component_port
 
-    def available_statework_ids(self) -> tuple[str, ...]:
-        raw = self.component_port.available_statework_ids()
-        if not isinstance(raw, Sequence) or len(raw) > 32:
-            raise ValueError("CFW StateWork availability exceeds its bounded contract")
-        values = tuple(raw)
+    def available_component_ids(self) -> tuple[str, ...]:
+        raw = self.component_port.available_component_ids()
+        if not isinstance(raw, Sequence) or len(raw) > 16:
+            raise ValueError("CFW component capability set exceeds its bounded contract")
+        values = tuple(str(item).lower() for item in raw)
         if (len(values) != len(set(values))
-                or any(not isinstance(item, str) or not item or len(item) > 128
-                       for item in values)):
-            raise ValueError("CFW returned malformed available StateWork IDs")
+                or any(not item or len(item) > 64 for item in values)):
+            raise ValueError("CFW returned malformed component capability IDs")
         return values
 
     def collect_behavior_signals(self, observation: RuntimeObservation
@@ -66,8 +65,12 @@ class CFWRuntimeAdapter:
     def prepare_behavior_directives(self, directives: Sequence[Mapping[str, Any]]) -> Any:
         return self.component_port.prepare_behavior_directives(tuple(directives))
 
-    def apply_behavior_directives(self, prepared: Any) -> Sequence[str]:
-        return self.component_port.apply_behavior_directives(prepared)
+    def apply_behavior_directives(self, prepared: Any,
+                                  behavior_state: Mapping[str, Any]) -> Sequence[str]:
+        return self.component_port.apply_behavior_directives(prepared, behavior_state)
+
+    def synchronize_behavior_state(self, behavior_state: Mapping[str, Any]) -> None:
+        self.component_port.synchronize_behavior_state(behavior_state)
 
     def rollback_behavior_directives(self, prepared: Any) -> None:
         self.component_port.rollback_behavior_directives(prepared)

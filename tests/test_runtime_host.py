@@ -11,6 +11,10 @@ from lib.mcp_server import DigitalPsychologyService
 from lib.outcomes import HostOutcomeFact
 from lib.runtime import (BehaviorStateStore, CFWRuntimeAdapter, RuntimeHost,
                          RuntimeIdentity, RuntimeObservation)
+from lib.protocol_artifact import QUESTION_REGISTRY
+from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionSpec,
+                                      SemanticState, SystemOneFrame,
+                                      SystemOneIdentity, canonical_hash)
 
 
 class _CFWPort:
@@ -20,8 +24,8 @@ class _CFWPort:
         self.controls = {}
         self.active_statework_contexts = []
 
-    def available_statework_ids(self):
-        return ("repair",)
+    def available_component_ids(self):
+        return ("owl", "anchor", "fuse", "ward", "sispis")
 
     def collect_behavior_signals(self, _observation):
         return tuple(self.signals)
@@ -29,11 +33,15 @@ class _CFWPort:
     def prepare_behavior_directives(self, directives):
         return dict(self.controls), tuple(dict(item) for item in directives)
 
-    def apply_behavior_directives(self, prepared):
+    def apply_behavior_directives(self, prepared, behavior_state):
         _prior, directives = prepared
         for item in directives:
             self.controls[item["directive_id"]] = item
+        self.behavior_state = dict(behavior_state)
         return tuple(item["directive_id"] for item in directives)
+
+    def synchronize_behavior_state(self, behavior_state):
+        self.behavior_state = dict(behavior_state)
 
     def rollback_behavior_directives(self, prepared):
         prior, _directives = prepared
@@ -108,6 +116,76 @@ class _EvidenceAuthority:
         return fact
 
 
+class _JudgeService(DigitalPsychologyService):
+    def __init__(self, *, event_db):
+        super().__init__(event_db=event_db)
+        self.calls = []
+
+    def judge(self, frame, *, mode=None):
+        self.calls.append(("judge", frame))
+        return None
+
+    def decide_behavior(self, context, *, judgment=None):
+        self.calls.append(("decide", judgment))
+        return super().decide_behavior(context, judgment=judgment)
+
+
+def _system_one_frame(identity):
+    system_identity = SystemOneIdentity(
+        namespace_id=identity.namespace_id,
+        application_id=identity.application_id,
+        application_instance_id=identity.application_instance_id,
+        agent_id=identity.agent_id,
+        agent_instance_id=identity.agent_instance_id,
+        session_id=identity.session_id,
+        task_id=identity.task_id,
+        attempt_id=identity.attempt_id,
+    )
+    activity = ActivityFact(
+        sequence=1, activity_type="action", source="host_observed",
+        host_declared_relation="ambiguous", target_kind="workspace",
+        proposed_purpose="advance the requested result",
+        affected_criterion_ids=("criterion-visual",),
+    )
+    state = SemanticState(
+        task={"objective": "Render the requested page", "work_mode": "delivery",
+              "deliverable_kind": "code_behavior", "task_complexity": "standard",
+              "phase": "implementation", "active_segment": identity.segment_id,
+              "active_statework": None, "active_flow": None, "non_goals": []},
+        situation={"current_state": "IMPLEMENTING", "blockers": [],
+                   "actions_since_goal_progress": 0,
+                   "actions_since_artifact_change": 0,
+                   "verification_actions_since_artifact_change": 0,
+                   "recovery_epochs": 0, "repeated_branch_count": 0},
+        criteria=(CriterionState("criterion-visual", "Render the requested page",
+                                 "functional"),),
+        activity=(activity,), workflows=(), convergence=(), candidate=activity,
+        legal_routes=("implement", "verify"),
+    )
+    question = QUESTION_REGISTRY["progress_relation"]
+    questions = (QuestionSpec(
+        question_id="progress_relation", family=question["family"],
+        question_type=question["type"], instructions=question["instructions"],
+        criteria=tuple(question["criteria"].items())),)
+    state_digest = canonical_hash(state.to_dict())
+    question_digest = canonical_hash([item.to_dict() for item in questions])
+    policy_hash = "c" * 64
+    request_digest = canonical_hash({
+        "identity": system_identity.to_dict(), "sequence": 1,
+        "state_digest": state_digest,
+        "question_bundle_digest": question_digest,
+        "policy_hash": policy_hash,
+    })
+    return SystemOneFrame(
+        identity=system_identity, request_id="host-frame-1", sequence=1,
+        state_digest=state_digest, question_bundle_digest=question_digest,
+        request_digest=request_digest, policy_hash=policy_hash,
+        backend_id="host-test", model_id="none", model_revision="none",
+        model_content_hash="a" * 64, provider_protocol_hash="b" * 64,
+        calibration_bundle_hash="", state=state, questions=questions,
+    )
+
+
 def _identity():
     return RuntimeIdentity(
         namespace_id="tenant-a", application_id="assistant",
@@ -171,7 +249,31 @@ def test_runtime_host_applies_cfw_controls_and_credits_host_verified_progress(tm
     assert stored.state.revision == 2
     assert "cognitive_mode" in context and "CFW context" in context
     assert "DIGITAL PSYCHOLOGY BEHAVIOR STATE" in context
+    assert '"csw_eligible_steps":{"repair":["inspect"]}' in context
+    assert '"csw_workflow_states":{"repair":"UNKNOWN"}' in context
     assert ("repair",) in csw.requested_candidates
     assert all(candidates in {(), ("repair",)}
                for candidates in csw.requested_candidates)
     assert cfw_port.active_statework_contexts[-1] == ("repair",)
+
+
+def test_runtime_host_dispatches_validated_system_one_frame_before_fast_loop(tmp_path):
+    identity = _identity()
+    frame = _system_one_frame(identity)
+    service = _JudgeService(event_db=tmp_path / "events.sqlite3")
+    try:
+        host = RuntimeHost(
+            service=service,
+            state_path=tmp_path / "behavior-state.sqlite3",
+            system_one_frame_factory=lambda *_context: frame,
+        )
+        session = host.open_session(
+            identity=identity, objective="Render the requested page",
+            objective_criteria=("criterion-visual",),
+            cfw=CFWRuntimeAdapter(_CFWPort()), csw=_CSWPort(),
+            outcome_evidence_authority=_EvidenceAuthority({}),
+        )
+        session.process_action(RuntimeObservation(action_index=1))
+        assert service.calls == [("judge", frame), ("decide", None)]
+    finally:
+        service.close()

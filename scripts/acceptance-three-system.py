@@ -51,11 +51,15 @@ def task_events(api, request, *, cohort: str):
             "subject_ref": subject})
         assert decision == decision.__class__.ALLOW
         invocation_id = f"inv-holdout-{bundle.task_id}"
-        host.after_tool(tool_type="read", result_class="pass", subject_ref=subject,
-                        invocation_id=invocation_id, actual_result={"status": "pass"})
+        tool_evidence = host.after_tool(
+            tool_type="read", result_class="pass", subject_ref=subject,
+            invocation_id=invocation_id, actual_result={"status": "pass"})
         assert host.validate_completion_boundary(
             subject_ref=subject, validator_id="completion-boundary-v1",
-            invocation_id=invocation_id, result={"status": "pass"}) == decision.__class__.ALLOW
+            invocation_id=invocation_id, result={"status": "pass"},
+            criterion_ids=("criterion-host-read",),
+            criterion_evidence_refs={"criterion-host-read": (tool_evidence,)},
+        ) == decision.__class__.ALLOW
         unrelated = host.observation("unrelated_statework_check", "unrelated:state")
         assert host.request_transition(
             statework_id="unrelated-statework", subject_ref="unrelated:state",
@@ -170,7 +174,14 @@ def main() -> int:
                 request = resolve_runtime.TaskRequest(
                     task_id=task_id, application_id="digital-psychology", subject_ref=f"subject:{task_id}", shape="quick",
                     model="model-a", harness="offline-harness", toolset="fixture",
-                    observation_context={})
+                    observation_context={},
+                    goal_contract=resolve_runtime.TaskGoalContract(
+                        objective="Read and validate the task output",
+                        deliverable_kind="code_behavior", work_mode="delivery",
+                        acceptance_criteria=(resolve_runtime.AcceptanceCriterion(
+                            "criterion-host-read", "The task output can be read successfully",
+                            "code_behavior"),),
+                    ))
                 bundle = resolve_runtime.resolve(request)
                 task_events(api.CognitiveRuntime(), request, cohort=cohort)
                 event_path = next(

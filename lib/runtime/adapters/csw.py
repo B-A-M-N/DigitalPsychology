@@ -89,7 +89,7 @@ class CSWRuntimeAdapter:
                            expected_selection_revision: int,
                            candidate_statework_ids: Sequence[str]) -> CSWBehaviorSnapshot:
         if statework_id not in candidate_statework_ids:
-            raise ValueError("StateWork activation is outside the CFW candidate set")
+            raise ValueError("StateWork activation is outside the CSW candidate set")
         binding = self._binding(statework_id)
         self.authority.activate_workflow(
             binding.identity, contract_hash=binding.contract_hash,
@@ -101,7 +101,7 @@ class CSWRuntimeAdapter:
                              expected_selection_revision: int,
                              candidate_statework_ids: Sequence[str]) -> CSWBehaviorSnapshot:
         if statework_id not in candidate_statework_ids:
-            raise ValueError("StateWork deactivation is outside the CFW candidate set")
+            raise ValueError("StateWork deactivation is outside the CSW candidate set")
         self._binding(statework_id)
         self.authority.deactivate_workflow(
             workflow_scope=self.identity.csw_scope(), statework_id=statework_id,

@@ -5,6 +5,7 @@ real probe evaluators, guarded lifecycle, persistent registry, immutable
 snapshot, event sink, secret-safe retention."""
 import os
 import sys
+import json
 import tempfile
 from pathlib import Path
 
@@ -278,8 +279,31 @@ def main() -> int:
     assert "G-new" in res2["active"] and "G-old" not in res2["active"]
     print("ok: explicit supersedes replaces")
 
-    # 7. Fixtures load through the same canonical loader
-    events = load_events(Path(__file__).resolve().parents[1] / "fixtures" / "events.ndjson")
+    # 7. Current-schema fixtures load through the same canonical loader.
+    # Write them in a temporary directory so this self-test does not depend on
+    # an ignored, machine-local NDJSON file that can retain an old schema.
+    fixture_events = [
+        make_event(1, "tool_result", "test_suite_result", subject="tests",
+                   payload={"tool_type": "test", "result_class": "pass",
+                            "summary": "self-test suite passed"}),
+        make_event(2, "completion", "completion_claim", subject="issue_resolved",
+                   evidence_refs=["evt-1"],
+                   payload={"result_class": "claim", "summary": "claimed resolved"}),
+        make_event(3, "contradiction", "operator_contradiction",
+                   actor_id="operator", subject="trusted proxy issue",
+                   invalidates="evt-2",
+                   payload={"result_class": "failure",
+                            "summary": "same trust-boundary case still fails"}),
+        make_event(4, "decision", "agent_response_to_contradiction",
+                   subject="prior claim",
+                   payload={"result_class": "decision", "summary": "reinspect"}),
+    ]
+    with tempfile.TemporaryDirectory(prefix="dp-self-test-events-") as raw_events:
+        fixture_path = Path(raw_events) / "events.ndjson"
+        fixture_path.write_text("\n".join(json.dumps(event.to_dict())
+                                           for event in fixture_events) + "\n",
+                               encoding="utf-8")
+        events = load_events(fixture_path)
     assert len(events) == 4
     print("ok: fixtures load via schema-validated loader:", [e.event_type for e in events])
 
@@ -355,7 +379,6 @@ def main() -> int:
     print("ok: GuardResolver threads model/harness constraints fail-closed")
 
     # 13. Real fixture feeds episode builder (operator contradiction links)
-    fixture_events = load_events(Path(__file__).resolve().parents[1] / "fixtures" / "events.ndjson")
     builder_f = EpisodeBuilder()
     for ev in fixture_events:
         builder_f.add(ev)

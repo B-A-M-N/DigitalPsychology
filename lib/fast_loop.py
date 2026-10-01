@@ -80,6 +80,8 @@ class FastLoopInput:
     context_pressure: float = 0.0
     evidence_refs: tuple[str, ...] = ()
     intervention_assessments: tuple[InterventionOutcome, ...] = ()
+    available_frameworks: tuple[str, ...] = (
+        "owl", "anchor", "fuse", "ward", "flow", "sispis", "dox")
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, str) or not self.scope.strip() or len(self.scope) > 256:
@@ -91,6 +93,14 @@ class FastLoopInput:
             raise ValueError("objective criterion IDs must be bounded text")
         if len(self.cfw_signals) > 32 or len(self.active_trigger_codes) > 32:
             raise ValueError("fast-loop input exceeds bounded signal counts")
+        supported_frameworks = {"owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"}
+        frameworks = tuple(self.available_frameworks)
+        if (len(frameworks) > 16 or len(frameworks) != len(set(frameworks))
+                or any(not isinstance(value, str) or value.lower() not in supported_frameworks
+                       for value in frameworks)):
+            raise ValueError("available CFW frameworks are malformed")
+        object.__setattr__(self, "available_frameworks",
+                           tuple(value.lower() for value in frameworks))
         if (self.actions_since_goal_progress < 0 or self.equivalent_retry_count < 0
                 or self.host_action_index < 0):
             raise ValueError("outcome counters must be non-negative")
@@ -435,6 +445,10 @@ class BehavioralController:
                            | (previously_effective & triggers))
         grouped: dict[str, list[tuple[str, str, str, str]]] = {}
         for target, value, cause, effect in proposed:
+            if (target.startswith("framework:")
+                    and target.split(":", 1)[1].lower()
+                    not in context.available_frameworks):
+                continue
             if target.startswith("framework:") and target.split(":", 1)[1] == "ward":
                 continue
             previous = self._target_value(working, target)

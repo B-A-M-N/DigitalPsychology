@@ -9,10 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from ..behavior_state import (BehaviorDirective, CSWBehaviorSnapshot,
-                              FrameworkSignal)
+from ..behavior_state import (BehaviorDirective, BehaviorState,
+                              CSWBehaviorSnapshot, FrameworkSignal)
+from ..system_one_contracts import SystemOneFrame
 
 
 @dataclass(frozen=True)
@@ -110,14 +111,17 @@ class RuntimeObservation:
 class CFWComponentPort(Protocol):
     """Explicit CFW capability boundary used by DP session orchestration."""
 
-    def available_statework_ids(self) -> Sequence[str]: ...
+    def available_component_ids(self) -> Sequence[str]: ...
 
     def collect_behavior_signals(self, observation: RuntimeObservation
                                  ) -> Sequence[FrameworkSignal]: ...
 
     def prepare_behavior_directives(self, directives: Sequence[Mapping[str, Any]]) -> Any: ...
 
-    def apply_behavior_directives(self, prepared: Any) -> Sequence[str]: ...
+    def apply_behavior_directives(self, prepared: Any,
+                                  behavior_state: Mapping[str, Any]) -> Sequence[str]: ...
+
+    def synchronize_behavior_state(self, behavior_state: Mapping[str, Any]) -> None: ...
 
     def rollback_behavior_directives(self, prepared: Any) -> None: ...
 
@@ -151,7 +155,14 @@ class CSWWorkflowPort(Protocol):
                    evidence_refs: Sequence[str], expected_workflow_revision: int) -> Any: ...
 
 
+SystemOneFrameFactory = Callable[[RuntimeIdentity, str, Sequence[str], BehaviorState,
+                                  RuntimeObservation, CSWBehaviorSnapshot,
+                                  Sequence[FrameworkSignal]], SystemOneFrame]
+
+
 class BehavioralDecisionService(Protocol):
+    def judge(self, frame: SystemOneFrame, *, mode: str | None = None) -> Any: ...
+
     def decide_behavior(self, context: Any, *, judgment: Any = None) -> Mapping[str, Any]: ...
 
     def assess_intervention_outcome(self, intervention: Any, frame: Any, *,
