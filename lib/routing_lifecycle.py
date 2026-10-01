@@ -117,7 +117,7 @@ class RoutingLifecycleStore:
     def is_active(self, *, source_profile_hash:str) -> bool:
         entry=self.list_registry_by_hash().get(str(source_profile_hash))
         if not entry: return False
-        return str(entry.get("status")) not in {"stale","rolled_back","candidate"}
+        return str(entry.get("status")) in {"active", "validated"}
 
     def list_registry_by_hash(self) -> dict[str,dict[str,Any]]:
         return {str(entry.get("profile_hash")):entry for entry in self.list_registry()}

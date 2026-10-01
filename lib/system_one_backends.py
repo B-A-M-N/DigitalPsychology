@@ -51,6 +51,10 @@ class ProviderHealthError(RuntimeError):
     """The provider did not complete one bounded inference attempt."""
 
 
+class ProviderContractError(ValueError):
+    """The provider returned a malformed or out-of-contract result."""
+
+
 class SystemOneBackend(Protocol):
     backend_id: str
     model_id: str
@@ -66,6 +70,40 @@ class SystemOneBackend(Protocol):
     def reset_identity(self, identity: SystemOneIdentity) -> None: ...
 
     def resync(self, frame: SystemOneFrame) -> None: ...
+
+
+class DisabledSystemOneBackend:
+    """Provider-neutral backend used by the default disabled service."""
+
+    backend_id = "null"
+    model_id = "none"
+    model_revision = "none"
+    model_content_hash = hashlib.sha256(b"digitalpsychology-disabled-model").hexdigest()
+    provider_protocol_hash = hashlib.sha256(b"digitalpsychology-disabled-provider").hexdigest()
+    max_latency_ms = 1
+
+    def __init__(self) -> None:
+        self._capability = _capability(
+            backend_id=self.backend_id, model_id=self.model_id,
+            model_revision=self.model_revision,
+            model_content_hash=self.model_content_hash,
+            provider_protocol_hash=self.provider_protocol_hash,
+            max_concurrent_requests=1)
+
+    def capability(self) -> SystemOneCapability:
+        return self._capability
+
+    def judge(self, frame: SystemOneFrame) -> SystemOneJudgment:
+        raise ProviderHealthError("the disabled provider cannot perform inference")
+
+    def reset_identity(self, identity: SystemOneIdentity) -> None:
+        return None
+
+    def resync(self, frame: SystemOneFrame) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
 
 
 def model_content_digest(model_path: str | Path) -> str:
@@ -89,7 +127,8 @@ def model_content_digest(model_path: str | Path) -> str:
 
 def _capability(*, backend_id: str, model_id: str, model_revision: str,
                 model_content_hash: str, provider_protocol_hash: str,
-                stateful_sessions: bool = False) -> SystemOneCapability:
+                stateful_sessions: bool = False,
+                max_concurrent_requests: int = 4) -> SystemOneCapability:
     return SystemOneCapability(
         backend_id=backend_id, model_id=model_id, model_revision=model_revision,
         model_content_hash=model_content_hash,
@@ -98,7 +137,8 @@ def _capability(*, backend_id: str, model_id: str, model_revision: str,
         question_registry_hash=QUESTION_REGISTRY_HASH,
         state_projection_schema_hash=STATE_PROJECTION_SCHEMA_HASH,
         supported_question_families=tuple(QUESTION_REGISTRY),
-        max_state_bytes=MAX_FRAME_BYTES, stateful_sessions=stateful_sessions)
+        max_state_bytes=MAX_FRAME_BYTES, stateful_sessions=stateful_sessions,
+        max_concurrent_requests=max_concurrent_requests)
 
 
 def _frame_bytes(frame: SystemOneFrame) -> bytes:
@@ -132,13 +172,13 @@ def _laya_questions(frame: SystemOneFrame) -> dict[str, dict[str, Any]]:
 
 def _probabilities(value: Any, labels: tuple[str, ...]) -> tuple[QuestionProbability, ...]:
     if not isinstance(value, Mapping) or set(map(str, value)) != set(labels):
-        raise ValueError("Laya probabilities must cover exactly the question options")
+        raise ProviderContractError("Laya probabilities must cover exactly the question options")
     raw = [float(value[label]) for label in labels]
     if any(not 0 <= item <= 1 for item in raw):
-        raise ValueError("Laya returned an invalid option probability")
+        raise ProviderContractError("Laya returned an invalid option probability")
     total = sum(raw)
     if total <= 0:
-        raise ValueError("Laya returned an empty probability distribution")
+        raise ProviderContractError("Laya returned an empty probability distribution")
     return tuple(QuestionProbability(label, probability / total)
                  for label, probability in zip(labels, raw))
 
@@ -147,7 +187,7 @@ def _judgment_from_laya(frame: SystemOneFrame, result: Any) -> SystemOneJudgment
     values = getattr(result, "values", None)
     probabilities = getattr(result, "probabilities", None)
     if not isinstance(values, Mapping) or not isinstance(probabilities, Mapping):
-        raise ValueError("Laya did not return typed values and probabilities")
+        raise ProviderContractError("Laya did not return typed values and probabilities")
     answers_by_id = getattr(result, "answers", None)
     if not isinstance(answers_by_id, Mapping):
         answers_by_id = values
@@ -158,12 +198,12 @@ def _judgment_from_laya(frame: SystemOneFrame, result: Any) -> SystemOneJudgment
         raw_answer = answers_by_id.get(question_id)
         if isinstance(raw_answer, Mapping):
             if raw_answer.get("type") != "choice":
-                raise ValueError(f"Laya returned a non-choice answer for {question_id}")
+                raise ProviderContractError(f"Laya returned a non-choice answer for {question_id}")
             selected = raw_answer.get("choice")
         else:
             selected = raw_answer
         if not isinstance(selected, str) or selected not in labels:
-            raise ValueError(f"Laya omitted or returned an illegal label for {question_id}")
+            raise ProviderContractError(f"Laya omitted or returned an illegal label for {question_id}")
         raw_probabilities = probabilities.get(question_id)
         if raw_probabilities is None and isinstance(raw_answer, Mapping):
             raw_probabilities = raw_answer.get("probabilities")
@@ -188,6 +228,8 @@ def _judgment_from_laya(frame: SystemOneFrame, result: Any) -> SystemOneJudgment
 class _Inference:
     frame: SystemOneFrame
     done: threading.Event
+    deadline_monotonic: float
+    cancelled: bool = False
     judgment: Optional[SystemOneJudgment] = None
     error: Optional[BaseException] = None
 
@@ -238,10 +280,13 @@ class LayaSystemOneBackend:
         self._queue: queue.Queue[_Inference | None] = queue.Queue(maxsize=1)
         self._worker: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
+        self._closed = False
+        self._closed_lock = threading.Lock()
         self._capability = _capability(
             backend_id=self.backend_id, model_id=model_id,
             model_revision=model_revision, model_content_hash=self.model_content_hash,
-            provider_protocol_hash=PROVIDER_PROTOCOL_HASH)
+            provider_protocol_hash=PROVIDER_PROTOCOL_HASH,
+            max_concurrent_requests=1)
 
     @classmethod
     def from_environment(cls, *, model_id: str = "laya-typed-decisions") -> "LayaSystemOneBackend":
@@ -271,6 +316,8 @@ class LayaSystemOneBackend:
 
     def _ensure_worker(self) -> None:
         with self._worker_lock:
+            if self._closed:
+                raise ProviderHealthError("Laya backend is closed")
             if self._worker is None:
                 self._worker = threading.Thread(
                     target=self._worker_main, name="digitalpsychology-laya", daemon=True)
@@ -281,13 +328,23 @@ class LayaSystemOneBackend:
             job = self._queue.get()
             if job is None:
                 return
+            if job.cancelled or time.monotonic() >= job.deadline_monotonic:
+                job.error = ProviderHealthError("Laya request expired before execution")
+                job.done.set()
+                continue
             try:
                 result = self._agent.decide(
                     job.frame.state.to_dict(), questions=_laya_questions(job.frame),
                     return_details=True, lang="en")
                 job.judgment = _judgment_from_laya(job.frame, result)
-            except BaseException as exc:
+            except ProviderContractError as exc:
                 job.error = exc
+            except (TypeError, ValueError, KeyError) as exc:
+                job.error = ProviderContractError("Laya returned a malformed result")
+                job.error.__cause__ = exc
+            except Exception as exc:
+                job.error = ProviderHealthError("Laya inference failed")
+                job.error.__cause__ = exc
             finally:
                 job.done.set()
 
@@ -298,25 +355,59 @@ class LayaSystemOneBackend:
                 or frame.model_content_hash != self.model_content_hash
                 or frame.provider_protocol_hash != PROVIDER_PROTOCOL_HASH):
             raise ValueError("System-1 frame provider identity differs from loaded Laya checkpoint")
-        self._ensure_worker()
-        job = _Inference(frame=frame, done=threading.Event())
         deadline = time.monotonic() + self.max_latency_ms / 1000.0
-        try:
-            self._queue.put(job, timeout=max(0.0, deadline - time.monotonic()))
-        except queue.Full as exc:
-            raise ProviderHealthError("Laya provider is still handling a prior request") from exc
+        job = _Inference(frame=frame, done=threading.Event(),
+                         deadline_monotonic=deadline)
+        with self._closed_lock:
+            if self._closed:
+                raise ProviderHealthError("Laya backend is closed")
+            self._ensure_worker()
+            try:
+                self._queue.put(job, timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Full as exc:
+                raise ProviderHealthError("Laya provider is still handling a prior request") from exc
         if not job.done.wait(max(0.0, deadline - time.monotonic())):
+            job.cancelled = True
             raise ProviderHealthError("Laya inference exceeded its configured deadline")
         if job.error is not None:
+            if isinstance(job.error, ProviderContractError):
+                raise job.error
+            if isinstance(job.error, ProviderHealthError):
+                raise job.error
             raise ProviderHealthError("Laya inference failed") from job.error
         if job.judgment is None:
             raise ProviderHealthError("Laya inference produced no result")
         return job.judgment
 
+    def close(self, *, timeout: float = 0.25) -> None:
+        """Stop accepting jobs, discard queued stale work, and bound the join."""
+        with self._closed_lock:
+            if self._closed:
+                worker = self._worker
+            else:
+                self._closed = True
+                worker = self._worker
+                while True:
+                    try:
+                        queued = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if queued is not None:
+                        queued.cancelled = True
+                        queued.error = ProviderHealthError("Laya backend closed before execution")
+                        queued.done.set()
+                if worker is not None:
+                    try:
+                        self._queue.put_nowait(None)
+                    except queue.Full:
+                        pass
+        if worker is not None:
+            worker.join(timeout=max(0.0, min(float(timeout), 2.0)))
+
 
 @dataclass
-class JevCompatibleHTTPBackend:
-    """One-shot typed JSON adapter for an explicitly pinned loopback provider."""
+class StatelessLoopbackHTTPBackend:
+    """Stateless typed JSON adapter for an explicitly pinned loopback service."""
 
     endpoint: str
     model_id: str
@@ -325,7 +416,8 @@ class JevCompatibleHTTPBackend:
     provider_protocol_hash: str
     timeout_ms: int = 5000
     transport: Callable[[Request, float], bytes] = _http_post
-    backend_id: str = "jev-compatible-http"
+    backend_id: str = "stateless-loopback-http"
+    max_concurrent_requests: int = 8
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.endpoint) if isinstance(self.endpoint, str) else None
@@ -337,6 +429,8 @@ class JevCompatibleHTTPBackend:
             raise ValueError(
                 f"System-1 timeout must be between 1 and {MAX_SYSTEM_ONE_LATENCY_MS}ms")
         self.timeout_ms = int(self.timeout_ms)
+        if not 1 <= int(self.max_concurrent_requests) <= 64:
+            raise ValueError("max_concurrent_requests must be between 1 and 64")
 
     @property
     def max_latency_ms(self) -> int:
@@ -346,7 +440,8 @@ class JevCompatibleHTTPBackend:
         return _capability(
             backend_id=self.backend_id, model_id=self.model_id,
             model_revision=self.model_revision, model_content_hash=self.model_content_hash,
-            provider_protocol_hash=self.provider_protocol_hash)
+            provider_protocol_hash=self.provider_protocol_hash,
+            max_concurrent_requests=self.max_concurrent_requests)
 
     def reset_identity(self, identity: SystemOneIdentity) -> None:
         return None
@@ -373,5 +468,7 @@ class JevCompatibleHTTPBackend:
         return judgment
 
 
-__all__ = ["SystemOneBackend", "ProviderHealthError", "LayaSystemOneBackend",
-           "JevCompatibleHTTPBackend", "PROVIDER_PROTOCOL_HASH", "model_content_digest"]
+__all__ = ["SystemOneBackend", "ProviderHealthError", "ProviderContractError",
+           "DisabledSystemOneBackend", "LayaSystemOneBackend",
+           "StatelessLoopbackHTTPBackend",
+           "PROVIDER_PROTOCOL_HASH", "model_content_digest"]

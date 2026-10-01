@@ -73,9 +73,11 @@ The slow loop is explicitly invoked; it is not an automatic background worker. I
 
 ### Optional Laya System-1 provider
 
-Laya support is opt-in. Install either `digital-psychology[laya]` or
-`digital-psychology[system-one]`; ordinary imports and the default DP MCP
-service do not import Laya, load PyTorch, or download model weights. The
+Laya support is an optional dependency. Install it with
+`python3 -m pip install 'digital-psychology[laya]'` (the `system-one` extra is
+an alias). This installs the Laya inference library without its separate HTTP
+serving extras. Ordinary imports and the default DP service keep the provider
+disabled; they do not import Laya, load PyTorch, or download model weights. The
 Laya adapter uses the public `Agent.decide` API and is available only to a
 trusted host through `SystemOneService`; it is not an agent-facing MCP tool.
 
@@ -84,6 +86,7 @@ revision and content hash. Set these variables before constructing the
 service with `SystemOneService.from_environment()`:
 
 ```text
+DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER=laya-native
 DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE=shadow
 DIGITALPSYCHOLOGY_LAYA_MODEL_PATH=/local/path/to/pinned-checkpoint
 DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION=<immutable-upstream-revision>
@@ -92,16 +95,19 @@ DIGITALPSYCHOLOGY_LAYA_DEVICE=cpu
 DIGITALPSYCHOLOGY_LAYA_TIMEOUT_MS=30000
 ```
 
-The timeout is pinned by the host policy and defaults to 30 seconds for local
-CPU inference. Hosts can choose a shorter deadline for faster devices; a timeout
-causes one provider failure and deterministic fallback.
+The checkpoint must be downloaded separately and supplied by local path; the
+optional package extra installs the Laya runtime library only. The timeout is
+pinned by the host policy and defaults to 30 seconds for local CPU inference.
+Hosts can choose a shorter deadline for faster devices; a timeout causes one
+provider failure and deterministic fallback.
 
 Advisory mode requires an active calibration bundle. The host builds a
 candidate from later independent validation outcomes, reviews and activates
 it through `SystemOneCalibrationLifecycle`, then points
 `DIGITALPSYCHOLOGY_SYSTEM_ONE_CALIBRATION_PATH` at the exported active bundle.
 Calibration is bound to one question family, model-content identity, protocol,
-work mode, and deliverable kind. Missing or out-of-scope calibration leaves
+and independent `(work mode, deliverable kind)` trajectory cohorts. Missing or
+out-of-scope calibration or a per-question confidence below its threshold leaves
 that question in shadow.
 
 The diagram above describes the optional combined loop. It is not a requirement for DP ingestion or experimentation.

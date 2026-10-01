@@ -109,6 +109,9 @@ class CalibrationRecord:
     validation_ece: float
     work_modes: tuple[str, ...]
     deliverable_kinds: tuple[str, ...]
+    independent_trajectory_count: int = 0
+    cohort_counts: tuple[tuple[str, str, int], ...] = ()
+    minimum_cohort_trajectories: int = 20
     protocol_version: str = PROTOCOL_VERSION
     protocol_hash: str = PROTOCOL_HASH
     question_registry_hash: str = QUESTION_REGISTRY_HASH
@@ -146,12 +149,27 @@ class CalibrationRecord:
                 "validation_accuracy", "validation_brier", "validation_ece")):
             raise ValueError("calibration metrics must be between zero and one")
         if min(self.sample_count, self.training_count, self.validation_count,
-               self.minimum_outcomes) < 0:
+               self.minimum_outcomes, self.independent_trajectory_count) < 0:
             raise ValueError("calibration sample counts must be non-negative")
         if self.training_count + self.validation_count != self.sample_count:
             raise ValueError("calibration train/validation counts do not add up")
         if not self.work_modes or not self.deliverable_kinds:
             raise ValueError("calibration applicability must name work modes and deliverables")
+        if self.independent_trajectory_count < 1 or self.minimum_cohort_trajectories < 1:
+            raise ValueError("calibration must record independent trajectory count")
+        if (not self.cohort_counts
+                or any(len(item) != 3 or not isinstance(item[0], str) or not item[0]
+                       or not isinstance(item[1], str) or not item[1]
+                       or not isinstance(item[2], int) or isinstance(item[2], bool)
+                       or item[2] < self.minimum_cohort_trajectories
+                       or item[2] > self.independent_trajectory_count
+                       for item in self.cohort_counts)):
+            raise ValueError("calibration applicability cohorts are malformed")
+        cohort_pairs = {(mode, kind) for mode, kind, _count in self.cohort_counts}
+        if (len(cohort_pairs) != len(self.cohort_counts)
+                or set(self.work_modes) != {mode for mode, _kind in cohort_pairs}
+                or set(self.deliverable_kinds) != {kind for _mode, kind in cohort_pairs}):
+            raise ValueError("calibration applicability cohorts are inconsistent")
         if self.status not in {"candidate", "active", "stale", "rolled_back"}:
             raise ValueError("unsupported calibration lifecycle status")
         if self.drift_status not in {"clear", "warning", "drifted"}:
@@ -173,6 +191,9 @@ class CalibrationRecord:
                 "validation_ece": float(self.validation_ece),
                 "work_modes": list(self.work_modes),
                 "deliverable_kinds": list(self.deliverable_kinds),
+                "independent_trajectory_count": self.independent_trajectory_count,
+                "cohort_counts": [list(item) for item in self.cohort_counts],
+                "minimum_cohort_trajectories": self.minimum_cohort_trajectories,
                 "protocol_version": self.protocol_version, "protocol_hash": self.protocol_hash,
                 "question_registry_hash": self.question_registry_hash,
                 "state_projection_schema_hash": self.state_projection_schema_hash,
@@ -186,7 +207,8 @@ class CalibrationRecord:
                   "minimum_advisory_confidence", "sample_count", "training_count",
                   "validation_count", "training_outcome_digest", "validation_outcome_digest",
                   "validation_accuracy", "validation_brier", "validation_ece", "work_modes",
-                  "deliverable_kinds", "protocol_version", "protocol_hash",
+                  "deliverable_kinds", "independent_trajectory_count", "cohort_counts",
+                  "minimum_cohort_trajectories", "protocol_version", "protocol_hash",
                   "question_registry_hash", "state_projection_schema_hash",
                   "minimum_outcomes", "status", "drift_status"}
         if not isinstance(value, Mapping) or set(value) != fields:
@@ -194,6 +216,8 @@ class CalibrationRecord:
         payload = dict(value)
         payload["work_modes"] = tuple(payload["work_modes"])
         payload["deliverable_kinds"] = tuple(payload["deliverable_kinds"])
+        payload["cohort_counts"] = tuple((str(mode), str(kind), int(count))
+                                         for mode, kind, count in payload["cohort_counts"])
         return cls(**payload)
 
     @property
@@ -224,7 +248,10 @@ class CalibrationRecord:
             and self.validation_ece <= maximum_ece
             and self.validation_count >= self.minimum_outcomes
             and task["work_mode"] in self.work_modes
-            and task["deliverable_kind"] in self.deliverable_kinds)
+            and task["deliverable_kind"] in self.deliverable_kinds
+            and dict(((mode, kind), count) for mode, kind, count in self.cohort_counts).get(
+                (str(task["work_mode"]), str(task["deliverable_kind"])), 0)
+            >= self.minimum_cohort_trajectories)
 
     def with_status(self, status: str) -> "CalibrationRecord":
         from dataclasses import replace
@@ -245,7 +272,7 @@ class CalibrationBundle:
         return {key: self.records[key].canonical() for key in sorted(self.records)}
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": "1.0.0", "records": self.canonical(),
+        return {"schema_version": "1.1.0", "records": self.canonical(),
                 "bundle_hash": self.digest}
 
     @property
@@ -265,7 +292,7 @@ class CalibrationBundle:
     def from_mapping(cls, value: Mapping[str, Any]) -> "CalibrationBundle":
         if (not isinstance(value, Mapping) or set(value) != {
                 "schema_version", "records", "bundle_hash"}
-                or value.get("schema_version") != "1.0.0"
+                or value.get("schema_version") != "1.1.0"
                 or not isinstance(value.get("records"), Mapping)):
             raise ValueError("malformed System-1 calibration bundle")
         bundle = cls({str(key): CalibrationRecord.from_mapping(item)
@@ -334,7 +361,9 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
         if any(not decision_payload.get(field) for field in required_identity):
             continue
         rows.append({
-            "identity": key[0], "decision_id": key[1], "probabilities": probabilities,
+            "identity": key[0], "trajectory_id": hashlib.sha256(
+                json.dumps(key[0][:7], separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "decision_id": key[1], "probabilities": probabilities,
             "selected": selected, "actual": actual,
             "model_identity": tuple(str(decision_payload[field]) for field in required_identity[:5]),
             "work_mode": str(decision_payload["system_one_work_mode"]),
@@ -372,6 +401,8 @@ def _calibration_bins(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def calibration_record_from_events(
     events: Iterable[Any], *, question_id: str,
     minimum_confidence: float = 0.9, minimum_outcomes: int = 100,
+    minimum_independent_trajectories: int = 30,
+    minimum_cohort_trajectories: int = 20,
     minimum_accuracy: float = 0.8, maximum_brier: float = 0.25,
     maximum_ece: float = 0.12,
 ) -> CalibrationRecord:
@@ -379,15 +410,18 @@ def calibration_record_from_events(
     rows = _paired_rows(events, question_id)
     if len(rows) < minimum_outcomes:
         raise ValueError("insufficient later independent outcomes for calibration")
+    trajectory_ids = sorted({row["trajectory_id"] for row in rows})
+    if len(trajectory_ids) < minimum_independent_trajectories:
+        raise ValueError("insufficient later independent trajectories for calibration")
     identities = {row["model_identity"] for row in rows}
     if len(identities) != 1:
         raise ValueError("calibration evidence mixes provider or model content identities")
     model_tuple = next(iter(identities))
-    ordered = sorted(rows, key=lambda row: hashlib.sha256(
-        row["decision_id"].encode("utf-8")).digest())
-    validation = ordered[::5]
-    validation_ids = {row["decision_id"] for row in validation}
-    train = [row for row in ordered if row["decision_id"] not in validation_ids]
+    ordered_trajectories = sorted(trajectory_ids, key=lambda item: hashlib.sha256(
+        item.encode("utf-8")).digest())
+    validation_trajectories = set(ordered_trajectories[::5])
+    validation = [row for row in rows if row["trajectory_id"] in validation_trajectories]
+    train = [row for row in rows if row["trajectory_id"] not in validation_trajectories]
     if len(train) < 20 or len(validation) < max(10, int(minimum_outcomes * 0.2)):
         raise ValueError("calibration requires at least 20 training and 10 held-out outcomes")
     train_rows = [(row["probabilities"], row["actual"]) for row in train]
@@ -406,6 +440,7 @@ def calibration_record_from_events(
 
     def digest(material: list[dict[str, Any]]) -> str:
         rows_for_digest = [{"identity": list(row["identity"]),
+                            "trajectory_id": row["trajectory_id"],
                             "decision_id": row["decision_id"],
                             "predicted": row["selected"], "actual": row["actual"],
                             "probabilities": row["probabilities"],
@@ -414,6 +449,16 @@ def calibration_record_from_events(
                            for row in material]
         return canonical_hash(rows_for_digest)
 
+    cohort_trajectories: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        key = (row["work_mode"], row["deliverable_kind"])
+        cohort_trajectories.setdefault(key, set()).add(row["trajectory_id"])
+    applicable_cohorts = tuple(sorted(
+        (mode, kind, len(trajectories))
+        for (mode, kind), trajectories in cohort_trajectories.items()
+        if len(trajectories) >= minimum_cohort_trajectories))
+    if not applicable_cohorts:
+        raise ValueError("no work-mode/deliverable cohort has enough independent trajectories")
     return CalibrationRecord(
         question_id=question_id, backend_id=model_tuple[0], model_id=model_tuple[1],
         model_revision=model_tuple[2], model_content_hash=model_tuple[3],
@@ -422,8 +467,11 @@ def calibration_record_from_events(
         sample_count=len(rows), training_count=len(train), validation_count=len(validation),
         training_outcome_digest=digest(train), validation_outcome_digest=digest(validation),
         validation_accuracy=accuracy, validation_brier=brier, validation_ece=ece,
-        work_modes=tuple(sorted({row["work_mode"] for row in rows})),
-        deliverable_kinds=tuple(sorted({row["deliverable_kind"] for row in rows})),
+        work_modes=tuple(sorted({mode for mode, _kind, _count in applicable_cohorts})),
+        deliverable_kinds=tuple(sorted({kind for _mode, kind, _count in applicable_cohorts})),
+        independent_trajectory_count=len(trajectory_ids),
+        cohort_counts=applicable_cohorts,
+        minimum_cohort_trajectories=minimum_cohort_trajectories,
         minimum_outcomes=max(10, int(minimum_outcomes * 0.2)))
 
 

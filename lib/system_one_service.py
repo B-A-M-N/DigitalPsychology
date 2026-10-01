@@ -5,10 +5,12 @@ import json
 import os
 from pathlib import Path
 
-from .system_one_backends import LayaSystemOneBackend, SystemOneBackend
+from .system_one_backends import (DisabledSystemOneBackend, LayaSystemOneBackend,
+                                 StatelessLoopbackHTTPBackend, SystemOneBackend)
 from .system_one_calibration import CalibrationBundle
 from .system_one_contracts import SystemOneFrame, SystemOneIdentity
 from .system_one_runtime import SystemOneResult, SystemOneRuntime
+from .protocol_artifact import QUESTION_REGISTRY
 
 
 class SystemOneService:
@@ -16,29 +18,71 @@ class SystemOneService:
 
     def __init__(self, backend: SystemOneBackend, *, mode: str = "disabled",
                  calibration_bundle: CalibrationBundle | None = None,
-                 cache_size: int = 128, max_concurrent_requests: int = 4) -> None:
+                 cache_size: int = 128, max_concurrent_requests: int = 4,
+                 enabled_question_families: tuple[str, ...] | None = None) -> None:
         if mode not in {"disabled", "shadow", "advisory"}:
             raise ValueError("System-1 mode must be disabled, shadow, or advisory")
-        if mode == "advisory" and not calibration_bundle:
-            raise ValueError("advisory System-1 mode requires an active calibration bundle")
+        enabled = tuple(QUESTION_REGISTRY if enabled_question_families is None
+                        else enabled_question_families)
+        if len(set(enabled)) != len(enabled) or any(question not in QUESTION_REGISTRY
+                                                    for question in enabled):
+            raise ValueError("enabled question families must be registered and unique")
+        records = calibration_bundle.records if calibration_bundle else {}
+        if mode == "advisory" and (not records or any(
+                question not in records or records[question].status != "active"
+                or records[question].drift_status != "clear" for question in enabled)):
+            raise ValueError("advisory mode requires active calibration for every enabled question")
         self.mode = mode
+        capability = backend.capability()
+        self.enabled_question_families = enabled
         self.runtime = SystemOneRuntime(
             backend, calibrations=calibration_bundle,
             cache_size=cache_size,
-            max_concurrent_requests=max_concurrent_requests)
+            max_concurrent_requests=min(max_concurrent_requests,
+                                        capability.max_concurrent_requests),
+            enabled_question_families=enabled)
 
     @classmethod
     def from_environment(cls) -> "SystemOneService":
-        """Opt in explicitly to the locally downloaded Laya checkpoint."""
-        mode = os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE", "disabled")
-        backend = LayaSystemOneBackend.from_environment()
+        """Build a provider-neutral service; optional backends require explicit selection."""
+        mode = os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE", "disabled").strip()
+        provider = os.environ.get("DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER", "disabled").strip()
+        if provider not in {"disabled", "laya-native", "jev-http"}:
+            raise ValueError("unsupported DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER")
+        if mode == "disabled" or provider == "disabled":
+            if mode != "disabled" and provider == "disabled":
+                raise ValueError("an enabled System-1 mode requires an explicit semantic provider")
+            backend: SystemOneBackend = DisabledSystemOneBackend()
+            mode = "disabled"
+        elif provider == "laya-native":
+            backend = LayaSystemOneBackend.from_environment()
+        else:
+            required = {
+                "endpoint": os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_ENDPOINT", ""),
+                "model_id": os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODEL_ID", ""),
+                "model_revision": os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODEL_REVISION", ""),
+                "model_content_hash": os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODEL_SHA256", ""),
+                "provider_protocol_hash": os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_PROVIDER_PROTOCOL_SHA256", ""),
+            }
+            if any(not value for value in required.values()):
+                raise ValueError("jev-http requires pinned endpoint and provider identity settings")
+            backend = StatelessLoopbackHTTPBackend(
+                **required,
+                timeout_ms=int(os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_TIMEOUT_MS", "5000")),
+                max_concurrent_requests=int(os.environ.get(
+                    "DIGITALPSYCHOLOGY_SYSTEM_ONE_MAX_CONCURRENCY", "8")))
         calibration_path = os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_CALIBRATION_PATH", "")
         if calibration_path:
             value = json.loads(Path(calibration_path).read_text(encoding="utf-8"))
             calibration_bundle = CalibrationBundle.from_mapping(value)
         else:
             calibration_bundle = CalibrationBundle({})
-        return cls(backend, mode=mode, calibration_bundle=calibration_bundle)
+        enabled = tuple(filter(None, os.environ.get(
+            "DIGITALPSYCHOLOGY_SYSTEM_ONE_QUESTIONS", ",".join(QUESTION_REGISTRY)).split(",")))
+        return cls(backend, mode=mode, calibration_bundle=calibration_bundle,
+                   enabled_question_families=enabled,
+                   max_concurrent_requests=int(os.environ.get(
+                       "DIGITALPSYCHOLOGY_SYSTEM_ONE_MAX_CONCURRENCY", "4")))
 
     @property
     def cache_size(self) -> int:

@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
+import os
 import sys
 import threading
 from types import SimpleNamespace
@@ -189,7 +190,8 @@ def test_optional_laya_dependency_is_lazy_and_default_service_does_not_load_it(t
     project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
     assert all(not dependency.lower().startswith("laya")
                for dependency in project["project"]["dependencies"])
-    assert "laya[serve]==0.3.22" in project["project"]["optional-dependencies"]["laya"]
+    assert project["project"]["optional-dependencies"]["laya"] == ["laya==0.3.22"]
+    assert project["project"]["optional-dependencies"]["system-one"] == ["laya==0.3.22"]
     assert "laya" not in sys.modules
     service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
     try:
@@ -197,6 +199,28 @@ def test_optional_laya_dependency_is_lazy_and_default_service_does_not_load_it(t
         assert "laya" not in sys.modules
     finally:
         service.close()
+
+
+def test_environment_factory_keeps_laya_optional_when_disabled():
+    from lib.system_one_service import SystemOneService
+
+    keys = [key for key in os.environ if key.startswith("DIGITALPSYCHOLOGY_SYSTEM_ONE_")]
+    keys += ["DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER"]
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ.pop(key, None)
+        service = SystemOneService.from_environment()
+        assert service.mode == "disabled"
+        assert service.capability()["backend_id"] == "null"
+        assert "laya" not in sys.modules
+        service.close()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def test_native_laya_adapter_renders_typed_questions_and_pins_local_content(tmp_path):
@@ -290,7 +314,7 @@ def test_runtime_accepts_a_foreign_repository_frame_through_the_vendored_wire_co
 
     result = SystemOneRuntime(FixedBackend()).judge(
         ForeignRepositoryFrame(), mode="shadow")
-    assert result.status == "ok"
+    assert result.status == "shadow"
     assert result.judgment.request_digest == request.request_digest
 
 
@@ -313,8 +337,8 @@ def test_concurrent_identical_state_discards_old_response_after_newer_sequence()
     latest = runtime.judge(frame(sequence=2), mode="shadow")
     release_first.set()
     old_thread.join(2)
-    assert latest.status == "ok"
-    assert old_result[0].status == "stale_response"
+    assert latest.status == "shadow"
+    assert old_result[0].status == "stale"
 
 
 def test_bad_provider_contract_does_not_open_shared_health_breaker():
@@ -332,8 +356,8 @@ def test_bad_provider_contract_does_not_open_shared_health_breaker():
     runtime = SystemOneRuntime(FixedBackend(responds=respond), breaker=breaker)
     bad = runtime.judge(frame(sequence=1), mode="shadow")
     good = runtime.judge(frame(sequence=2), mode="shadow")
-    assert bad.status == "provider_contract_error"
-    assert good.status == "ok"
+    assert bad.status == "rejected"
+    assert good.status == "shadow"
     assert breaker.failures == 0
 
 
@@ -346,8 +370,8 @@ def test_provider_crash_uses_one_attempt_and_opens_health_breaker():
 
     breaker = CircuitBreaker(threshold=1, cooldown_seconds=30)
     runtime = SystemOneRuntime(FixedBackend(responds=broken), breaker=breaker)
-    assert runtime.judge(frame(sequence=1), mode="shadow").status == "fallback"
-    assert runtime.judge(frame(sequence=2), mode="shadow").status == "circuit_open"
+    assert runtime.judge(frame(sequence=1), mode="shadow").status == "unavailable"
+    assert runtime.judge(frame(sequence=2), mode="shadow").status == "unavailable"
     assert calls == ["request-1"]
 
 
@@ -361,6 +385,9 @@ def calibration_record(question_id="progress_relation", *, status="active"):
         validation_outcome_digest="e" * 64, validation_accuracy=0.95,
         validation_brier=0.05, validation_ece=0.04,
         work_modes=("delivery",), deliverable_kinds=("code_behavior",),
+        independent_trajectory_count=30,
+        cohort_counts=(("delivery", "code_behavior", 20),),
+        minimum_cohort_trajectories=20,
         minimum_outcomes=20, status=status)
 
 
@@ -444,6 +471,21 @@ def test_calibration_rejects_self_labeled_or_nonlater_outcomes():
                                        minimum_outcomes=1)
 
 
+def test_calibration_groups_attempts_and_interactions_into_one_trajectory():
+    events = _calibration_events(count=100)
+    for pair, offset in enumerate(range(0, len(events), 2)):
+        task_id = "repeated-task"
+        attempt_id = f"attempt-{pair}"
+        interaction_id = f"interaction-{pair}"
+        for event in events[offset:offset + 2]:
+            event.task_id = task_id
+            event.attempt_id = attempt_id
+            event.interaction_id = interaction_id
+    with pytest.raises(ValueError, match="independent trajectories"):
+        calibration_record_from_events(
+            events, question_id="progress_relation", minimum_outcomes=100)
+
+
 def test_calibration_lifecycle_stages_activates_and_exports_active_bundle(tmp_path):
     lifecycle = SystemOneCalibrationLifecycle(tmp_path / "system-one-calibration.json")
     candidate = calibration_record().with_status("candidate")
@@ -479,6 +521,6 @@ def test_digital_psychology_service_composes_system_one_without_an_mcp_tool(tmp_
 def test_packaged_protocol_schema_is_canonical_copy():
     schema_path = Path(__file__).parents[1] / "lib" / "schemas" / "system-one-protocol.schema.json"
     schema = json.loads(schema_path.read_text())
-    assert schema["protocol_version"] == "2.0.0"
+    assert schema["protocol_version"] == "2.1.0"
     assert schema["$defs"]["SystemOneFrame"]["additionalProperties"] is False
     assert schema["x-question-registry"] == QUESTION_REGISTRY

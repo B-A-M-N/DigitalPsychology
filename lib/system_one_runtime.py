@@ -7,7 +7,9 @@ import threading
 import time
 from typing import Callable, Mapping, Optional, Protocol
 
-from .system_one_backends import ProviderHealthError, SystemOneBackend
+from .system_one_backends import ProviderContractError, ProviderHealthError, SystemOneBackend
+from .protocol_artifact import (QUESTION_REGISTRY, QUESTION_REGISTRY_HASH,
+                                STATE_PROJECTION_SCHEMA_HASH)
 from .system_one_calibration import CalibrationBundle, CalibrationRecord
 from .system_one_contracts import (SystemOneCapability, SystemOneFrame,
                                    SystemOneIdentity, SystemOneJudgment)
@@ -23,6 +25,7 @@ class SystemOneResult:
     status: str
     calibrated_question_ids: tuple[str, ...] = ()
     cache_hit: bool = False
+    reason: Optional[str] = None
 
     @property
     def calibrated(self) -> bool:
@@ -69,7 +72,8 @@ class SystemOneRuntime:
                  cache_size: int = 128,
                  eligibility: Optional[FrameEligibility] = None,
                  breaker: Optional[CircuitBreaker] = None,
-                 max_concurrent_requests: int = 4) -> None:
+                 max_concurrent_requests: int = 4,
+                 enabled_question_families: tuple[str, ...] | None = None) -> None:
         if not 0 <= cache_size <= 4096:
             raise ValueError("cache_size must be between 0 and 4096")
         if not 1 <= max_concurrent_requests <= 64:
@@ -80,12 +84,21 @@ class SystemOneRuntime:
         else:
             self.calibration_bundle = CalibrationBundle(dict(calibrations or {}))
         self.cache_size = cache_size
+        enabled = tuple(QUESTION_REGISTRY if enabled_question_families is None
+                        else enabled_question_families)
+        if len(set(enabled)) != len(enabled) or any(question not in QUESTION_REGISTRY
+                                                    for question in enabled):
+            raise ValueError("enabled question families must be registered and unique")
+        self.enabled_question_families = frozenset(enabled)
+        capability = backend.capability()
+        self.max_concurrent_requests = min(max_concurrent_requests,
+                                           capability.max_concurrent_requests)
         self.eligibility = eligibility or (lambda frame: True)
         self.breaker = breaker or CircuitBreaker()
         self._cache: OrderedDict[tuple[object, ...], SystemOneJudgment] = OrderedDict()
         self._latest_sequence: OrderedDict[tuple[str, ...], int] = OrderedDict()
         self._state_lock = threading.RLock()
-        self._provider_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        self._provider_slots = threading.BoundedSemaphore(self.max_concurrent_requests)
 
     @property
     def backend_id(self) -> str:
@@ -134,8 +147,8 @@ class SystemOneRuntime:
         return (cls._identity_key(frame.identity), frame.policy_hash,
                 frame.backend_id, frame.model_id, frame.model_revision,
                 frame.model_content_hash, frame.provider_protocol_hash,
-                frame.protocol_hash, frame.state_projection_schema_hash
-                if hasattr(frame, "state_projection_schema_hash") else "",
+                frame.protocol_hash, QUESTION_REGISTRY_HASH,
+                STATE_PROJECTION_SCHEMA_HASH,
                 frame.calibration_bundle_hash, frame.state_digest,
                 frame.question_bundle_digest)
 
@@ -183,10 +196,14 @@ class SystemOneRuntime:
         for item in answer.answers:
             record = self.calibration_bundle.records.get(item.question_id)
             if record is not None and record.valid_for(frame):
-                calibrated_answers.append(replace(
+                calibrated_item = replace(
                     item, calibrated_probabilities=record.apply(item.raw_probabilities),
-                    calibration_hash=record.digest))
-                calibrated_ids.append(item.question_id)
+                    calibration_hash=record.digest)
+                calibrated_answers.append(calibrated_item)
+                confidence = calibrated_item.calibrated_confidence
+                if (confidence is not None
+                        and confidence >= record.minimum_advisory_confidence):
+                    calibrated_ids.append(item.question_id)
             else:
                 calibrated_answers.append(item)
         return replace(answer, answers=tuple(calibrated_answers)), tuple(calibrated_ids)
@@ -200,29 +217,31 @@ class SystemOneRuntime:
         if mode not in {"disabled", "shadow", "advisory"}:
             raise ValueError("System-1 mode must be disabled, shadow, or advisory")
         if mode == "disabled":
-            return SystemOneResult(None, "disabled")
+            return SystemOneResult(None, "disabled", reason="disabled")
         if not isinstance(frame, SystemOneFrame):
             try:
                 raw_frame = frame.canonical_payload() if callable(
                     getattr(frame, "canonical_payload", None)) else frame
                 frame = SystemOneFrame.from_mapping(raw_frame)
             except Exception:
-                return SystemOneResult(None, "ineligible")
+                return SystemOneResult(None, "rejected", reason="ineligible")
         try:
             eligible = bool(self.eligibility(frame))
         except Exception:
             eligible = False
         if not eligible:
-            return SystemOneResult(None, "ineligible")
+            return SystemOneResult(None, "rejected", reason="ineligible")
+        if not set(frame.question_ids).issubset(self.enabled_question_families):
+            return SystemOneResult(None, "rejected", reason="unsupported_question_family")
         if frame.calibration_bundle_hash != self.calibration_hash:
-            return SystemOneResult(None, "calibration_mismatch")
+            return SystemOneResult(None, "rejected", reason="calibration_mismatch")
 
         identity_key = self._identity_key(frame.identity)
         cache_key = self._cache_key(frame)
         with self._state_lock:
             latest = self._latest_sequence.get(identity_key, 0)
             if frame.sequence <= latest:
-                return SystemOneResult(None, "stale_request")
+                return SystemOneResult(None, "stale", reason="stale_request")
             self._latest_sequence[identity_key] = frame.sequence
             self._latest_sequence.move_to_end(identity_key)
             while len(self._latest_sequence) > 4096:
@@ -231,54 +250,70 @@ class SystemOneRuntime:
             if cached is not None:
                 self._cache.move_to_end(cache_key)
                 rebound = self._rebind(cached, frame)
-                _, calibrated_ids = self._calibrate(frame, rebound)
-                return SystemOneResult(rebound, "ok", calibrated_ids, cache_hit=True)
+                calibrated_answer, calibrated_ids = self._calibrate(frame, rebound)
+                return self._mode_result(mode, calibrated_answer, calibrated_ids,
+                                         cache_hit=True)
             if not self.breaker.permits():
-                return SystemOneResult(None, "circuit_open")
+                return SystemOneResult(None, "unavailable", reason="circuit_open")
 
         if not self._provider_slots.acquire(timeout=self.max_latency_ms / 1000.0):
-            with self._state_lock:
-                self.breaker.failure()
-            return SystemOneResult(None, "provider_busy")
+            return SystemOneResult(None, "unavailable", reason="provider_busy")
         started = time.monotonic()
         try:
             answer = self.backend.judge(frame)
         except ProviderHealthError:
             with self._state_lock:
                 self.breaker.failure()
-            return SystemOneResult(None, "fallback")
+            return SystemOneResult(None, "unavailable", reason="provider_error")
         except (OSError, TimeoutError):
             with self._state_lock:
                 self.breaker.failure()
-            return SystemOneResult(None, "fallback")
+            return SystemOneResult(None, "unavailable", reason="provider_error")
+        except ProviderContractError:
+            return SystemOneResult(None, "rejected", reason="provider_contract_error")
         except Exception:
             # Wrong protocol, identity, or malformed request responses are local
             # contract violations; they must not disable other agents' calls.
-            return SystemOneResult(None, "provider_contract_error")
+            return SystemOneResult(None, "rejected", reason="provider_contract_error")
         finally:
             self._provider_slots.release()
 
         if (time.monotonic() - started) * 1000 > self.max_latency_ms:
             with self._state_lock:
                 self.breaker.failure()
-            return SystemOneResult(None, "fallback")
+            return SystemOneResult(None, "unavailable", reason="provider_deadline_exceeded")
         try:
             self._validate(frame, answer)
         except Exception:
-            return SystemOneResult(None, "provider_contract_error")
+            return SystemOneResult(None, "rejected", reason="provider_contract_error")
         with self._state_lock:
             if self._latest_sequence.get(identity_key) != frame.sequence:
-                return SystemOneResult(None, "stale_response")
+                return SystemOneResult(None, "stale", reason="stale_response")
             self.breaker.success()
             calibrated_answer, calibrated_ids = self._calibrate(frame, answer)
             if self.cache_size:
-                self._cache[cache_key] = calibrated_answer
+                self._cache[cache_key] = answer
                 self._cache.move_to_end(cache_key)
                 while len(self._cache) > self.cache_size:
                     self._cache.popitem(last=False)
+        return self._mode_result(mode, calibrated_answer, calibrated_ids)
+
+    @staticmethod
+    def _mode_result(mode: str, judgment: SystemOneJudgment,
+                     calibrated_ids: tuple[str, ...], *,
+                     cache_hit: bool = False) -> SystemOneResult:
         if mode == "advisory" and not calibrated_ids:
-            return SystemOneResult(calibrated_answer, "uncalibrated_shadow", ())
-        return SystemOneResult(calibrated_answer, "ok", calibrated_ids)
+            return SystemOneResult(judgment, "shadow", (), cache_hit,
+                                   reason="uncalibrated")
+        if mode == "shadow":
+            return SystemOneResult(judgment, "shadow", calibrated_ids, cache_hit,
+                                   reason="shadow_mode")
+        return SystemOneResult(judgment, "ok", calibrated_ids, cache_hit)
+
+    def close(self) -> None:
+        close = getattr(self.backend, "close", None)
+        if callable(close):
+            close()
 
 
 __all__ = ["CircuitBreaker", "SystemOneRuntime", "SystemOneResult"]
