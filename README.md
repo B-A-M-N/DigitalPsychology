@@ -15,7 +15,7 @@ DP does not infer subjective experience. It uses observable behavior to decide w
 
 ## Current implementation
 
-DigitalPsychology is the behavioral policy plane. It does not grant permissions, define legal StateWork transitions, validate evidence, or replace host authority. The MCP runtime host persists DP state, checks revisions, intersects directives with hard constraints, applies component settings, and asks CSW to validate workflow changes.
+DigitalPsychology owns the cross-system runtime host in `lib/runtime/`. Its per-task `RuntimeSession` coordinates the behavioral loop, persists `BehaviorState`, projects context, resolves intervention outcomes, and talks to explicit CFW and CSW adapters. It does not grant permissions, define legal StateWork transitions, validate evidence, or replace either system's authority.
 
 Implemented capabilities include:
 
@@ -27,12 +27,14 @@ Implemented capabilities include:
 - **Authoritative lifecycle state** with explicit rollback/rejection transitions, durable deployment revisions, and known-good previous profiles.
 - **Versioned advice-exchange contracts** so the host can record trusted context, eligible choices, requested adjustments, and the final effective routing decision.
 - **A deterministic fast-loop controller** that emits typed `BehavioralDecision`, `BehaviorDirective`, and `BehaviorState` values from bounded CFW/CSW/runtime inputs.
-- **Intervention lifecycle records** with cause, expected effect, start revision, scope, expiry, and measured outcome; cleared or expired interventions emit explicit release directives.
+- **An independent intervention outcome evaluator** that accepts only scoped, post-intervention host/CSW/validator evidence and an exact applied-directive receipt. It distinguishes supported progress, regression, confounding, missing evidence, and expired windows; agent success claims are not evidence.
+- **Intervention lifecycle records** with cause, expected effect, target criteria, baseline status, start action, bounded horizon, scope, expiry, and measured outcome; cleared or expired interventions emit explicit release directives.
 - **Constrained StateWork preferences** ranked only from the eligible choices supplied by CSW. DP cannot commit or legalize a CSW transition.
+- **Revisioned DP runtime sessions** that coordinate CFW signals and directives, CSW snapshots and activation, context projection, evidence assessment, and authenticated intervention/outcome events.
 
 DP can run without CFW or CSW installed when the host supplies no external signals. CFW and CSW remain operational without DP; an MCP host may use the CFW startup preset and CSW authority without adaptive DP control.
 
-The Python `DigitalPsychologyService.decide_behavior()` method is a trusted-host API and is deliberately not exposed as an agent-facing MCP tool. The host supplies current behavior state, CFW signals, a bounded CSW snapshot, and outcomes, then persists and applies the returned decision with compare-and-swap revision checks. See [the fast-loop contract](docs/behavioral-fast-loop.md). CFW's existing session/controller integration is still being migrated to this boundary.
+Runtime session orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed as agent-facing MCP tools. `RuntimeHost` opens scoped `RuntimeSession` instances; each session uses compare-and-swap for DP state, asks CFW to validate/apply controls, and asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
 
 The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
 
@@ -72,8 +74,8 @@ The slow loop is explicitly invoked; it is not an automatic background worker. I
 ## Optional integrations
 
 - **DP alone:** use the package, SQLite event store, trajectory reconstruction, experiment receipts, and slow-loop service independently.
-- **DP + CFW:** the host supplies CFW component signals; DP returns bounded settings for the host to apply after the hard-policy resolver.
-- **DP + CSW:** the host supplies a CSW snapshot and its eligible StateWork choices. DP can rank those choices; CSW remains the source of legal workflow state and transitions.
+- **DP + CFW:** `CFWRuntimeAdapter` consumes validated CFW signals, applies bounded DP directives through CFW's declared host API, and projects the committed DP context at model/tool-planning boundaries.
+- **DP + CSW:** `CSWRuntimeAdapter` reads CSW-owned active workflow selections and eligible candidates. DP can rank those choices; CSW activates them and remains the source of legal workflow state, evidence, and transitions.
 - **CFW + CSW without DP:** both runtime authorities continue to work with no DP service installed.
 
 ### Optional Laya System-1 provider
@@ -388,7 +390,7 @@ DigitalPsychology
     and WHAT ACTUALLY CHANGES IT?
 ```
 
-CFW provides behavioral policy. CSW provides state-aware workflow control. DigitalPsychology provides the observation and experimental loop that determines whether those policies are actually doing what they were intended to do.
+CFW provides cognitive components, signals, and enforcement. CSW provides authoritative workflow state and legal transitions. DigitalPsychology owns cross-system behavioral adaptation and measures whether its interventions improve progress toward the user's objective.
 
 Together, they form an **adaptive agent control stack**: not a single giant prompt, not an unconstrained self-modifying agent, but a layered system in which behavior can be prescribed, state can be governed, outcomes can be observed, and future policy can improve from evidence.
 

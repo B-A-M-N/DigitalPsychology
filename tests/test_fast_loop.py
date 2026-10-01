@@ -41,11 +41,13 @@ def test_repeated_equivalent_work_creates_bounded_recovery_and_legal_statework_p
         "set_mode", "set_framework", "set_control", "prefer_statework",
     }
     assert {item.cause for item in decision.state.active_interventions} == {
-        "equivalent_retry", "statework_fit",
+        "equivalent_retry",
     }
+    assert any(target.target == "statework:repair-flow"
+               for target in decision.state.active_interventions[0].targets)
 
 
-def test_progress_closes_recovery_and_emits_explicit_deactivation_directives():
+def test_unverified_progress_flag_cannot_assign_intervention_credit():
     controller = BehavioralController()
     initial = BehaviorState()
     first = controller.decide(FastLoopInput(
@@ -69,7 +71,9 @@ def test_progress_closes_recovery_and_emits_explicit_deactivation_directives():
     assert second.state.framework_modes["owl"] == "normal"
     assert second.state.framework_modes["anchor"] == "passive"
     assert second.state.framework_modes["fuse"] == "normal"
-    assert any(item.outcome == "improved" for item in second.intervention_outcomes)
+    assert any(item.outcome == "withdrawn"
+               and item.attribution == "insufficient"
+               for item in second.intervention_outcomes)
     assert any(item.operation == "set_framework" and item.value == "normal"
                for item in second.directives)
     assert not any(item.cause == "equivalent_retry"
@@ -101,11 +105,20 @@ def test_regressing_intervention_is_recorded_and_stays_blocked_until_trigger_cle
         state=BehaviorState(), csw_snapshot=CSWBehaviorSnapshot(revision=1),
         equivalent_retry_count=2,
     ))
+    intervention = first.state.active_interventions[0]
+    from lib.behavior_state import InterventionOutcome
+    assessment = InterventionOutcome(
+        intervention_id=intervention.intervention_id,
+        cause=intervention.cause,
+        outcome="regressed", observed_revision=2,
+        evidence_refs=("regression-evidence",), scope=intervention.scope,
+        attribution="supported", goal_progress=False,
+    )
     second = controller.decide(FastLoopInput(
         scope="tenant/app/agent/session/task/attempt",
         state=first.state, csw_snapshot=CSWBehaviorSnapshot(revision=2),
         equivalent_retry_count=2, regression_observed=True,
-        action_completed=True, evidence_refs=("regression-evidence",),
+        action_completed=True, intervention_assessments=(assessment,),
     ))
     third = controller.decide(FastLoopInput(
         scope="tenant/app/agent/session/task/attempt",
@@ -124,6 +137,41 @@ def test_regressing_intervention_is_recorded_and_stays_blocked_until_trigger_cle
     ))
     assert cleared.state.cognitive_mode == "DELIVER"
     assert any(item.value == "DELIVER" for item in cleared.directives)
+
+
+def test_independently_effective_intervention_is_retained_without_repeating_it():
+    from lib.behavior_state import InterventionOutcome
+
+    controller = BehavioralController()
+    first = controller.decide(FastLoopInput(
+        scope="tenant/app/agent/session/task/attempt",
+        state=BehaviorState(), csw_snapshot=CSWBehaviorSnapshot(revision=1),
+        objective_criteria=("criterion-2",),
+        criterion_status={"criterion-2": "unmet"},
+        host_action_index=4, equivalent_retry_count=2,
+    ))
+    intervention = first.state.active_interventions[0]
+    assessment = InterventionOutcome(
+        intervention_id=intervention.intervention_id,
+        cause=intervention.cause,
+        outcome="effective", observed_revision=2,
+        evidence_refs=("validator-criterion-2",), scope=intervention.scope,
+        attribution="supported", criterion_ids_progressed=("criterion-2",),
+        goal_progress=True, artifact_changed=True, repeated_approach=False,
+    )
+
+    second = controller.decide(FastLoopInput(
+        scope=intervention.scope, state=first.state,
+        csw_snapshot=CSWBehaviorSnapshot(revision=2), equivalent_retry_count=2,
+        intervention_assessments=(assessment,),
+    ))
+
+    assert second.state.cognitive_mode == "RECOVER"
+    assert second.state.intervention_history[-1].outcome == "effective"
+    assert not any(item.cause == "equivalent_retry"
+                   for item in second.state.active_interventions)
+    assert not any(item.operation == "set_mode" and item.value == "RECOVER"
+                   for item in second.directives)
 
 
 def test_intervention_identity_is_scoped_per_agent_session():

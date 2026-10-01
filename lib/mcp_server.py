@@ -1,8 +1,9 @@
-"""DigitalPsychology MCP slow-loop service.
+"""DigitalPsychology MCP transport.
 
-The service is the authoritative ingestion/control-plane boundary.  CFW and
-CSW remain usable without it; an unavailable service therefore produces no
-adaptive advice rather than changing static runtime policy.
+Session orchestration lives in ``digital_psychology.runtime``. This module
+only registers the public telemetry, advice, and profile tools; host-only
+session state, directive application, and outcome evaluation are not MCP
+tools.
 """
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ import json
 import os
 import stat
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -20,8 +23,11 @@ try:
 except ImportError:  # transport is optional; the service remains testable
     FastMCP = None
 
-from .feedback_loop import EventFactory, EventError, SQLiteSink, trusted_state_root
+from .feedback_loop import Event, EventFactory, EventError, SQLiteSink, trusted_state_root
 from .fast_loop import BehavioralController, FastLoopInput
+from .outcomes import (InterventionEvaluationFrame, InterventionEvaluator,
+                       InterventionEventContext, OutcomeEvidenceAuthority)
+from .behavior_state import BehaviorIntervention, BehaviorDirective, InterventionOutcome
 from .routing_profiles import (BehavioralRoutingProfile, RoutingProfileError,
                                SharingDecisionAuthority, applicable_adjustments,
                                validate_profile)
@@ -60,6 +66,7 @@ class DigitalPsychologyService:
         self._sharing_authority = sharing_authority
         self._system_one_service = system_one_service
         self._behavioral_controller = behavioral_controller or BehavioralController()
+        self._intervention_evaluator = InterventionEvaluator()
         if (max_pending_events_per_origin < 1 or max_ingest_seconds_per_origin <= 0
                 or backpressure_recovery_seconds <= 0
                 or not 10 <= int(busy_timeout_ms) <= 5000 or int(per_origin_write_limit) < 1):
@@ -119,6 +126,105 @@ class DigitalPsychologyService:
             judgment = judgment.judgment if judgment.status == "ok" else None
         decision = self._behavioral_controller.decide(context, judgment=judgment)
         return decision.to_dict()
+
+    def assess_intervention_outcome(
+            self, intervention: BehaviorIntervention,
+            frame: InterventionEvaluationFrame, *,
+            evidence_authority: OutcomeEvidenceAuthority) -> dict[str, Any]:
+        """Host-only independent credit assignment; never an agent MCP tool.
+
+        The supplied authority must resolve refs from CSW and host validators.
+        Agent/model statements are not valid outcome evidence.
+        """
+        return self._intervention_evaluator.assess(
+            intervention, frame, authority=evidence_authority).to_dict()
+
+    def record_intervention_application(
+            self, intervention: BehaviorIntervention,
+            directives: tuple[BehaviorDirective, ...],
+            applied_directive_ids: tuple[str, ...], *,
+            event_context: InterventionEventContext) -> str:
+        """Persist a host receipt after the runtime actually applies directives."""
+        required = {item.directive_id for item in directives
+                    if item.intervention_id == intervention.intervention_id}
+        applied = set(applied_directive_ids)
+        if not required or required != applied or len(applied) != len(applied_directive_ids):
+            raise ValueError("applied intervention receipt does not cover its exact directives")
+        payload = {
+            "behavior_intervention_id": intervention.intervention_id,
+            "behavior_intervention_cause": intervention.cause,
+            "behavior_intervention_expected_effect": intervention.expected_effect,
+            "behavior_intervention_status": "applied",
+            "behavior_intervention_attribution": "insufficient",
+            "behavior_intervention_target_changes": [
+                target.to_dict() for target in intervention.targets],
+            "behavior_intervention_target_criteria": list(intervention.target_criteria),
+            "behavior_intervention_start_revision": intervention.start_revision,
+            "behavior_intervention_baseline_action_index": intervention.baseline_action_index,
+            "behavior_intervention_evaluation_horizon_actions":
+                intervention.evaluation_horizon_actions,
+            "behavior_intervention_competing_ids":
+                list(intervention.concurrent_intervention_ids),
+            "behavior_intervention_directive_ids": sorted(applied),
+        }
+        return self._record_intervention_event(
+            event_context, category="decision", event_type="behavior_intervention_applied",
+            scope=intervention.scope, evidence_refs=(), payload=payload)
+
+    def record_intervention_outcome(
+            self, outcome: InterventionOutcome, *,
+            event_context: InterventionEventContext) -> str:
+        """Durably join independent outcome evidence to the applied intervention."""
+        payload = {
+            "behavior_intervention_id": outcome.intervention_id,
+            "behavior_intervention_cause": outcome.cause,
+            "behavior_intervention_status": outcome.outcome,
+            "behavior_intervention_attribution": outcome.attribution,
+            "behavior_intervention_criterion_progress":
+                list(outcome.criterion_ids_progressed),
+            "behavior_intervention_goal_progress": outcome.goal_progress,
+            "behavior_intervention_comparison_id": outcome.comparison_id,
+            "behavior_intervention_artifact_changed": outcome.artifact_changed,
+            "behavior_intervention_repeated_approach": outcome.repeated_approach,
+            "behavior_intervention_verification_quality": outcome.verification_quality,
+        }
+        return self._record_intervention_event(
+            event_context, category="validation", event_type="behavior_intervention_assessed",
+            scope=outcome.scope, evidence_refs=outcome.evidence_refs, payload=payload)
+
+    def _record_intervention_event(
+            self, event_context: InterventionEventContext, *, category: str,
+            event_type: str, scope: str, evidence_refs: tuple[str, ...],
+            payload: Mapping[str, Any]) -> str:
+        event_id = f"dp-intv-{uuid.uuid4().hex}"
+        event = Event(
+            event_id=event_id,
+            timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            namespace_id=event_context.namespace_id,
+            application_id=event_context.application_id,
+            application_instance_id=event_context.application_instance_id,
+            agent_instance_id=event_context.agent_instance_id,
+            session_id=event_context.session_id,
+            task_id=event_context.task_id,
+            attempt_id=event_context.attempt_id,
+            segment_id=event_context.segment_id,
+            agent_id=event_context.agent_id,
+            behavioral_subject=event_context.behavioral_subject,
+            category=category,
+            event_type=event_type,
+            actor_id="digitalpsychology_runtime",
+            authority_source="host_outcome_evaluator" if category == "validation"
+                             else "digitalpsychology_runtime",
+            scope=scope,
+            goal_contract_hash=event_context.goal_contract_hash,
+            evidence_refs=list(evidence_refs),
+            payload=dict(payload),
+        )
+        # This event is minted only by the host-only runtime API after it has
+        # applied directives or resolved outcome evidence. Agent ingestion does
+        # not receive this capability.
+        self._sink.emit_authenticated(event, authenticated=True)
+        return event_id
 
     def _producer_key(self, key_id: str) -> bytes:
         raw = os.environ.get(f"DIGITALPSYCHOLOGY_INGESTION_KEY_{key_id}", "")
@@ -474,7 +580,8 @@ def create_server(service: DigitalPsychologyService | None = None):
     server = FastMCP(
         "digital-psychology",
         instructions=("Behavioral telemetry ingestion and bounded adaptive advice. "
-                      "CFW remains the runtime authority."),
+                      "The DigitalPsychology runtime host coordinates CFW component "
+                      "adapters and CSW-owned workflow authority."),
     )
 
     @server.tool()

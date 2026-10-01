@@ -33,13 +33,21 @@
     },
     "outcome": {
       "type": "object", "additionalProperties": false,
-      "required": ["intervention_id", "cause", "outcome", "observed_revision", "evidence_refs"],
+      "required": ["intervention_id", "cause", "outcome", "observed_revision", "evidence_refs", "scope", "attribution", "criterion_ids_progressed", "goal_progress", "artifact_changed", "repeated_approach", "verification_quality", "comparison_id"],
       "properties": {
         "intervention_id": {"type": "string", "minLength": 1, "maxLength": 128},
         "cause": {"type": "string", "minLength": 1, "maxLength": 128},
-        "outcome": {"enum": ["improved", "no_effect", "regressed", "expired", "withdrawn"]},
+        "outcome": {"enum": ["effective", "ineffective", "regressed", "unattributed", "inconclusive", "expired", "withdrawn"]},
         "observed_revision": {"type": "integer", "minimum": 0},
-        "evidence_refs": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+        "evidence_refs": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+        "scope": {"type": "string", "minLength": 1, "maxLength": 256},
+        "attribution": {"enum": ["supported", "confounded", "not_attributed", "none", "insufficient"]},
+        "criterion_ids_progressed": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+        "goal_progress": {"type": ["boolean", "null"]},
+        "artifact_changed": {"type": ["boolean", "null"]},
+        "repeated_approach": {"type": ["boolean", "null"]},
+        "verification_quality": {"enum": ["improved", "unchanged", "degraded", "unknown"]},
+        "comparison_id": {"type": ["string", "null"], "maxLength": 128}
       }
     }
   }

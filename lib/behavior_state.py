@@ -19,7 +19,11 @@ FRAMEWORK_MODES = frozenset({
     "reopen", "recovery", "reset",
 })
 INTERVENTION_OUTCOMES = frozenset({
-    "improved", "no_effect", "regressed", "expired", "withdrawn",
+    "effective", "ineffective", "regressed", "unattributed",
+    "inconclusive", "expired", "withdrawn",
+})
+INTERVENTION_ATTRIBUTIONS = frozenset({
+    "supported", "confounded", "not_attributed", "none", "insufficient",
 })
 
 
@@ -68,6 +72,11 @@ class BehaviorIntervention:
     expires_after_actions: int
     actions_elapsed: int
     targets: tuple[InterventionTarget, ...]
+    target_criteria: tuple[str, ...] = ()
+    baseline_criterion_status: Mapping[str, str] = field(default_factory=dict)
+    baseline_action_index: int = 0
+    evaluation_horizon_actions: int | None = None
+    concurrent_intervention_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
@@ -78,23 +87,54 @@ class BehaviorIntervention:
             raise ValueError("intervention revision and expiry must be positive bounds")
         if not 0 <= self.actions_elapsed <= self.expires_after_actions:
             raise ValueError("intervention elapsed actions exceed its expiry")
+        horizon = self.evaluation_horizon_actions
+        if horizon is None:
+            horizon = self.expires_after_actions
+            object.__setattr__(self, "evaluation_horizon_actions", horizon)
+        if not 1 <= horizon <= 64:
+            raise ValueError("intervention evaluation horizon is out of bounds")
+        if not isinstance(self.baseline_action_index, int) or self.baseline_action_index < 0:
+            raise ValueError("baseline action index must be non-negative")
         if not 1 <= len(self.targets) <= 12:
             raise ValueError("intervention must have one to twelve targets")
         if len({target.target for target in self.targets}) != len(self.targets):
             raise ValueError("intervention targets must be unique")
+        object.__setattr__(self, "target_criteria",
+                           _ids(self.target_criteria, "target_criteria", limit=8))
+        if (not isinstance(self.baseline_criterion_status, Mapping)
+                or len(self.baseline_criterion_status) > 8):
+            raise ValueError("baseline criterion status must be bounded")
+        statuses = {}
+        for criterion_id, status in self.baseline_criterion_status.items():
+            key = _text(criterion_id, "baseline criterion ID", limit=128)
+            if key not in self.target_criteria or status not in {
+                    "unmet", "in_progress", "verified", "blocked", "unknown"}:
+                raise ValueError("baseline criterion status is invalid or out of scope")
+            statuses[key] = status
+        object.__setattr__(self, "baseline_criterion_status", MappingProxyType(statuses))
+        object.__setattr__(self, "concurrent_intervention_ids",
+                           _ids(self.concurrent_intervention_ids,
+                                "concurrent_intervention_ids", limit=16))
 
     def to_dict(self) -> dict[str, Any]:
         return {"intervention_id": self.intervention_id, "cause": self.cause,
                 "expected_effect": self.expected_effect,
                 "start_revision": self.start_revision, "scope": self.scope,
                 "expires_after_actions": self.expires_after_actions,
+                "evaluation_horizon_actions": self.evaluation_horizon_actions,
                 "actions_elapsed": self.actions_elapsed,
-                "targets": [target.to_dict() for target in self.targets]}
+                "targets": [target.to_dict() for target in self.targets],
+                "target_criteria": list(self.target_criteria),
+                "baseline_criterion_status": dict(self.baseline_criterion_status),
+                "baseline_action_index": self.baseline_action_index,
+                "concurrent_intervention_ids": list(self.concurrent_intervention_ids)}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "BehaviorIntervention":
         data = dict(value)
         data["targets"] = tuple(InterventionTarget(**item) for item in data["targets"])
+        for name in ("target_criteria", "concurrent_intervention_ids"):
+            data[name] = tuple(data.get(name, ()))
         return cls(**data)
 
 
@@ -105,22 +145,64 @@ class InterventionOutcome:
     outcome: str
     observed_revision: int
     evidence_refs: tuple[str, ...] = ()
+    scope: str = "legacy-unscoped"
+    attribution: str = "insufficient"
+    criterion_ids_progressed: tuple[str, ...] = ()
+    goal_progress: bool | None = None
+    artifact_changed: bool | None = None
+    repeated_approach: bool | None = None
+    verification_quality: str = "unknown"
+    comparison_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
         _text(self.cause, "intervention cause", limit=128)
+        _text(self.scope, "outcome scope", limit=256)
         if self.outcome not in INTERVENTION_OUTCOMES:
             raise ValueError("unsupported intervention outcome")
+        if self.attribution not in INTERVENTION_ATTRIBUTIONS:
+            raise ValueError("unsupported intervention attribution")
         if self.observed_revision < 0:
             raise ValueError("observed revision must be non-negative")
+        if self.verification_quality not in {"improved", "unchanged", "degraded", "unknown"}:
+            raise ValueError("unsupported verification quality")
+        if self.comparison_id is not None and (
+                not isinstance(self.comparison_id, str) or not self.comparison_id
+                or len(self.comparison_id) > 128):
+            raise ValueError("comparison_id must be bounded text or null")
+        for name in ("goal_progress", "artifact_changed", "repeated_approach"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean or null")
         object.__setattr__(self, "evidence_refs",
                            _ids(self.evidence_refs, "evidence_refs", limit=16))
+        object.__setattr__(self, "criterion_ids_progressed",
+                           _ids(self.criterion_ids_progressed,
+                                "criterion_ids_progressed", limit=8))
 
     def to_dict(self) -> dict[str, Any]:
         return {"intervention_id": self.intervention_id, "cause": self.cause,
                 "outcome": self.outcome,
                 "observed_revision": self.observed_revision,
-                "evidence_refs": list(self.evidence_refs)}
+                "evidence_refs": list(self.evidence_refs), "scope": self.scope,
+                "attribution": self.attribution,
+                "criterion_ids_progressed": list(self.criterion_ids_progressed),
+                "goal_progress": self.goal_progress,
+                "artifact_changed": self.artifact_changed,
+                "repeated_approach": self.repeated_approach,
+                "verification_quality": self.verification_quality,
+                "comparison_id": self.comparison_id}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "InterventionOutcome":
+        data = dict(value)
+        # Read old locally persisted DP v1 states without treating their
+        # controller-generated labels as independently attributed outcomes.
+        data["outcome"] = {"improved": "inconclusive", "no_effect": "inconclusive"}.get(
+            data.get("outcome"), data.get("outcome"))
+        data["evidence_refs"] = tuple(data.get("evidence_refs", ()))
+        data["criterion_ids_progressed"] = tuple(data.get("criterion_ids_progressed", ()))
+        return cls(**data)
 
 
 @dataclass(frozen=True)
@@ -212,7 +294,7 @@ class BehaviorState:
             for item in data.get("active_interventions", ()))
         data["intervention_history"] = tuple(
             item if isinstance(item, InterventionOutcome)
-            else InterventionOutcome(**item)
+            else InterventionOutcome.from_mapping(item)
             for item in data.get("intervention_history", ()))
         for name in ("active_stateworks", "focus_criteria"):
             data[name] = tuple(data.get(name, ()))
@@ -282,6 +364,9 @@ class CSWBehaviorSnapshot:
     active_stateworks: tuple[str, ...] = ()
     eligible_stateworks: tuple[StateWorkOption, ...] = ()
     workflow_states: Mapping[str, str] = field(default_factory=dict)
+    snapshot_id: str = ""
+    workflow_revisions: Mapping[str, int] = field(default_factory=dict)
+    eligible_steps: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, int) or self.revision < 0:
@@ -299,6 +384,33 @@ class CSWBehaviorSnapshot:
         for key, value in self.workflow_states.items():
             states[_text(key, "workflow ID", limit=128)] = _text(value, "workflow state", limit=64)
         object.__setattr__(self, "workflow_states", MappingProxyType(states))
+        if self.snapshot_id and (not isinstance(self.snapshot_id, str)
+                                 or len(self.snapshot_id) != 64
+                                 or any(char not in "0123456789abcdef"
+                                        for char in self.snapshot_id)):
+            raise ValueError("CSW snapshot ID must be a SHA-256 digest")
+        revisions = dict(self.workflow_revisions)
+        if (len(revisions) > 16 or not set(revisions).issubset(set(self.active_stateworks))
+                or any(not isinstance(value, int) or value < 0
+                       for value in revisions.values())):
+            raise ValueError("workflow revisions must be bounded to active StateWorks")
+        object.__setattr__(self, "workflow_revisions", MappingProxyType(revisions))
+        step_map = {}
+        if not isinstance(self.eligible_steps, Mapping) or len(self.eligible_steps) > 16:
+            raise ValueError("CSW legal step map must be bounded")
+        for statework_id, steps in self.eligible_steps.items():
+            key = _text(statework_id, "workflow ID", limit=128)
+            step_map[key] = _ids(steps, "eligible step IDs", limit=64)
+        object.__setattr__(self, "eligible_steps", MappingProxyType(step_map))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"revision": self.revision, "snapshot_id": self.snapshot_id,
+                "active_stateworks": list(self.active_stateworks),
+                "eligible_stateworks": [item.to_dict() for item in self.eligible_stateworks],
+                "workflow_states": dict(self.workflow_states),
+                "workflow_revisions": dict(self.workflow_revisions),
+                "eligible_steps": {key: list(value)
+                                    for key, value in self.eligible_steps.items()}}
 
 
 @dataclass(frozen=True)
@@ -355,7 +467,7 @@ class BehavioralDecision:
 
 
 __all__ = [
-    "BEHAVIOR_MODES", "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
+    "BEHAVIOR_MODES", "INTERVENTION_ATTRIBUTIONS", "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
     "BehavioralDecision", "CSWBehaviorSnapshot", "FrameworkSignal",
     "InterventionOutcome", "InterventionTarget", "StateWorkOption",
 ]

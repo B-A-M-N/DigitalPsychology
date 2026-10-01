@@ -25,6 +25,8 @@ class SlowLoopReport:
     deployment_exposures: list[dict[str, Any]] = field(default_factory=list)
     observations_completed: list[dict[str, Any]] = field(default_factory=list)
     intervention_effectiveness: list[dict[str, Any]] = field(default_factory=list)
+    intervention_credit_assignments: list[dict[str, Any]] = field(default_factory=list)
+    intervention_strategy_observations: list[dict[str, Any]] = field(default_factory=list)
     regressions: list[dict[str, Any]] = field(default_factory=list)
     rejection_reasons: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -50,6 +52,7 @@ class BoundedLearningController:
 
     def run(self, events: Iterable[Any], task_context: Mapping[str, Mapping[str, Any]]) -> SlowLoopReport:
         event_list = list(events)
+        credit_assignments, strategy_observations = collect_intervention_credit_assignments(event_list)
         candidates = derive_profiles(
             event_list, task_context, minimum_samples=self.minimum_samples,
             minimum_effect=self.minimum_effect)
@@ -61,6 +64,10 @@ class BoundedLearningController:
         regressions: list[dict[str, Any]] = []
         rejection_reasons: list[dict[str, Any]] = []
         feedback_events: list[dict[str, Any]] = []
+        feedback_events.extend({"type": "independent_intervention_outcome", **item}
+                               for item in credit_assignments)
+        feedback_events.extend({"type": "intervention_strategy_observation", **item}
+                               for item in strategy_observations)
         for candidate in candidates:
             profile_id = str(candidate.get("profile_id") or "")
             evidence = dict(candidate.get("evidence") or {})
@@ -130,7 +137,112 @@ class BoundedLearningController:
             candidates=candidates, promoted=promoted, rejected=rejected,
             deployment_exposures=exposures, observations_completed=observations,
             intervention_effectiveness=effectiveness, regressions=regressions,
+            intervention_credit_assignments=credit_assignments,
+            intervention_strategy_observations=strategy_observations,
             rejection_reasons=rejection_reasons, events=feedback_events)
+
+
+def collect_intervention_credit_assignments(
+        events: Iterable[Any]
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Join authenticated host application receipts to assessed outcomes.
+
+    These pairs are learning observations only. They are never promoted as a
+    causal strategy without the existing baseline/intervention/holdout gates.
+    """
+    applications: dict[tuple[str, ...], Any] = {}
+    outcomes: dict[tuple[str, ...], list[Any]] = {}
+
+    def pair_key(event: Any, intervention_id: str) -> tuple[str, ...]:
+        return tuple(str(getattr(event, name) or "") for name in (
+            "namespace_id", "application_instance_id", "agent_instance_id",
+            "session_id", "task_id", "attempt_id", "scope",
+            "goal_contract_hash")) + (intervention_id,)
+
+    for event in events:
+        payload = getattr(event, "payload", None) or {}
+        intervention_id = payload.get("behavior_intervention_id")
+        if not isinstance(intervention_id, str) or not intervention_id:
+            continue
+        if (event.actor_id != "digitalpsychology_runtime"
+                or not event.scope or not event.task_id or not event.attempt_id):
+            continue
+        if event.event_type == "behavior_intervention_applied":
+            if (payload.get("behavior_intervention_status") != "applied"
+                    or event.authority_source != "digitalpsychology_runtime"):
+                continue
+            applications[pair_key(event, intervention_id)] = event
+        elif event.event_type == "behavior_intervention_assessed":
+            if event.authority_source != "host_outcome_evaluator":
+                continue
+            outcomes.setdefault(pair_key(event, intervention_id), []).append(event)
+
+    pairs: list[dict[str, Any]] = []
+    for key, assessments in outcomes.items():
+        intervention_id = key[-1]
+        application = applications.get(key)
+        if application is None:
+            continue
+        assessment = max(assessments, key=lambda event: (event.timestamp, event.event_id))
+        payload = assessment.payload or {}
+        status = payload.get("behavior_intervention_status")
+        attribution = payload.get("behavior_intervention_attribution")
+        evidence_refs = tuple(assessment.evidence_refs or ())
+        independently_supported = (
+            status in {"effective", "ineffective", "regressed"}
+            and attribution == "supported" and bool(evidence_refs))
+        applied_payload = application.payload or {}
+        pair = {
+            "intervention_id": intervention_id,
+            "cause": applied_payload.get("behavior_intervention_cause"),
+            "outcome": status,
+            "attribution": attribution,
+            "independently_supported": independently_supported,
+            "target_criteria": list(
+                applied_payload.get("behavior_intervention_target_criteria") or ()),
+            "criterion_ids_progressed": list(
+                payload.get("behavior_intervention_criterion_progress") or ()),
+            "goal_progress": payload.get("behavior_intervention_goal_progress"),
+            "comparison_id": payload.get("behavior_intervention_comparison_id"),
+            "artifact_changed": payload.get("behavior_intervention_artifact_changed"),
+            "repeated_approach": payload.get("behavior_intervention_repeated_approach"),
+            "verification_quality": payload.get(
+                "behavior_intervention_verification_quality", "unknown"),
+            "task_id": assessment.task_id,
+            "attempt_id": assessment.attempt_id,
+            "agent_instance_id": assessment.agent_instance_id,
+            "goal_contract_hash": assessment.goal_contract_hash,
+            "evidence_refs": list(evidence_refs),
+        }
+        pairs.append(pair)
+
+    groups: dict[tuple[str, tuple[str, ...]], list[dict[str, Any]]] = {}
+    for pair in pairs:
+        if not pair["independently_supported"]:
+            continue
+        key = (str(pair.get("cause") or "unknown"),
+               tuple(sorted(pair.get("target_criteria") or ())))
+        groups.setdefault(key, []).append(pair)
+    observations = []
+    for (cause, criteria), rows in sorted(groups.items()):
+        counts: dict[str, int] = {}
+        for row in rows:
+            outcome = str(row["outcome"])
+            counts[outcome] = counts.get(outcome, 0) + 1
+        total = sum(counts.values())
+        observations.append({
+            "cause": cause,
+            "target_criteria": list(criteria),
+            "supported_trial_count": total,
+            "effective_count": counts.get("effective", 0),
+            "ineffective_count": counts.get("ineffective", 0),
+            "regressed_count": counts.get("regressed", 0),
+            "effective_rate": counts.get("effective", 0) / total if total else 0.0,
+            "disposition": "observational_only",
+            "promotion_requires": "independent baseline, intervention, and holdout cohorts",
+        })
+    pairs.sort(key=lambda item: (str(item.get("cause")), item["intervention_id"]))
+    return pairs, observations
 
 
 def candidate_id(candidate: Mapping[str, Any]) -> str:

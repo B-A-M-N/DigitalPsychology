@@ -7,7 +7,7 @@ revision, intersects directives with hard constraints, and applies them.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from typing import Any, Mapping, Optional, Protocol
@@ -71,12 +71,15 @@ class FastLoopInput:
     active_trigger_codes: tuple[str, ...] = ()
     actions_since_goal_progress: int = 0
     equivalent_retry_count: int = 0
+    host_action_index: int = 0
+    criterion_status: Mapping[str, str] = field(default_factory=dict)
     action_completed: bool = False
     progress_made: bool = False
     regression_observed: bool = False
     artifact_changed: bool = False
     context_pressure: float = 0.0
     evidence_refs: tuple[str, ...] = ()
+    intervention_assessments: tuple[InterventionOutcome, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, str) or not self.scope.strip() or len(self.scope) > 256:
@@ -88,7 +91,8 @@ class FastLoopInput:
             raise ValueError("objective criterion IDs must be bounded text")
         if len(self.cfw_signals) > 32 or len(self.active_trigger_codes) > 32:
             raise ValueError("fast-loop input exceeds bounded signal counts")
-        if self.actions_since_goal_progress < 0 or self.equivalent_retry_count < 0:
+        if (self.actions_since_goal_progress < 0 or self.equivalent_retry_count < 0
+                or self.host_action_index < 0):
             raise ValueError("outcome counters must be non-negative")
         if not 0.0 <= float(self.context_pressure) <= 1.0:
             raise ValueError("context pressure must be between zero and one")
@@ -96,6 +100,20 @@ class FastLoopInput:
                 not isinstance(value, str) or not value or len(value) > 256
                 for value in self.evidence_refs):
             raise ValueError("evidence references must be bounded")
+        statuses = dict(self.criterion_status or {})
+        if len(statuses) > 8 or not set(statuses).issubset(set(self.objective_criteria)):
+            raise ValueError("criterion status must be bounded to objective criteria")
+        if any(status not in {"unmet", "in_progress", "verified", "blocked", "unknown"}
+               for status in statuses.values()):
+            raise ValueError("unsupported host criterion status")
+        object.__setattr__(self, "criterion_status", statuses)
+        if len(self.intervention_assessments) > 16:
+            raise ValueError("intervention assessment count exceeds its bound")
+        assessment_ids = [item.intervention_id for item in self.intervention_assessments]
+        if len(assessment_ids) != len(set(assessment_ids)):
+            raise ValueError("intervention assessments must be unique per decision")
+        if any(item.scope != self.scope for item in self.intervention_assessments):
+            raise ValueError("intervention assessments must match the decision scope")
 
 
 class BehavioralController:
@@ -187,10 +205,14 @@ class BehavioralController:
     def _new_intervention(self, *, scope: str, revision: int, cause: str,
                           expected_effect: str,
                           targets: tuple[tuple[str, str, str], ...],
-                          expiry: Optional[int] = None) -> BehaviorIntervention:
+                          expiry: Optional[int] = None,
+                          target_criteria: tuple[str, ...] = (),
+                          baseline_criterion_status: Optional[Mapping[str, str]] = None,
+                          baseline_action_index: int = 0,
+                          concurrent_intervention_ids: tuple[str, ...] = ()) -> BehaviorIntervention:
         intervention_id = "intv-" + self._digest({
             "scope": scope, "revision": revision, "cause": cause,
-            "targets": targets,
+            "targets": targets, "target_criteria": target_criteria,
         })[:24]
         records = tuple(InterventionTarget(
             target=target, previous_value=previous, applied_value=applied)
@@ -199,7 +221,15 @@ class BehavioralController:
             intervention_id=intervention_id, cause=cause,
             expected_effect=expected_effect, start_revision=revision,
             scope=scope, expires_after_actions=expiry or self.intervention_expiry_actions,
-            actions_elapsed=0, targets=records)
+            actions_elapsed=0, targets=records,
+            target_criteria=target_criteria,
+            baseline_criterion_status={
+                key: (baseline_criterion_status or {}).get(key, "unknown")
+                for key in target_criteria
+            },
+            baseline_action_index=baseline_action_index,
+            evaluation_horizon_actions=expiry or self.intervention_expiry_actions,
+            concurrent_intervention_ids=concurrent_intervention_ids)
 
     @staticmethod
     def _rank_stateworks(mode: str, options: tuple[StateWorkOption, ...],
@@ -257,53 +287,59 @@ class BehavioralController:
             triggers.add("context_pressure")
         previously_failed = {
             item.cause for item in original.intervention_history
-            if item.outcome in {"expired", "regressed"}
+            if item.outcome in {"ineffective", "regressed", "unattributed",
+                                "inconclusive", "expired"}
         }
         blocking_failed_causes = previously_failed & triggers
+        if blocking_failed_causes:
+            triggers.add("failed_cause_blocked")
+        previously_effective = {
+            item.cause for item in original.intervention_history
+            if item.outcome == "effective"
+        } | {item.cause for item in context.intervention_assessments
+             if item.outcome == "effective"}
 
         interventions: list[BehaviorIntervention] = []
         outcomes: list[InterventionOutcome] = []
         directives: list[BehaviorDirective] = []
         expired_causes: set[str] = set()
-        active_workflows = set(context.csw_snapshot.active_stateworks)
+        assessments = {item.intervention_id: item
+                       for item in context.intervention_assessments}
+        active_ids = {item.intervention_id for item in original.active_interventions}
+        if not set(assessments).issubset(active_ids):
+            raise ValueError("outcome assessment does not match an active intervention")
         working = original
         for item in original.active_interventions:
             elapsed = item.actions_elapsed + (1 if context.action_completed else 0)
             updated = replace(item, actions_elapsed=min(elapsed, item.expires_after_actions))
-            committed_workflow = any(
-                target.target.startswith("statework:")
-                and target.target.split(":", 1)[1] in active_workflows
-                for target in item.targets)
-            if committed_workflow:
-                outcomes.append(InterventionOutcome(
-                    intervention_id=item.intervention_id, cause=item.cause,
-                    outcome="improved", observed_revision=next_revision,
-                    evidence_refs=context.evidence_refs))
-                continue
-            if context.regression_observed:
-                outcomes.append(InterventionOutcome(
-                    intervention_id=item.intervention_id, cause=item.cause,
-                    outcome="regressed", observed_revision=next_revision,
-                    evidence_refs=context.evidence_refs))
-                expired_causes.add(item.cause)
-                continue
-            if context.progress_made and item.cause not in triggers:
-                outcomes.append(InterventionOutcome(
-                    intervention_id=item.intervention_id, cause=item.cause,
-                    outcome="improved", observed_revision=next_revision,
-                    evidence_refs=context.evidence_refs))
+            assessment = assessments.get(item.intervention_id)
+            if assessment is not None:
+                if (assessment.cause != item.cause
+                        or assessment.observed_revision <= item.start_revision):
+                    raise ValueError("intervention outcome does not match its active record")
+                if (assessment.outcome == "inconclusive"
+                        and updated.actions_elapsed < item.evaluation_horizon_actions):
+                    # Partial evidence is not a terminal outcome. Keep the
+                    # intervention live until its declared observation
+                    # horizon so a missing fact cannot trigger early rollback.
+                    interventions.append(updated)
+                    continue
+                outcomes.append(assessment)
+                if assessment.outcome in {"ineffective", "regressed", "unattributed",
+                                          "inconclusive", "expired"}:
+                    expired_causes.add(item.cause)
                 continue
             if item.cause not in triggers:
                 outcomes.append(InterventionOutcome(
                     intervention_id=item.intervention_id, cause=item.cause,
-                    outcome="no_effect", observed_revision=next_revision,
-                    evidence_refs=context.evidence_refs))
+                    outcome="withdrawn", observed_revision=next_revision,
+                    scope=context.scope, attribution="insufficient"))
                 continue
-            if elapsed >= item.expires_after_actions:
+            if elapsed >= item.evaluation_horizon_actions:
                 outcomes.append(InterventionOutcome(
                     intervention_id=item.intervention_id, cause=item.cause,
                     outcome="expired", observed_revision=next_revision,
-                    evidence_refs=context.evidence_refs))
+                    scope=context.scope, attribution="insufficient"))
                 expired_causes.add(item.cause)
                 continue
             interventions.append(updated)
@@ -315,6 +351,12 @@ class BehavioralController:
             item.intervention_id for item in interventions}
         for closed in original.active_interventions:
             if closed.intervention_id not in closed_ids:
+                continue
+            assessed = next((item for item in outcomes
+                             if item.intervention_id == closed.intervention_id), None)
+            if assessed is not None and assessed.outcome == "effective":
+                # A validated effective intervention is retained as the new
+                # behavior baseline. A later DP decision can still revise it.
                 continue
             for target in reversed(closed.targets):
                 if target.target in active_targets or target.target.startswith("statework:"):
@@ -389,7 +431,8 @@ class BehavioralController:
                         ("recovery_level", str(max(0, working.recovery_level - 1)),
                          "progress_observed", "Reduce recovery pressure after objective progress.")]
 
-        existing_causes = {item.cause for item in interventions}
+        existing_causes = ({item.cause for item in interventions}
+                           | (previously_effective & triggers))
         grouped: dict[str, list[tuple[str, str, str, str]]] = {}
         for target, value, cause, effect in proposed:
             if target.startswith("framework:") and target.split(":", 1)[1] == "ward":
@@ -409,7 +452,12 @@ class BehavioralController:
                 expected_effect=expected_effect,
                 targets=tuple((target, previous, value)
                               for target, previous, value, _effect in target_values),
-                expiry=expiry)
+                expiry=expiry,
+                target_criteria=context.objective_criteria,
+                baseline_criterion_status=context.criterion_status,
+                baseline_action_index=context.host_action_index,
+                concurrent_intervention_ids=tuple(
+                    item.intervention_id for item in interventions))
             interventions.append(intervention)
             for target, _previous, value, effect in target_values:
                 operation = ("set_framework" if target.startswith("framework:")
@@ -441,25 +489,54 @@ class BehavioralController:
             context.csw_snapshot.active_stateworks)
         preference = ranked[:1]
         if preference and not any(
-                item.cause == "statework_fit" and any(
-                    target.target == f"statework:{preference[0]}" for target in item.targets)
+                any(target.target == f"statework:{preference[0]}" for target in item.targets)
                 for item in working.active_interventions):
-            intervention = self._new_intervention(
-                scope=context.scope, revision=next_revision, cause="statework_fit",
-                expected_effect="Use the eligible StateWork that best fits the current behavioral mode; CSW validates and commits it.",
-                targets=((f"statework:{preference[0]}", "unselected", "preferred"),),
-                expiry=1)
-            interventions = list(working.active_interventions) + [intervention]
-            directive = BehaviorDirective(
-                directive_id="dir-" + self._digest({
-                    "intervention": intervention.intervention_id,
-                    "statework": preference[0]})[:24],
-                operation="prefer_statework", target=preference[0], value="preferred",
-                cause="statework_fit", expected_effect=intervention.expected_effect,
-                scope=context.scope, expires_after_actions=1,
-                intervention_id=intervention.intervention_id)
-            directives.append(directive)
-            working = replace(working, active_interventions=tuple(interventions[-16:]))
+            # Keep one causal unit when a workflow preference accompanies a
+            # behavioral intervention. Separate simultaneous intervention IDs
+            # would make progress unassignable even though both settings were
+            # applied as one bounded DP decision.
+            prior_intervention_ids = {
+                item.intervention_id for item in original.active_interventions}
+            new_owner = next((item for item in working.active_interventions
+                              if item.intervention_id not in prior_intervention_ids), None)
+            if new_owner is not None:
+                intervention = new_owner
+                updated = replace(
+                    intervention,
+                    targets=intervention.targets + (InterventionTarget(
+                        target=f"statework:{preference[0]}",
+                        previous_value="unselected", applied_value="preferred"),))
+                interventions = [updated if item.intervention_id == updated.intervention_id
+                                 else item for item in working.active_interventions]
+                working = replace(working, active_interventions=tuple(interventions[-16:]))
+            elif working.active_interventions:
+                # Do not overlap a new workflow-selection intervention with a
+                # still-evaluating behavior change. Reconsider after its
+                # evidence window closes.
+                preference = ()
+            else:
+                intervention = self._new_intervention(
+                    scope=context.scope, revision=next_revision, cause="statework_fit",
+                    expected_effect="Use the eligible StateWork that best fits the current behavioral mode; CSW validates and commits it.",
+                    targets=((f"statework:{preference[0]}", "unselected", "preferred"),),
+                    expiry=1,
+                    target_criteria=context.objective_criteria,
+                    baseline_criterion_status=context.criterion_status,
+                    baseline_action_index=context.host_action_index,
+                    concurrent_intervention_ids=tuple(
+                        item.intervention_id for item in interventions))
+                interventions = list(working.active_interventions) + [intervention]
+            if preference:
+                directive = BehaviorDirective(
+                    directive_id="dir-" + self._digest({
+                        "intervention": intervention.intervention_id,
+                        "statework": preference[0]})[:24],
+                    operation="prefer_statework", target=preference[0], value="preferred",
+                    cause=intervention.cause, expected_effect=intervention.expected_effect,
+                    scope=context.scope, expires_after_actions=1,
+                    intervention_id=intervention.intervention_id)
+                directives.append(directive)
+                working = replace(working, active_interventions=tuple(interventions[-16:]))
         else:
             preference = ()
 
