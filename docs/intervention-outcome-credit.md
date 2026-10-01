@@ -22,6 +22,13 @@ Each reference is resolved through an injected `OutcomeEvidenceAuthority`;
 source and kind must match an allowed authority. Raw model text cannot create
 an outcome fact.
 
+When a host supplies the complete task set, the evaluator also records target
+criterion progress, required criteria remaining, newly verified or blocked
+criteria, required-work regressions, attention coverage, and maximum
+starvation age. Target progress is not effective if another required
+criterion regresses or any runnable required criterion exceeds the fairness
+bound. The agent and the semantic provider cannot author these deltas.
+
 The result distinguishes:
 
 - `effective`: objective progress is verified for the target criterion in an
@@ -56,6 +63,11 @@ receipts and resolve each evidence reference against the authoritative stores
 before calling it. The resulting typed `InterventionOutcome` can then be
 passed to `FastLoopInput.intervention_assessments`; the controller closes that
 intervention and retains, releases, or blocks behavior accordingly.
+
+Application and outcome event payloads enter the DP runtime outbox in the same
+SQLite transaction as the corresponding behavior-state revision. Delivery to
+the event store is idempotent by stable event ID, so a crash after state commit
+does not silently discard the credit-assignment record.
 
 The evidence resolver is an explicit dependency so the evaluator does not
 silently trust caller-provided labels. DigitalPsychology's `RuntimeSession`

@@ -21,7 +21,7 @@
       "required": ["directive_id", "operation", "target", "value", "cause", "expected_effect", "scope", "expires_after_actions", "intervention_id"],
       "properties": {
         "directive_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "operation": {"enum": ["set_mode", "set_framework", "set_control", "prefer_statework"]},
+        "operation": {"enum": ["set_mode", "set_framework", "set_control", "prefer_statework", "release_statework"]},
         "target": {"type": "string", "minLength": 1, "maxLength": 128},
         "value": {"type": "string", "minLength": 1, "maxLength": 2048},
         "cause": {"type": "string", "minLength": 1, "maxLength": 128},
@@ -47,7 +47,9 @@
         "artifact_changed": {"type": ["boolean", "null"]},
         "repeated_approach": {"type": ["boolean", "null"]},
         "verification_quality": {"enum": ["improved", "unchanged", "degraded", "unknown"]},
-        "comparison_id": {"type": ["string", "null"], "maxLength": 128}
+        "comparison_id": {"type": ["string", "null"], "maxLength": 128},
+        "target_criteria": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+        "task_set_outcome": {"oneOf": [{"type": "null"}, {"$ref": "behavior-state-v1.schema.json#/$defs/taskSetOutcome"}]}
       }
     }
   }

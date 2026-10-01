@@ -910,6 +910,24 @@
           "type": "array", "uniqueItems": true, "maxItems": 8,
           "items": {"type": "string", "minLength": 1, "maxLength": 128}
         },
+        "behavior_intervention_task_set_outcome": {
+          "type": ["object", "null"], "additionalProperties": false,
+          "required": ["targeted_progress_delta", "total_required_remaining_before",
+                       "total_required_remaining_after", "newly_verified", "newly_blocked",
+                       "regressions", "max_starvation_before", "max_starvation_after",
+                       "attention_coverage_delta"],
+          "properties": {
+            "targeted_progress_delta": {"type": "integer", "minimum": 0},
+            "total_required_remaining_before": {"type": "integer", "minimum": 0},
+            "total_required_remaining_after": {"type": "integer", "minimum": 0},
+            "newly_verified": {"type": "array", "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "newly_blocked": {"type": "array", "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "regressions": {"type": "array", "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+            "max_starvation_before": {"type": "integer", "minimum": 0},
+            "max_starvation_after": {"type": "integer", "minimum": 0},
+            "attention_coverage_delta": {"type": "integer"}
+          }
+        },
         "behavior_intervention_criterion_progress": {
           "type": "array", "uniqueItems": true, "maxItems": 8,
           "items": {"type": "string", "minLength": 1, "maxLength": 128}

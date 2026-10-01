@@ -8,7 +8,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from lib.behavior_state import (BehaviorIntervention, InterventionTarget)
+from lib.behavior_state import (BehaviorIntervention, GoalItemSnapshot,
+                                GoalSetSnapshot, InterventionTarget)
 from lib.behavior_state import BehaviorDirective
 from lib.outcomes import (HostOutcomeFact, InterventionEventContext,
                           InterventionEvaluationFrame, InterventionEvaluator)
@@ -26,7 +27,8 @@ class _EvidenceAuthority:
         return self.facts[evidence_ref]
 
 
-def _intervention(*, baseline="unmet", concurrent=()):
+def _intervention(*, baseline="unmet", concurrent=(), baseline_goal_set=None,
+                  baseline_attention_last_seen=None):
     return BehaviorIntervention(
         intervention_id="intv-1", cause="goal_drift",
         expected_effect="produce criterion-directed progress",
@@ -37,6 +39,8 @@ def _intervention(*, baseline="unmet", concurrent=()):
         baseline_criterion_status={"criterion-visual": baseline},
         baseline_action_index=10, evaluation_horizon_actions=3,
         concurrent_intervention_ids=tuple(concurrent),
+        baseline_goal_set=baseline_goal_set,
+        baseline_attention_last_seen=baseline_attention_last_seen or {},
     )
 
 
@@ -45,11 +49,13 @@ def _fact(reference, kind, source, *, criterion_id=None, revision=6):
                            action_index=12)
 
 
-def _frame(*refs, competitors=(), complete=True, action_index=13):
+def _frame(*refs, competitors=(), complete=True, action_index=13,
+           goal_set=None, attention_last_seen=None):
     return InterventionEvaluationFrame(
         scope=SCOPE, observed_revision=6, action_index=action_index,
         evaluation_complete=complete, applied_intervention_ids=("intv-1",),
         competing_intervention_ids=tuple(competitors), evidence_refs=tuple(refs),
+        goal_set=goal_set, attention_last_seen=attention_last_seen or {},
     )
 
 
@@ -181,6 +187,84 @@ def test_evaluation_horizon_cannot_be_closed_early():
             _intervention(), _frame(complete=True, action_index=11),
             authority=_EvidenceAuthority({}),
         )
+
+
+def test_task_set_outcome_requires_target_progress_without_regression():
+    before = GoalSetSnapshot(1, (
+        GoalItemSnapshot("criterion-visual", status="READY"),
+        GoalItemSnapshot("criterion-docs", status="READY"),
+    ))
+    after = GoalSetSnapshot(2, (
+        GoalItemSnapshot("criterion-visual", status="VERIFIED"),
+        GoalItemSnapshot("criterion-docs", status="READY"),
+    ))
+    attention = {"criterion-visual": 10, "criterion-docs": 10}
+    intervention = _intervention(
+        baseline_goal_set=before, baseline_attention_last_seen=attention)
+
+    outcome = InterventionEvaluator().assess(
+        intervention,
+        _frame(goal_set=after, attention_last_seen=attention),
+        authority=_EvidenceAuthority({}),
+    )
+
+    assert outcome.outcome == "effective"
+    assert outcome.target_criteria == ("criterion-visual",)
+    assert outcome.task_set_outcome is not None
+    assert outcome.task_set_outcome.targeted_progress_delta == 1
+    assert outcome.task_set_outcome.total_required_remaining_before == 2
+    assert outcome.task_set_outcome.total_required_remaining_after == 1
+    assert outcome.task_set_outcome.newly_verified == ("criterion-visual",)
+    assert not outcome.task_set_outcome.regressions
+
+
+def test_task_set_regression_blocks_credit_even_when_target_progresses():
+    before = GoalSetSnapshot(1, (
+        GoalItemSnapshot("criterion-visual", status="READY"),
+        GoalItemSnapshot("criterion-auth", status="VERIFIED"),
+    ))
+    after = GoalSetSnapshot(2, (
+        GoalItemSnapshot("criterion-visual", status="VERIFIED"),
+        GoalItemSnapshot("criterion-auth", status="ACTIVE"),
+    ))
+    attention = {"criterion-visual": 10, "criterion-auth": 10}
+
+    outcome = InterventionEvaluator().assess(
+        _intervention(baseline_goal_set=before,
+                      baseline_attention_last_seen=attention),
+        _frame(goal_set=after, attention_last_seen=attention),
+        authority=_EvidenceAuthority({}),
+    )
+
+    assert outcome.outcome == "regressed"
+    assert outcome.task_set_outcome is not None
+    assert outcome.task_set_outcome.regressions == ("criterion-auth",)
+
+
+def test_progress_on_unrelated_criterion_does_not_credit_targeted_intervention():
+    before = GoalSetSnapshot(1, (
+        GoalItemSnapshot("criterion-visual", status="READY"),
+        GoalItemSnapshot("criterion-auth", status="READY"),
+    ))
+    after = GoalSetSnapshot(2, (
+        GoalItemSnapshot("criterion-visual", status="READY"),
+        GoalItemSnapshot("criterion-auth", status="VERIFIED"),
+    ))
+    attention = {"criterion-visual": 10, "criterion-auth": 10}
+
+    outcome = InterventionEvaluator().assess(
+        _intervention(baseline_goal_set=before,
+                      baseline_attention_last_seen=attention),
+        _frame(goal_set=after, attention_last_seen=attention),
+        authority=_EvidenceAuthority({}),
+    )
+
+    assert outcome.outcome == "inconclusive"
+    assert outcome.goal_progress is None
+    assert outcome.target_criteria == ("criterion-visual",)
+    assert outcome.task_set_outcome is not None
+    assert outcome.task_set_outcome.targeted_progress_delta == 0
+    assert outcome.task_set_outcome.newly_verified == ("criterion-auth",)
 
 
 def test_host_application_and_assessment_are_persisted_as_authenticated_events(tmp_path):

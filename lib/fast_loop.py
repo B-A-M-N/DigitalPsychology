@@ -13,8 +13,9 @@ import json
 from typing import Any, Mapping, Optional, Protocol
 
 from .behavior_state import (
-    BehaviorIntervention, BehaviorState, BehaviorDirective, BehavioralDecision,
-    CSWBehaviorSnapshot, FrameworkSignal, InterventionOutcome,
+    AttentionLease, BehaviorIntervention, BehaviorState, BehaviorDirective,
+    BehavioralDecision, CSWBehaviorSnapshot, FrameworkSignal, GoalSetSnapshot,
+    InterventionOutcome,
     InterventionTarget, StateWorkOption,
 )
 
@@ -67,6 +68,9 @@ class FastLoopInput:
     state: BehaviorState
     csw_snapshot: CSWBehaviorSnapshot
     objective_criteria: tuple[str, ...] = ()
+    goal_set: GoalSetSnapshot | None = None
+    attention_lease: AttentionLease | None = None
+    attention_last_seen: Mapping[str, int] = field(default_factory=dict)
     cfw_signals: tuple[FrameworkSignal, ...] = ()
     active_trigger_codes: tuple[str, ...] = ()
     actions_since_goal_progress: int = 0
@@ -86,8 +90,8 @@ class FastLoopInput:
     def __post_init__(self) -> None:
         if not isinstance(self.scope, str) or not self.scope.strip() or len(self.scope) > 256:
             raise ValueError("fast-loop scope must be non-empty bounded text")
-        if len(self.objective_criteria) > 8 or len(set(self.objective_criteria)) != len(self.objective_criteria):
-            raise ValueError("objective criteria must be unique and bounded to eight")
+        if len(self.objective_criteria) > 256 or len(set(self.objective_criteria)) != len(self.objective_criteria):
+            raise ValueError("objective criteria must be unique and bounded to 256")
         if any(not isinstance(value, str) or not value or len(value) > 128
                for value in self.objective_criteria):
             raise ValueError("objective criterion IDs must be bounded text")
@@ -111,12 +115,29 @@ class FastLoopInput:
                 for value in self.evidence_refs):
             raise ValueError("evidence references must be bounded")
         statuses = dict(self.criterion_status or {})
-        if len(statuses) > 8 or not set(statuses).issubset(set(self.objective_criteria)):
+        if len(statuses) > 256 or not set(statuses).issubset(set(self.objective_criteria)):
             raise ValueError("criterion status must be bounded to objective criteria")
         if any(status not in {"unmet", "in_progress", "verified", "blocked", "unknown"}
                for status in statuses.values()):
             raise ValueError("unsupported host criterion status")
         object.__setattr__(self, "criterion_status", statuses)
+        if self.goal_set is not None:
+            if not isinstance(self.goal_set, GoalSetSnapshot):
+                raise ValueError("fast-loop goal_set must be a validated host snapshot")
+            if set(item.criterion_id for item in self.goal_set.items) != set(self.objective_criteria):
+                raise ValueError("goal set must exactly cover the complete runtime objective")
+        if self.attention_lease is not None:
+            if not isinstance(self.attention_lease, AttentionLease):
+                raise ValueError("attention lease must be validated")
+            if not set(self.attention_lease.criterion_ids).issubset(set(self.objective_criteria)):
+                raise ValueError("attention lease escapes the full objective set")
+        seen = dict(self.attention_last_seen or {})
+        if len(seen) > 256 or not set(seen).issubset(set(self.objective_criteria)):
+            raise ValueError("attention history must be bounded to objective criteria")
+        if any(type(key) is not str or type(value) is not int or value < 0
+               for key, value in seen.items()):
+            raise ValueError("attention history entries are malformed")
+        object.__setattr__(self, "attention_last_seen", seen)
         if len(self.intervention_assessments) > 16:
             raise ValueError("intervention assessment count exceeds its bound")
         assessment_ids = [item.intervention_id for item in self.intervention_assessments]
@@ -202,7 +223,8 @@ class BehavioralController:
             modes[key] = value
             return replace(state, framework_modes=modes)
         if target == "focus_criteria":
-            return replace(state, focus_criteria=tuple(json.loads(value)))
+            return replace(state, focus_criteria=tuple(json.loads(value)),
+                           attention_lease=None)
         if target == "statework_preference":
             return state
         if target in {"verification_intensity", "exploration_budget", "retry_policy",
@@ -219,7 +241,10 @@ class BehavioralController:
                           target_criteria: tuple[str, ...] = (),
                           baseline_criterion_status: Optional[Mapping[str, str]] = None,
                           baseline_action_index: int = 0,
-                          concurrent_intervention_ids: tuple[str, ...] = ()) -> BehaviorIntervention:
+                          concurrent_intervention_ids: tuple[str, ...] = (),
+                          baseline_goal_set: GoalSetSnapshot | None = None,
+                          baseline_attention_last_seen: Mapping[str, int] | None = None
+                          ) -> BehaviorIntervention:
         intervention_id = "intv-" + self._digest({
             "scope": scope, "revision": revision, "cause": cause,
             "targets": targets, "target_criteria": target_criteria,
@@ -239,7 +264,9 @@ class BehavioralController:
             },
             baseline_action_index=baseline_action_index,
             evaluation_horizon_actions=expiry or self.intervention_expiry_actions,
-            concurrent_intervention_ids=concurrent_intervention_ids)
+            concurrent_intervention_ids=concurrent_intervention_ids,
+            baseline_goal_set=baseline_goal_set,
+            baseline_attention_last_seen=baseline_attention_last_seen or {})
 
     @staticmethod
     def _rank_stateworks(mode: str, options: tuple[StateWorkOption, ...],
@@ -273,16 +300,56 @@ class BehavioralController:
         codes = {signal.code for signal in context.cfw_signals if signal.active}
         codes.update(context.active_trigger_codes)
 
+        attention_ids = (context.attention_lease.criterion_ids
+                         if context.attention_lease is not None
+                         else original.focus_criteria)
+        goal_items = ({item.criterion_id: item for item in context.goal_set.items}
+                      if context.goal_set is not None else {})
+        focused_items = [goal_items[item] for item in attention_ids if item in goal_items]
+        multi_item_task = (context.goal_set is not None
+                           and sum(item.required for item in context.goal_set.items) > 1)
+        if context.goal_set is not None:
+            focused_retry_count = max(
+                (item.equivalent_retry_count for item in focused_items), default=0)
+            focused_stall_count = max(
+                (item.actions_since_progress for item in focused_items), default=0)
+            focused_progress = any(
+                item.last_progress_action == context.host_action_index
+                for item in focused_items)
+            runnable_count = len(context.goal_set.runnable_items)
+            required_counts = context.goal_set.required_counts
+            task_complete = (required_counts["total"] > 0
+                             and required_counts["remaining_required"] == 0)
+        else:
+            focused_retry_count = context.equivalent_retry_count
+            focused_stall_count = context.actions_since_goal_progress
+            focused_progress = context.progress_made
+            runnable_count = len(context.objective_criteria)
+            task_complete = False
+
+        scoped_retry_signal = any(
+            signal.active and signal.code == "equivalent_retry"
+            and (signal.criterion_id in attention_ids or not multi_item_task)
+            for signal in context.cfw_signals)
+        scoped_support_signal = any(
+            signal.active and signal.code == "support_work_budget_exceeded"
+            and (signal.criterion_id in attention_ids or not multi_item_task)
+            for signal in context.cfw_signals)
+        unscoped_retry = ("equivalent_retry" in context.active_trigger_codes
+                          and not multi_item_task)
+        unscoped_support = ("support_work_budget_exceeded" in context.active_trigger_codes
+                            and not multi_item_task)
+
         contradiction = bool(codes & {"operator_contradiction", "stale_assumption"})
-        retry = (context.equivalent_retry_count >= self.retry_threshold
+        retry = (focused_retry_count >= self.retry_threshold
                  or (semantic.retry_relation == "equivalent_retry"
                      and semantic.retry_confidence >= self.semantic_threshold)
-                 or "equivalent_retry" in codes)
-        drift = (context.actions_since_goal_progress >= self.support_action_threshold
-                 or "support_work_budget_exceeded" in codes
+                 or scoped_retry_signal or unscoped_retry)
+        drift = (focused_stall_count >= self.support_action_threshold
+                 or scoped_support_signal or unscoped_support
                  or (semantic.goal_drift is True
                      and semantic.goal_drift_confidence >= self.semantic_threshold)) \
-                and not context.progress_made
+                and not focused_progress
         pressure = (context.context_pressure >= 0.85 or "context_pressure_high" in codes)
 
         triggers: set[str] = set()
@@ -295,24 +362,29 @@ class BehavioralController:
             triggers.add("goal_drift")
         if pressure:
             triggers.add("context_pressure")
+        def applies_to_attention(criterion_ids: tuple[str, ...]) -> bool:
+            return not criterion_ids or not attention_ids or bool(
+                set(criterion_ids) & set(attention_ids))
+
         previously_failed = {
             item.cause for item in original.intervention_history
             if item.outcome in {"ineffective", "regressed", "unattributed",
                                 "inconclusive", "expired"}
+            and applies_to_attention(item.target_criteria)
         }
         blocking_failed_causes = previously_failed & triggers
         if blocking_failed_causes:
             triggers.add("failed_cause_blocked")
         previously_effective = {
             item.cause for item in original.intervention_history
-            if item.outcome == "effective"
+            if item.outcome == "effective" and applies_to_attention(item.target_criteria)
         } | {item.cause for item in context.intervention_assessments
-             if item.outcome == "effective"}
+             if item.outcome == "effective" and applies_to_attention(item.target_criteria)}
 
         interventions: list[BehaviorIntervention] = []
         outcomes: list[InterventionOutcome] = []
         directives: list[BehaviorDirective] = []
-        expired_causes: set[str] = set()
+        expired_causes: set[tuple[str, tuple[str, ...]]] = set()
         assessments = {item.intervention_id: item
                        for item in context.intervention_assessments}
         active_ids = {item.intervention_id for item in original.active_interventions}
@@ -337,26 +409,32 @@ class BehavioralController:
                 outcomes.append(assessment)
                 if assessment.outcome in {"ineffective", "regressed", "unattributed",
                                           "inconclusive", "expired"}:
-                    expired_causes.add(item.cause)
+                    expired_causes.add((item.cause, item.target_criteria))
                 continue
             if item.cause not in triggers:
                 outcomes.append(InterventionOutcome(
                     intervention_id=item.intervention_id, cause=item.cause,
                     outcome="withdrawn", observed_revision=next_revision,
-                    scope=context.scope, attribution="insufficient"))
+                    scope=context.scope, attribution="insufficient",
+                    target_criteria=item.target_criteria))
                 continue
             if elapsed >= item.evaluation_horizon_actions:
                 outcomes.append(InterventionOutcome(
                     intervention_id=item.intervention_id, cause=item.cause,
                     outcome="expired", observed_revision=next_revision,
-                    scope=context.scope, attribution="insufficient"))
-                expired_causes.add(item.cause)
+                    scope=context.scope, attribution="insufficient",
+                    target_criteria=item.target_criteria))
+                expired_causes.add((item.cause, item.target_criteria))
                 continue
             interventions.append(updated)
 
         # Restore the settings owned by a closed intervention, unless another
         # still-active intervention currently owns that same target.
         active_targets = {target.target for item in interventions for target in item.targets}
+        next_focus = (context.attention_lease.criterion_ids
+                      if context.attention_lease is not None else ())
+        if next_focus != working.focus_criteria:
+            active_targets.add("focus_criteria")
         closed_ids = {item.intervention_id for item in original.active_interventions} - {
             item.intervention_id for item in interventions}
         for closed in original.active_interventions:
@@ -364,12 +442,27 @@ class BehavioralController:
                 continue
             assessed = next((item for item in outcomes
                              if item.intervention_id == closed.intervention_id), None)
-            if assessed is not None and assessed.outcome == "effective":
-                # A validated effective intervention is retained as the new
-                # behavior baseline. A later DP decision can still revise it.
-                continue
             for target in reversed(closed.targets):
-                if target.target in active_targets or target.target.startswith("statework:"):
+                if target.target in active_targets:
+                    continue
+                if target.target.startswith("statework:"):
+                    if target.previous_value == "unselected":
+                        statework_id = target.target.split(":", 1)[1]
+                        directives.append(BehaviorDirective(
+                            directive_id="dir-" + self._digest({
+                                "intervention": closed.intervention_id,
+                                "target": target.target, "value": "unselected",
+                                "revision": next_revision})[:24],
+                            operation="release_statework", target=statework_id,
+                            value="unselected", cause=(
+                                "intervention_expired" if any(
+                                    outcome.intervention_id == closed.intervention_id
+                                    and outcome.outcome == "expired"
+                                    for outcome in outcomes) else "trigger_cleared"),
+                            expected_effect=(
+                                "Release the CSW StateWork activated by this temporary DP lease."),
+                            scope=context.scope, expires_after_actions=1,
+                            intervention_id=closed.intervention_id))
                     continue
                 before = self._target_value(working, target.target)
                 working = self._set_target(working, target.target, target.previous_value)
@@ -394,7 +487,10 @@ class BehavioralController:
                     scope=context.scope, expires_after_actions=1,
                     intervention_id=closed.intervention_id))
 
-        failed_intervention = bool(blocking_failed_causes or expired_causes & triggers)
+        failed_intervention = bool(
+            blocking_failed_causes
+            or any(cause in triggers and applies_to_attention(target_criteria)
+                   for cause, target_criteria in expired_causes))
         if failed_intervention:
             triggers.add("failed_cause_blocked")
 
@@ -406,10 +502,23 @@ class BehavioralController:
             proposed = [("mode", "REINSPECT", cause, "Reopen the evidence base before continuing."),
                         ("framework:owl", "elevated", cause, "Recheck assumptions against current evidence."),
                         ("framework:anchor", "reopen", cause, "Reanchor the active task to current evidence.")]
+        elif task_complete:
+            reason = "all required host-owned criteria are verified"
+            proposed = [("mode", "READY_TO_COMPLETE", "required_criteria_verified",
+                         "The complete required task set is verified by host evidence.")]
         elif failed_intervention:
-            reason = "stop repeating an expired or regressing intervention while its cause remains active"
-            proposed = [("mode", "BLOCKED", "failed_cause_blocked",
-                         "Require a fresh plan or operator input before retrying this behavioral change.")]
+            if runnable_count > 0:
+                reason = "yield this criterion after an ineffective recovery window and continue runnable work"
+                proposed = [("mode", "REPLAN", "failed_criterion_yielded",
+                             "Rotate to other runnable criteria after the bounded recovery window.")]
+            else:
+                reason = "stop because no required criterion remains runnable"
+                proposed = [("mode", "BLOCKED", "failed_cause_blocked",
+                             "Require an authority update or operator input before continuing.")]
+        elif context.goal_set is not None and runnable_count == 0:
+            reason = "no required criterion is currently runnable"
+            proposed = [("mode", "BLOCKED", "no_runnable_required_criteria",
+                         "Wait for the host to unblock or reprioritize required work.")]
         elif retry or drift:
             cause = "equivalent_retry" if retry else "goal_drift"
             reason = ("require a materially different recovery attempt" if retry
@@ -424,7 +533,7 @@ class BehavioralController:
                         ("recovery_level", str(min(3, working.recovery_level + 1)), cause,
                          "Make one bounded recovery attempt and reassess.")]
             if drift:
-                proposed.append(("focus_criteria", json.dumps(list(context.objective_criteria),
+                proposed.append(("focus_criteria", json.dumps(list(attention_ids),
                                                                separators=(",", ":")), cause,
                                  "Keep the next action bound to unfinished objective criteria."))
         elif pressure:
@@ -434,14 +543,28 @@ class BehavioralController:
                          "Retain active criteria, current authoritative state, and the next action."),
                         ("exploration_budget", "low", cause,
                          "Reduce context growth until pressure returns to normal.")]
-        elif context.progress_made:
+        elif focused_progress:
             reason = "objective progress observed; release stale recovery constraints"
             proposed = [("mode", "VERIFY" if context.artifact_changed else "DELIVER",
                          "progress_observed", "Continue from the new objective progress."),
                         ("recovery_level", str(max(0, working.recovery_level - 1)),
                          "progress_observed", "Reduce recovery pressure after objective progress.")]
 
-        existing_causes = ({item.cause for item in interventions}
+        if next_focus != working.focus_criteria:
+            lease_key = (context.attention_lease.lease_id[-16:]
+                         if context.attention_lease is not None else "released")
+            attention_cause = (proposed[0][2] if proposed
+                               else f"attention_lease_{lease_key}")
+            proposed = [(target, value, attention_cause, effect)
+                        for target, value, _cause, effect in proposed
+                        if target != "focus_criteria"]
+            proposed.append((
+                "focus_criteria", json.dumps(list(next_focus), separators=(",", ":")),
+                attention_cause,
+                "Give runnable required criteria a bounded, starvation-aware attention window."))
+
+        existing_causes = ({item.cause for item in interventions
+                            if applies_to_attention(item.target_criteria)}
                            | (previously_effective & triggers))
         grouped: dict[str, list[tuple[str, str, str, str]]] = {}
         for target, value, cause, effect in proposed:
@@ -467,11 +590,13 @@ class BehavioralController:
                 targets=tuple((target, previous, value)
                               for target, previous, value, _effect in target_values),
                 expiry=expiry,
-                target_criteria=context.objective_criteria,
+                target_criteria=tuple(next_focus or attention_ids),
                 baseline_criterion_status=context.criterion_status,
                 baseline_action_index=context.host_action_index,
                 concurrent_intervention_ids=tuple(
-                    item.intervention_id for item in interventions))
+                    item.intervention_id for item in interventions),
+                baseline_goal_set=context.goal_set,
+                baseline_attention_last_seen=context.attention_last_seen)
             interventions.append(intervention)
             for target, _previous, value, effect in target_values:
                 operation = ("set_framework" if target.startswith("framework:")
@@ -490,6 +615,9 @@ class BehavioralController:
         working = replace(
             working,
             revision=next_revision,
+            focus_criteria=next_focus,
+            attention_lease=context.attention_lease,
+            attention_last_seen=context.attention_last_seen,
             active_stateworks=context.csw_snapshot.active_stateworks,
             active_interventions=tuple(interventions[-16:]),
             intervention_history=tuple(
@@ -534,11 +662,13 @@ class BehavioralController:
                     expected_effect="Use the eligible StateWork that best fits the current behavioral mode; CSW validates and commits it.",
                     targets=((f"statework:{preference[0]}", "unselected", "preferred"),),
                     expiry=1,
-                    target_criteria=context.objective_criteria,
+                    target_criteria=tuple(next_focus or attention_ids),
                     baseline_criterion_status=context.criterion_status,
                     baseline_action_index=context.host_action_index,
                     concurrent_intervention_ids=tuple(
-                        item.intervention_id for item in interventions))
+                        item.intervention_id for item in interventions),
+                    baseline_goal_set=context.goal_set,
+                    baseline_attention_last_seen=context.attention_last_seen)
                 interventions = list(working.active_interventions) + [intervention]
             if preference:
                 directive = BehaviorDirective(

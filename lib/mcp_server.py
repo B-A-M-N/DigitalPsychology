@@ -145,6 +145,17 @@ class DigitalPsychologyService:
             applied_directive_ids: tuple[str, ...], *,
             event_context: InterventionEventContext) -> str:
         """Persist a host receipt after the runtime actually applies directives."""
+        event = self.prepare_intervention_application(
+            intervention, directives, applied_directive_ids,
+            event_context=event_context)
+        return self.dispatch_runtime_event(event)
+
+    def prepare_intervention_application(
+            self, intervention: BehaviorIntervention,
+            directives: tuple[BehaviorDirective, ...],
+            applied_directive_ids: tuple[str, ...], *,
+            event_context: InterventionEventContext) -> dict[str, Any]:
+        """Build the authenticated receipt for atomic insertion in the host outbox."""
         required = {item.directive_id for item in directives
                     if item.intervention_id == intervention.intervention_id}
         applied = set(applied_directive_ids)
@@ -167,14 +178,21 @@ class DigitalPsychologyService:
                 list(intervention.concurrent_intervention_ids),
             "behavior_intervention_directive_ids": sorted(applied),
         }
-        return self._record_intervention_event(
+        return self._build_intervention_event(
             event_context, category="decision", event_type="behavior_intervention_applied",
-            scope=intervention.scope, evidence_refs=(), payload=payload)
+            scope=intervention.scope, evidence_refs=(), payload=payload).to_dict()
 
     def record_intervention_outcome(
             self, outcome: InterventionOutcome, *,
             event_context: InterventionEventContext) -> str:
         """Durably join independent outcome evidence to the applied intervention."""
+        event = self.prepare_intervention_outcome(outcome, event_context=event_context)
+        return self.dispatch_runtime_event(event)
+
+    def prepare_intervention_outcome(
+            self, outcome: InterventionOutcome, *,
+            event_context: InterventionEventContext) -> dict[str, Any]:
+        """Build an assessed outcome for atomic insertion in the host outbox."""
         payload = {
             "behavior_intervention_id": outcome.intervention_id,
             "behavior_intervention_cause": outcome.cause,
@@ -182,20 +200,52 @@ class DigitalPsychologyService:
             "behavior_intervention_attribution": outcome.attribution,
             "behavior_intervention_criterion_progress":
                 list(outcome.criterion_ids_progressed),
+            "behavior_intervention_target_criteria": list(outcome.target_criteria),
+            "behavior_intervention_task_set_outcome": (
+                outcome.task_set_outcome.to_dict()
+                if outcome.task_set_outcome is not None else None),
             "behavior_intervention_goal_progress": outcome.goal_progress,
             "behavior_intervention_comparison_id": outcome.comparison_id,
             "behavior_intervention_artifact_changed": outcome.artifact_changed,
             "behavior_intervention_repeated_approach": outcome.repeated_approach,
             "behavior_intervention_verification_quality": outcome.verification_quality,
         }
-        return self._record_intervention_event(
+        return self._build_intervention_event(
             event_context, category="validation", event_type="behavior_intervention_assessed",
-            scope=outcome.scope, evidence_refs=outcome.evidence_refs, payload=payload)
+            scope=outcome.scope, evidence_refs=outcome.evidence_refs,
+            payload=payload).to_dict()
+
+    def dispatch_runtime_event(self, value: Mapping[str, Any]) -> str:
+        """Idempotently deliver a trusted host event from the runtime outbox."""
+        if not isinstance(value, Mapping):
+            raise ValueError("runtime outbox event must be an object")
+        event = EventFactory.from_dict(dict(value))
+        allowed = {
+            ("decision", "behavior_intervention_applied",
+             "digitalpsychology_runtime", "digitalpsychology_runtime"),
+            ("validation", "behavior_intervention_assessed",
+             "digitalpsychology_runtime", "host_outcome_evaluator"),
+        }
+        identity = (event.category, event.event_type, event.actor_id,
+                    event.authority_source)
+        if identity not in allowed:
+            raise ValueError("runtime outbox event is outside the trusted DP host contract")
+        self._sink.emit_authenticated(event, authenticated=True)
+        return event.event_id
 
     def _record_intervention_event(
             self, event_context: InterventionEventContext, *, category: str,
             event_type: str, scope: str, evidence_refs: tuple[str, ...],
             payload: Mapping[str, Any]) -> str:
+        return self.dispatch_runtime_event(self._build_intervention_event(
+            event_context, category=category, event_type=event_type,
+            scope=scope, evidence_refs=evidence_refs, payload=payload).to_dict())
+
+    @staticmethod
+    def _build_intervention_event(
+            event_context: InterventionEventContext, *, category: str,
+            event_type: str, scope: str, evidence_refs: tuple[str, ...],
+            payload: Mapping[str, Any]) -> Event:
         event_id = f"dp-intv-{uuid.uuid4().hex}"
         event = Event(
             event_id=event_id,
@@ -220,11 +270,7 @@ class DigitalPsychologyService:
             evidence_refs=list(evidence_refs),
             payload=dict(payload),
         )
-        # This event is minted only by the host-only runtime API after it has
-        # applied directives or resolved outcome evidence. Agent ingestion does
-        # not receive this capability.
-        self._sink.emit_authenticated(event, authenticated=True)
-        return event_id
+        return event
 
     def _producer_key(self, key_id: str) -> bytes:
         raw = os.environ.get(f"DIGITALPSYCHOLOGY_INGESTION_KEY_{key_id}", "")

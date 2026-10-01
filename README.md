@@ -29,10 +29,11 @@ Implemented capabilities include:
 - **A deterministic fast-loop controller** that emits typed `BehavioralDecision`, `BehaviorDirective`, and `BehaviorState` values from bounded CFW/CSW/runtime inputs.
 - **An independent intervention outcome evaluator** that accepts only scoped, post-intervention host/CSW/validator evidence and an exact applied-directive receipt. It distinguishes supported progress, regression, confounding, missing evidence, and expired windows; agent success claims are not evidence.
 - **Intervention lifecycle records** with cause, expected effect, target criteria, baseline status, start action, bounded horizon, scope, expiry, and measured outcome; cleared or expired interventions emit explicit release directives.
+- **Transactional intervention event outbox** that commits authenticated application and outcome events with the DP behavior revision, then retries delivery idempotently after restarts.
 - **Constrained StateWork preferences** ranked only from the eligible choices supplied by CSW. DP cannot commit or legalize a CSW transition.
 - **Revisioned DP runtime sessions** that coordinate CFW signals and directives, CSW snapshots and activation, context projection, evidence assessment, and authenticated intervention/outcome events.
 
-DP can run without CFW or CSW installed when the host supplies no external signals. CFW and CSW remain operational without DP; an MCP host may use the CFW startup preset and CSW authority without adaptive DP control.
+DP's telemetry, experiments, and deterministic controller do not require CFW or CSW packages. The cross-system `RuntimeHost` uses explicit ports to coordinate CFW and CSW. CFW and CSW also remain independently usable; the complete adaptive deployment runs CFW, CSW, and DP together, with each repository retaining its own authority.
 
 Runtime session orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed as agent-facing MCP tools. `RuntimeHost` opens scoped `RuntimeSession` instances; each session uses compare-and-swap for DP state, asks CFW to validate/apply controls, and asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
 
@@ -76,6 +77,7 @@ The slow loop is explicitly invoked; it is not an automatic background worker. I
 - **DP alone:** use the package, SQLite event store, trajectory reconstruction, experiment receipts, and slow-loop service independently.
 - **DP + CFW:** `CFWRuntimeAdapter` consumes validated CFW signals, applies bounded DP directives through CFW's declared host API, and projects the committed DP context at model/tool-planning boundaries.
 - **DP + CSW:** `CSWRuntimeAdapter` reads CSW-owned active workflow selections and eligible candidates. DP can rank those choices; CSW activates them and remains the source of legal workflow state, evidence, and transitions.
+- **CFW + CSW + DP:** the intended adaptive deployment. CFW provides cognitive components and reversible actuators, CSW supplies authoritative workflow state and legal transitions, and DP coordinates bounded interventions and assigns credit from external evidence.
 - **CFW + CSW without DP:** both runtime authorities continue to work with no DP service installed.
 
 ### Optional Laya System-1 provider
@@ -345,16 +347,18 @@ DP therefore records interaction and delegation provenance and distinguishes ind
 
 ## Fast loop versus slow loop
 
-DigitalPsychology primarily belongs to the **slow loop**.
+DigitalPsychology owns both the bounded fast controller and the evidence driven slow learner.
 
 ```text
-During a task:  CFW + CSW → govern current execution
+During a task:  CFW + CSW → observe and govern their domains
+                DP → select bounded behavior interventions
+                host evidence → score each intervention
 
 Across tasks:   DP → reconstruct → compare → experiment
                   → validate → affect future composition
 ```
 
-Allowing DP to casually rewrite a running task's policy would make it difficult to determine whether an observed change was caused by the intervention. Emergency containment is separate from longitudinal behavioral learning.
+Fast-loop changes carry bounded leases and independent outcomes. Slow-loop policy promotion requires matched, independent trajectories; one task cannot establish a durable behavioral prior.
 
 ## Core principles
 

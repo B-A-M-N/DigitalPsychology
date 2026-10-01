@@ -10,7 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Protocol
 
-from .behavior_state import BehaviorIntervention, InterventionOutcome
+from .behavior_state import (BehaviorIntervention, GoalSetSnapshot,
+                             InterventionOutcome, TaskSetOutcome)
+from .attention import MAX_FAIRNESS_AGE_ACTIONS
 
 
 _SOURCE_KINDS = {
@@ -125,6 +127,8 @@ class InterventionEvaluationFrame:
     applied_intervention_ids: tuple[str, ...]
     competing_intervention_ids: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
+    goal_set: GoalSetSnapshot | None = None
+    attention_last_seen: Mapping[str, int] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, str) or not self.scope.strip() or len(self.scope) > 256:
@@ -142,6 +146,15 @@ class InterventionEvaluationFrame:
                    for value in values) or len(values) != len(set(values)):
                 raise ValueError(f"{name} must contain unique bounded strings")
             object.__setattr__(self, name, tuple(values))
+        if self.goal_set is not None and not isinstance(self.goal_set, GoalSetSnapshot):
+            raise ValueError("evaluation goal set must be host validated")
+        attention = dict(self.attention_last_seen or {})
+        if (len(attention) > 256
+                or any(not isinstance(key, str) or not key or len(key) > 128
+                       or type(value) is not int or value < 0
+                       for key, value in attention.items())):
+            raise ValueError("evaluation attention history is malformed")
+        object.__setattr__(self, "attention_last_seen", attention)
 
 
 class InterventionEvaluator:
@@ -203,6 +216,11 @@ class InterventionEvaluator:
             # criterion ID. Accept that only for interventions whose host did
             # not supply criterion targets at all.
             objective_progress = objective_progress or "objective_progress" in kinds
+        task_set_outcome = self._task_set_outcome(intervention, frame)
+        if task_set_outcome is not None:
+            objective_progress = objective_progress or bool(
+                task_set_outcome.targeted_progress_delta
+                or (not target_ids and task_set_outcome.newly_verified))
         artifact_changed = True if "artifact_changed" in kinds else None
         repeated_approach = (True if "equivalent_approach" in kinds else
                              False if "materially_different_attempt" in kinds else None)
@@ -216,6 +234,10 @@ class InterventionEvaluator:
             verification_quality = "unknown"
 
         regression = "objective_regression" in kinds
+        if task_set_outcome is not None:
+            regression = regression or bool(task_set_outcome.regressions)
+            regression = regression or (
+                task_set_outcome.max_starvation_after > MAX_FAIRNESS_AGE_ACTIONS)
         comparative = [fact for fact in facts if fact.kind in _COMPARATIVE_KINDS]
         comparison_ids = {fact.comparison_id for fact in comparative}
         if len(comparison_ids) > 1:
@@ -238,6 +260,14 @@ class InterventionEvaluator:
         applied = intervention.intervention_id in frame.applied_intervention_ids
         overlapping = (set(frame.competing_intervention_ids)
                        | set(intervention.concurrent_intervention_ids))
+        attention_only = (len(intervention.targets) == 1
+                          and intervention.targets[0].target == "focus_criteria")
+        fairness_progress = bool(
+            attention_only and task_set_outcome is not None
+            and task_set_outcome.targeted_progress_delta > 0
+            and task_set_outcome.attention_coverage_delta > 0
+            and (task_set_outcome.total_required_remaining_after
+                 < task_set_outcome.total_required_remaining_before))
         if not applied:
             outcome = "unattributed"
             attribution = "insufficient"
@@ -246,26 +276,22 @@ class InterventionEvaluator:
             outcome = "unattributed"
             attribution = "not_attributed"
             goal_progress = True if objective_progress else False if regression else None
-        elif regression and (objective_progress or overlapping) and not explicit_effect:
-            outcome = "unattributed"
-            attribution = "confounded"
-            goal_progress = True if objective_progress else False
-        elif explicit_no_credit:
-            outcome = "unattributed"
-            attribution = "not_attributed"
-            goal_progress = True if objective_progress else False if regression else None
         elif regression:
-            outcome = "regressed"
-            attribution = "supported"
+            if overlapping and not explicit_effect:
+                outcome = "unattributed"
+                attribution = "confounded"
+            else:
+                outcome = "regressed"
+                attribution = "supported"
             goal_progress = False
-        elif objective_progress:
+        elif fairness_progress or objective_progress:
             if overlapping and not explicit_effect:
                 outcome = "unattributed"
                 attribution = "confounded"
             else:
                 outcome = "effective"
                 attribution = "supported"
-            goal_progress = True
+            goal_progress = True if objective_progress else False
         elif frame.evaluation_complete and objective_rejected:
             if overlapping and not explicit_effect:
                 outcome = "unattributed"
@@ -293,6 +319,88 @@ class InterventionEvaluator:
             repeated_approach=repeated_approach,
             verification_quality=verification_quality,
             comparison_id=comparison_id,
+            target_criteria=intervention.target_criteria,
+            task_set_outcome=task_set_outcome,
+        )
+
+    @staticmethod
+    def _task_set_outcome(intervention: BehaviorIntervention,
+                          frame: InterventionEvaluationFrame) -> TaskSetOutcome | None:
+        before = intervention.baseline_goal_set
+        after = frame.goal_set
+        if before is None or after is None:
+            return None
+        before_by_id = {item.criterion_id: item for item in before.items if item.required}
+        after_by_id = {item.criterion_id: item for item in after.items if item.required}
+        newly_verified = tuple(sorted(
+            criterion_id for criterion_id, item in after_by_id.items()
+            if item.status == "VERIFIED"
+            and (criterion_id not in before_by_id
+                 or before_by_id[criterion_id].status != "VERIFIED")))
+        blocked_statuses = {"BLOCKED", "DEPENDENCY_BLOCKED", "DEFERRED_BY_OPERATOR"}
+        newly_blocked = tuple(sorted(
+            criterion_id for criterion_id, item in after_by_id.items()
+            if item.status in blocked_statuses
+            and (criterion_id not in before_by_id
+                 or before_by_id[criterion_id].status not in blocked_statuses)))
+        regressions = {
+            criterion_id for criterion_id, item in before_by_id.items()
+            if item.status == "VERIFIED"
+            and (criterion_id not in after_by_id
+                 or after_by_id[criterion_id].status != "VERIFIED")
+        }
+        progress_rank = {"READY": 0, "ACTIVE": 1, "VERIFIED": 2}
+        for criterion_id, old in before_by_id.items():
+            current = after_by_id.get(criterion_id)
+            if current is None:
+                regressions.add(criterion_id)
+                continue
+            if (old.status in progress_rank and current.status in progress_rank
+                    and progress_rank[current.status] < progress_rank[old.status]):
+                regressions.add(criterion_id)
+            elif (current.status in blocked_statuses
+                  and old.status not in blocked_statuses):
+                regressions.add(criterion_id)
+        targeted_progress = 0
+        for criterion_id in intervention.target_criteria:
+            old = before_by_id.get(criterion_id)
+            current = after_by_id.get(criterion_id)
+            if old is None or current is None:
+                continue
+            if (old.status in progress_rank and current.status in progress_rank
+                    and progress_rank[current.status] > progress_rank[old.status]):
+                targeted_progress += 1
+
+        def max_starvation(snapshot: GoalSetSnapshot,
+                           last_seen: Mapping[str, int], action_index: int) -> int:
+            return max((max(0, action_index - last_seen.get(item.criterion_id,
+                                                           action_index))
+                        for item in snapshot.runnable_items), default=0)
+
+        before_counts = before.required_counts
+        after_counts = after.required_counts
+        covered_before = sum(
+            intervention.baseline_action_index
+            <= intervention.baseline_attention_last_seen.get(item.criterion_id, -1)
+            for item in before_by_id.values())
+        covered_after = sum(
+            intervention.baseline_action_index
+            <= frame.attention_last_seen.get(item.criterion_id, -1)
+            <= frame.action_index
+            for item in after_by_id.values())
+        return TaskSetOutcome(
+            targeted_progress_delta=targeted_progress,
+            total_required_remaining_before=before_counts["remaining_required"],
+            total_required_remaining_after=after_counts["remaining_required"],
+            newly_verified=newly_verified,
+            newly_blocked=newly_blocked,
+            regressions=tuple(sorted(regressions)),
+            max_starvation_before=max_starvation(
+                before, intervention.baseline_attention_last_seen,
+                intervention.baseline_action_index),
+            max_starvation_after=max_starvation(
+                after, frame.attention_last_seen, frame.action_index),
+            attention_coverage_delta=covered_after - covered_before,
         )
 
 

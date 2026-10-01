@@ -6,7 +6,10 @@ import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from lib.behavior_state import CSWBehaviorSnapshot, StateWorkOption
+from lib.behavior_state import (BehaviorIntervention, BehaviorState,
+                                CSWBehaviorSnapshot, GoalItemSnapshot,
+                                GoalSetSnapshot, InterventionTarget,
+                                StateWorkOption)
 from lib.mcp_server import DigitalPsychologyService
 from lib.outcomes import HostOutcomeFact
 from lib.runtime import (BehaviorStateStore, CFWRuntimeAdapter, RuntimeHost,
@@ -64,6 +67,7 @@ class _CSWPort:
         self.revision = 0
         self.active = ()
         self.requested_candidates = []
+        self.released = []
         self.options = (StateWorkOption(
             "repair", behavior_tags=("recovery",),
             purpose="Rebuild a failed approach from evidence."),)
@@ -94,6 +98,7 @@ class _CSWPort:
                              candidate_statework_ids):
         if expected_selection_revision != self.revision:
             raise RuntimeError("stale CSW selection revision")
+        self.released.append(statework_id)
         self.active = tuple(item for item in self.active if item != statework_id)
         self.revision += 1
         return self.behavioral_snapshot()
@@ -128,6 +133,18 @@ class _JudgeService(DigitalPsychologyService):
     def decide_behavior(self, context, *, judgment=None):
         self.calls.append(("decide", judgment))
         return super().decide_behavior(context, judgment=judgment)
+
+
+class _FailOnceEventDispatchService(DigitalPsychologyService):
+    def __init__(self, *, event_db):
+        super().__init__(event_db=event_db)
+        self.fail_next_dispatch = True
+
+    def dispatch_runtime_event(self, value):
+        if self.fail_next_dispatch:
+            self.fail_next_dispatch = False
+            raise OSError("simulated event sink interruption")
+        return super().dispatch_runtime_event(value)
 
 
 def _system_one_frame(identity):
@@ -247,14 +264,166 @@ def test_runtime_host_applies_cfw_controls_and_credits_host_verified_progress(tm
     assert second.state.intervention_history[-1].outcome == "effective"
     assert stored.action_index == 11
     assert stored.state.revision == 2
+    assert second.state.active_stateworks == ()
     assert "cognitive_mode" in context and "CFW context" in context
     assert "DIGITAL PSYCHOLOGY BEHAVIOR STATE" in context
-    assert '"csw_eligible_steps":{"repair":["inspect"]}' in context
-    assert '"csw_workflow_states":{"repair":"UNKNOWN"}' in context
+    assert '"csw_eligible_steps":{}' in context
+    assert '"csw_workflow_states":{}' in context
     assert ("repair",) in csw.requested_candidates
     assert all(candidates in {(), ("repair",)}
                for candidates in csw.requested_candidates)
-    assert cfw_port.active_statework_contexts[-1] == ("repair",)
+    assert cfw_port.active_statework_contexts[-1] == ()
+
+
+def test_runtime_host_keeps_twelve_item_task_set_complete_and_rotates_attention(tmp_path):
+    identity = _identity()
+    service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
+    criteria = tuple(f"criterion-{index}" for index in range(1, 13))
+    goal_set = GoalSetSnapshot(revision=7, items=tuple(
+        GoalItemSnapshot(
+            criterion_id=criterion_id,
+            priority=100 if index == 1 else 0,
+            status="READY",
+            equivalent_retry_count=2 if index == 1 else 0,
+        ) for index, criterion_id in enumerate(criteria, start=1)))
+    try:
+        host = RuntimeHost(service=service,
+                           state_path=tmp_path / "behavior-state.sqlite3")
+        cfw_port = _CFWPort()
+        cfw_port.signals = []
+        session = host.open_session(
+            identity=identity, objective="Complete all twelve requested items",
+            objective_criteria=criteria,
+            cfw=CFWRuntimeAdapter(cfw_port), csw=_CSWPort(),
+            outcome_evidence_authority=_EvidenceAuthority({}),
+        )
+
+        observed: set[str] = set()
+        focus_after_first_lease = ()
+        for action_index in range(1, 13):
+            result = session.process_action(RuntimeObservation(
+                action_index=action_index,
+                goal_set=goal_set,
+                # These task-global values must not trigger a retry/recovery
+                # against unrelated criteria.
+                actions_since_goal_progress=999,
+                equivalent_retry_count=999,
+            ))
+            assert result.state.cognitive_mode != "BLOCKED"
+            assert len(result.state.focus_criteria) <= 3
+            observed.update(result.state.focus_criteria)
+            if action_index == 1:
+                assert result.state.cognitive_mode == "RECOVER"
+                assert "criterion-1" in result.state.focus_criteria
+            if action_index == 4:
+                focus_after_first_lease = result.state.focus_criteria
+                projection = result.behavior_context
+                assert '"total":12' in projection
+                assert "objective_criteria" not in projection
+
+        assert observed == set(criteria)
+        assert "criterion-1" not in focus_after_first_lease
+        context = session.before_model_call()
+        assert '"attention_window"' in context
+        assert all(item in context for item in result.state.focus_criteria)
+        assert session.project_behavior_context().count("criterion-") < 16
+    finally:
+        service.close()
+
+
+def test_runtime_host_releases_statework_when_its_dp_lease_closes(tmp_path):
+    identity = _identity()
+    service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
+    cfw_port = _CFWPort()
+    cfw_port.signals = []
+    csw = _CSWPort()
+    csw.active = ("repair",)
+    csw.options = ()
+    store = BehaviorStateStore(tmp_path / "behavior-state.sqlite3")
+    intervention = BehaviorIntervention(
+        intervention_id="lease-repair-1", cause="equivalent_retry",
+        expected_effect="Use the recovery StateWork for one bounded attempt.",
+        start_revision=0, scope=identity.scope, expires_after_actions=2,
+        actions_elapsed=0,
+        targets=(InterventionTarget("statework:repair", "unselected", "preferred"),),
+        target_criteria=("criterion-visual",),
+        baseline_criterion_status={"criterion-visual": "unmet"},
+        baseline_action_index=0, evaluation_horizon_actions=2)
+    initial = BehaviorState(
+        revision=1, active_stateworks=("repair",),
+        active_interventions=(intervention,))
+    store.save(
+        identity.scope, expected_revision=0, expected_action_index=-1,
+        action_index=0, state=initial)
+    try:
+        host = RuntimeHost(service=service, state_path=tmp_path / "behavior-state.sqlite3")
+        session = host.open_session(
+            identity=identity, objective="Render the requested page",
+            objective_criteria=("criterion-visual",),
+            cfw=CFWRuntimeAdapter(cfw_port), csw=csw,
+            outcome_evidence_authority=_EvidenceAuthority({}),
+        )
+
+        turn = session.process_action(RuntimeObservation(action_index=1))
+
+        assert csw.released == ["repair"]
+        assert not turn.state.active_stateworks
+        assert "lease-repair-1" not in {
+            item.intervention_id for item in turn.state.active_interventions}
+        release_ids = {directive.directive_id for directive in turn.decision.directives
+                       if directive.operation == "release_statework"}
+        assert release_ids and release_ids.issubset(set(turn.applied_directive_ids))
+    finally:
+        service.close()
+
+
+def test_runtime_event_outbox_recovers_after_host_restart(tmp_path):
+    identity = _identity()
+    state_path = tmp_path / "behavior-state.sqlite3"
+    event_path = tmp_path / "events.sqlite3"
+    failing_service = _FailOnceEventDispatchService(event_db=event_path)
+    csw = _CSWPort()
+    cfw_port = _CFWPort()
+
+    host = RuntimeHost(service=failing_service, state_path=state_path)
+    first_session = host.open_session(
+        identity=identity, objective="Render the requested page",
+        objective_criteria=("criterion-visual",),
+        cfw=CFWRuntimeAdapter(cfw_port), csw=csw,
+        outcome_evidence_authority=_EvidenceAuthority({}),
+    )
+    first = first_session.process_action(RuntimeObservation(
+        action_index=1, equivalent_retry_count=2,
+        criterion_status={"criterion-visual": "unmet"},
+    ))
+    assert first.application_event_ids
+    assert first.pending_event_ids == first.application_event_ids
+    persisted = BehaviorStateStore(state_path).pending_outbox(identity.scope)
+    assert tuple(item.event_id for item in persisted) == first.application_event_ids
+    failing_service.close()
+
+    resumed_service = DigitalPsychologyService(event_db=event_path)
+    try:
+        resumed_host = RuntimeHost(service=resumed_service, state_path=state_path)
+        resumed_session = resumed_host.open_session(
+            identity=identity, objective="Render the requested page",
+            objective_criteria=("criterion-visual",),
+            cfw=CFWRuntimeAdapter(_CFWPort()), csw=csw,
+            outcome_evidence_authority=_EvidenceAuthority({}),
+        )
+        resumed_session.process_action(RuntimeObservation(
+            action_index=2,
+            criterion_status={"criterion-visual": "unmet"},
+        ))
+
+        delivered = [json.loads(row[0]) for row in resumed_service._sink._conn.execute(
+            "SELECT payload FROM events WHERE event_id=?",
+            (first.application_event_ids[0],)).fetchall()]
+        assert len(delivered) == 1
+        assert delivered[0]["event_type"] == "behavior_intervention_applied"
+        assert not BehaviorStateStore(state_path).pending_outbox(identity.scope)
+    finally:
+        resumed_service.close()
 
 
 def test_runtime_host_dispatches_validated_system_one_frame_before_fast_loop(tmp_path):

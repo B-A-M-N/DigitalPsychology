@@ -1,8 +1,9 @@
 """DigitalPsychology behavioral control and learning contracts."""
 
 from .behavior_state import (
-    BehaviorIntervention, BehaviorDirective, BehaviorState, BehavioralDecision,
-    CSWBehaviorSnapshot, FrameworkSignal, InterventionOutcome,
+    AttentionLease, BehaviorIntervention, BehaviorDirective, BehaviorState,
+    BehavioralDecision, CSWBehaviorSnapshot, FrameworkSignal, GoalItemSnapshot,
+    GoalSetSnapshot, InterventionOutcome, TaskSetOutcome,
     InterventionTarget, StateWorkOption,
 )
 from .fast_loop import BehavioralController, FastLoopInput, SemanticAssessment
@@ -15,9 +16,10 @@ from .runtime import (BehaviorStateStore, CFWComponentPort, CSWWorkflowPort,
 from .runtime.adapters import CFWRuntimeAdapter, CSWRuntimeAdapter, CSWWorkflowBinding
 
 __all__ = [
-    "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
+    "AttentionLease", "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
     "BehavioralDecision", "BehavioralController", "CSWBehaviorSnapshot",
-    "FastLoopInput", "FrameworkSignal", "InterventionOutcome",
+    "FastLoopInput", "FrameworkSignal", "GoalItemSnapshot", "GoalSetSnapshot",
+    "InterventionOutcome", "TaskSetOutcome",
     "InterventionTarget", "SemanticAssessment", "StateWorkOption",
     "HostOutcomeFact", "InterventionEventContext", "InterventionEvaluationFrame", "InterventionEvaluator",
     "OutcomeEvidenceAuthority", "BehaviorStateStore", "CFWComponentPort",

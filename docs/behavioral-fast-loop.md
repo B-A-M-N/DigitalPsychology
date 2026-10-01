@@ -11,6 +11,12 @@ CSW ports.
 For each host action, `RuntimeSession.process_action()` gathers:
 
 - the current DP `BehaviorState` and its revision;
+- the complete host-owned task set, bounded to 256 criteria, with per-criterion
+  status, priority, dependencies, retry count, and stall age;
+- a DP attention lease covering at most three runnable required criteria for
+  at most three actions. Oldest-attended criteria take precedence over priority,
+  so priority cannot starve required work; all 256 criteria are selected within
+  the 258-action fairness bound;
 - bounded CFW signals, such as stale assumptions, equivalent retries, or
   support work displacing unfinished criteria;
 - a bounded CSW snapshot, including the current active workflows and only
@@ -33,6 +39,19 @@ revision, directives, CSW-eligible StateWork preferences, and independently
 assessed intervention outcomes. DP persists its behavior revision separately
 from the CSW selection and workflow revisions.
 
+The DP state revision, applied-directive receipts, and pending intervention
+events commit together in the local SQLite state store. Event delivery uses
+stable IDs and is acknowledged only after the event sink accepts the same
+payload. A restart retries pending events without losing or duplicating the
+intervention record.
+
+The whole task set remains the completion authority. A failed or stalled
+criterion does not block runnable peers; DP enters `BLOCKED` only when no
+required criterion can run. The task is ready to complete only when every
+required criterion is host-verified. Prompt projection includes aggregate
+counts, the current attention lease, the next ready criteria, and the oldest
+starved criterion rather than injecting an unbounded criterion list.
+
 The runtime's decision, directive application, and outcome assessment methods
 are trusted-host APIs. They are not registered as agent-facing MCP tools. DP
 persists its decision with compare-and-swap and keeps WARD mandatory. CFW
@@ -45,6 +64,11 @@ StateWork preferences are ranked only from `CSWBehaviorSnapshot.eligible_statewo
 `CSWRuntimeAdapter` submits activation through CSW's revisioned selection API
 and then refreshes its snapshot. A rejected or stale request cannot be copied
 into DP's next view as active state.
+
+A StateWork activated as part of a temporary DP intervention is leased to that
+intervention. When the intervention is assessed, withdrawn, or expires, DP
+emits a typed release directive; the host deactivates it through CSW's
+revisioned API and compensates if the rest of the decision cannot be committed.
 
 ## Intervention lifecycle
 
@@ -98,6 +122,11 @@ session = host.open_session(
 turn = session.process_action(host_observation)
 model_context = session.before_model_call(tool_capable=True)
 ```
+
+The same session evaluates each closed intervention against its starting task
+set and the current host snapshot. Target progress receives credit only when
+required work has no regression and remains inside the starvation bound.
+Progress on one criterion does not conceal regression on another.
 
 `host_observation` and outcome evidence references are produced by the trusted
 host. An agent cannot submit its own intervention receipt or success judgment.

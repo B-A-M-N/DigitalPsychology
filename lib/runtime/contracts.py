@@ -12,7 +12,8 @@ import json
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from ..behavior_state import (BehaviorDirective, BehaviorState,
-                              CSWBehaviorSnapshot, FrameworkSignal)
+                              CSWBehaviorSnapshot, FrameworkSignal,
+                              GoalSetSnapshot)
 from ..system_one_contracts import SystemOneFrame
 
 
@@ -77,6 +78,7 @@ class RuntimeObservation:
     actions_since_goal_progress: int = 0
     equivalent_retry_count: int = 0
     context_pressure: float = 0.0
+    goal_set: GoalSetSnapshot | None = None
     criterion_status: Mapping[str, str] = field(default_factory=dict)
     evidence_refs: tuple[str, ...] = ()
     active_trigger_codes: tuple[str, ...] = ()
@@ -91,12 +93,26 @@ class RuntimeObservation:
         if (self.actions_since_goal_progress < 0 or self.equivalent_retry_count < 0
                 or not 0.0 <= float(self.context_pressure) <= 1.0):
             raise ValueError("runtime observation counters are out of bounds")
+        if self.goal_set is not None and not isinstance(self.goal_set, GoalSetSnapshot):
+            raise ValueError("goal_set must be a host-validated GoalSetSnapshot")
         statuses = dict(self.criterion_status)
-        if len(statuses) > 8 or any(
+        if len(statuses) > 256 or any(
                 not isinstance(key, str) or not key or len(key) > 128
                 or value not in {"unmet", "in_progress", "verified", "blocked", "unknown"}
                 for key, value in statuses.items()):
-            raise ValueError("host criterion statuses are malformed")
+            raise ValueError("host criterion statuses must be bounded to 256 items")
+        if self.goal_set is not None:
+            snapshot_statuses = {
+                item.criterion_id: {
+                    "READY": "unmet", "ACTIVE": "in_progress", "VERIFIED": "verified",
+                    "BLOCKED": "blocked", "DEPENDENCY_BLOCKED": "blocked",
+                    "DEFERRED_BY_OPERATOR": "blocked",
+                }[item.status]
+                for item in self.goal_set.items
+            }
+            if statuses and statuses != snapshot_statuses:
+                raise ValueError("criterion_status must agree with the host goal-set snapshot")
+            statuses = snapshot_statuses
         object.__setattr__(self, "criterion_status", statuses)
         for name, limit in (("evidence_refs", 16), ("active_trigger_codes", 32)):
             values = getattr(self, name)
@@ -173,6 +189,15 @@ class BehavioralDecisionService(Protocol):
                                         event_context: Any) -> str: ...
 
     def record_intervention_outcome(self, outcome: Any, *, event_context: Any) -> str: ...
+
+    def prepare_intervention_application(self, intervention: Any, directives: tuple,
+                                         applied_directive_ids: tuple[str, ...], *,
+                                         event_context: Any) -> Mapping[str, Any]: ...
+
+    def prepare_intervention_outcome(self, outcome: Any, *,
+                                     event_context: Any) -> Mapping[str, Any]: ...
+
+    def dispatch_runtime_event(self, event: Mapping[str, Any]) -> str: ...
 
 
 __all__ = ["RuntimeIdentity", "RuntimeObservation", "CFWComponentPort",

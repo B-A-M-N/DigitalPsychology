@@ -139,7 +139,7 @@ def test_regressing_intervention_is_recorded_and_stays_blocked_until_trigger_cle
     assert any(item.value == "DELIVER" for item in cleared.directives)
 
 
-def test_independently_effective_intervention_is_retained_without_repeating_it():
+def test_effective_fast_loop_intervention_is_recorded_then_restored():
     from lib.behavior_state import InterventionOutcome
 
     controller = BehavioralController()
@@ -166,12 +166,15 @@ def test_independently_effective_intervention_is_retained_without_repeating_it()
         intervention_assessments=(assessment,),
     ))
 
-    assert second.state.cognitive_mode == "RECOVER"
+    assert second.state.cognitive_mode == "DELIVER"
     assert second.state.intervention_history[-1].outcome == "effective"
     assert not any(item.cause == "equivalent_retry"
                    for item in second.state.active_interventions)
-    assert not any(item.operation == "set_mode" and item.value == "RECOVER"
+    assert any(item.operation == "set_mode" and item.value == "DELIVER"
                    for item in second.directives)
+    assert second.state.framework_modes["owl"] == "normal"
+    assert second.state.framework_modes["anchor"] == "passive"
+    assert second.state.framework_modes["fuse"] == "normal"
 
 
 def test_intervention_identity_is_scoped_per_agent_session():

@@ -42,6 +42,162 @@ def _ids(values: Any, name: str, *, limit: int, item_limit: int = 128) -> tuple[
     return result
 
 
+def _nonnegative_int(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+@dataclass(frozen=True)
+class GoalItemSnapshot:
+    """Host-owned status and progress facts for one required or optional goal."""
+
+    criterion_id: str
+    required: bool = True
+    priority: int = 0
+    dependencies: tuple[str, ...] = ()
+    status: str = "READY"
+    actions_since_progress: int = 0
+    equivalent_retry_count: int = 0
+    last_progress_action: int | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.criterion_id, "criterion_id", limit=128)
+        if not isinstance(self.required, bool):
+            raise ValueError("goal item required flag must be boolean")
+        if type(self.priority) is not int or not 0 <= self.priority <= 100:
+            raise ValueError("goal item priority must be between zero and 100")
+        object.__setattr__(self, "dependencies",
+                           _ids(self.dependencies, "goal dependencies", limit=256))
+        if self.criterion_id in self.dependencies:
+            raise ValueError("goal item cannot depend on itself")
+        if self.status not in {"READY", "ACTIVE", "VERIFIED", "BLOCKED",
+                               "DEPENDENCY_BLOCKED", "DEFERRED_BY_OPERATOR"}:
+            raise ValueError("unsupported host goal status")
+        if (type(self.actions_since_progress) is not int
+                or self.actions_since_progress < 0
+                or type(self.equivalent_retry_count) is not int
+                or self.equivalent_retry_count < 0):
+            raise ValueError("goal progress counters must be non-negative integers")
+        if self.last_progress_action is not None and (
+                type(self.last_progress_action) is not int
+                or self.last_progress_action < 0):
+            raise ValueError("last progress action must be non-negative or null")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"criterion_id": self.criterion_id, "required": self.required,
+                "priority": self.priority, "dependencies": list(self.dependencies),
+                "status": self.status,
+                "actions_since_progress": self.actions_since_progress,
+                "equivalent_retry_count": self.equivalent_retry_count,
+                "last_progress_action": self.last_progress_action}
+
+
+@dataclass(frozen=True)
+class GoalSetSnapshot:
+    """Complete host-authoritative task set; never a prompt-sized projection."""
+
+    revision: int
+    items: tuple[GoalItemSnapshot, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.revision) is not int or self.revision < 0:
+            raise ValueError("goal set revision must be non-negative")
+        if not isinstance(self.items, (tuple, list)) or not 1 <= len(self.items) <= 256:
+            raise ValueError("goal set must contain between one and 256 items")
+        items = tuple(item if isinstance(item, GoalItemSnapshot)
+                      else GoalItemSnapshot(**dict(item)) for item in self.items)
+        ids = [item.criterion_id for item in items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("goal set criterion IDs must be unique")
+        known = set(ids)
+        if any(not set(item.dependencies).issubset(known) for item in items):
+            raise ValueError("goal set contains an unknown dependency")
+        graph = {item.criterion_id: item.dependencies for item in items}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(criterion_id: str) -> None:
+            if criterion_id in visiting:
+                raise ValueError("goal set dependencies contain a cycle")
+            if criterion_id in visited:
+                return
+            visiting.add(criterion_id)
+            for dependency in graph[criterion_id]:
+                visit(dependency)
+            visiting.remove(criterion_id)
+            visited.add(criterion_id)
+
+        for criterion_id in ids:
+            visit(criterion_id)
+        object.__setattr__(self, "items", items)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"revision": self.revision,
+                "items": [item.to_dict() for item in self.items]}
+
+    @property
+    def runnable_items(self) -> tuple[GoalItemSnapshot, ...]:
+        verified = {item.criterion_id for item in self.items
+                    if item.status == "VERIFIED"}
+        return tuple(item for item in self.items
+                     if item.required and item.status in {"READY", "ACTIVE"}
+                     and set(item.dependencies).issubset(verified))
+
+    @property
+    def required_counts(self) -> dict[str, int]:
+        required = [item for item in self.items if item.required]
+        return {
+            "total": len(required),
+            "verified": sum(item.status == "VERIFIED" for item in required),
+            "ready": sum(item in self.runnable_items for item in required),
+            "blocked": sum(item.status == "BLOCKED" for item in required),
+            "dependency_blocked": sum(item.status == "DEPENDENCY_BLOCKED"
+                                       for item in required),
+            "deferred": sum(item.status == "DEFERRED_BY_OPERATOR" for item in required),
+            "remaining_required": sum(item.status != "VERIFIED" for item in required),
+        }
+
+
+@dataclass(frozen=True)
+class AttentionLease:
+    """Bounded DP attention window over the full host-owned goal set."""
+
+    lease_id: str
+    criterion_ids: tuple[str, ...]
+    issued_revision: int
+    goal_set_revision: int
+    start_action: int
+    max_actions: int = 3
+    reason: str = "priority_and_starvation"
+
+    def __post_init__(self) -> None:
+        _text(self.lease_id, "attention lease ID", limit=128)
+        object.__setattr__(self, "criterion_ids",
+                           _ids(self.criterion_ids, "attention criteria", limit=3))
+        if not self.criterion_ids:
+            raise ValueError("attention lease must select at least one criterion")
+        for name in ("issued_revision", "goal_set_revision", "start_action"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if type(self.max_actions) is not int or not 1 <= self.max_actions <= 8:
+            raise ValueError("attention lease duration must be between one and eight actions")
+        _text(self.reason, "attention lease reason", limit=128)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"lease_id": self.lease_id, "criterion_ids": list(self.criterion_ids),
+                "issued_revision": self.issued_revision,
+                "goal_set_revision": self.goal_set_revision,
+                "start_action": self.start_action,
+                "max_actions": self.max_actions, "reason": self.reason}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "AttentionLease":
+        data = dict(value)
+        data["criterion_ids"] = tuple(data.get("criterion_ids", ()))
+        return cls(**data)
+
+
 @dataclass(frozen=True)
 class InterventionTarget:
     """One reversible setting change owned by an intervention."""
@@ -77,6 +233,8 @@ class BehaviorIntervention:
     baseline_action_index: int = 0
     evaluation_horizon_actions: int | None = None
     concurrent_intervention_ids: tuple[str, ...] = ()
+    baseline_goal_set: GoalSetSnapshot | None = None
+    baseline_attention_last_seen: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
@@ -115,6 +273,21 @@ class BehaviorIntervention:
         object.__setattr__(self, "concurrent_intervention_ids",
                            _ids(self.concurrent_intervention_ids,
                                 "concurrent_intervention_ids", limit=16))
+        if self.baseline_goal_set is not None and not isinstance(
+                self.baseline_goal_set, GoalSetSnapshot):
+            value = self.baseline_goal_set
+            object.__setattr__(self, "baseline_goal_set", GoalSetSnapshot(
+                revision=int(value["revision"]),
+                items=tuple(GoalItemSnapshot(**dict(item)) for item in value["items"])))
+        if (not isinstance(self.baseline_attention_last_seen, Mapping)
+                or len(self.baseline_attention_last_seen) > 256):
+            raise ValueError("baseline attention history must be bounded")
+        baseline_attention = {}
+        for criterion_id, action_index in self.baseline_attention_last_seen.items():
+            baseline_attention[_text(criterion_id, "baseline attention criterion", limit=128)] = (
+                _nonnegative_int(action_index, "baseline attention action index"))
+        object.__setattr__(self, "baseline_attention_last_seen",
+                           MappingProxyType(baseline_attention))
 
     def to_dict(self) -> dict[str, Any]:
         return {"intervention_id": self.intervention_id, "cause": self.cause,
@@ -127,7 +300,10 @@ class BehaviorIntervention:
                 "target_criteria": list(self.target_criteria),
                 "baseline_criterion_status": dict(self.baseline_criterion_status),
                 "baseline_action_index": self.baseline_action_index,
-                "concurrent_intervention_ids": list(self.concurrent_intervention_ids)}
+                "concurrent_intervention_ids": list(self.concurrent_intervention_ids),
+                "baseline_goal_set": (self.baseline_goal_set.to_dict()
+                                      if self.baseline_goal_set is not None else None),
+                "baseline_attention_last_seen": dict(self.baseline_attention_last_seen)}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "BehaviorIntervention":
@@ -135,7 +311,52 @@ class BehaviorIntervention:
         data["targets"] = tuple(InterventionTarget(**item) for item in data["targets"])
         for name in ("target_criteria", "concurrent_intervention_ids"):
             data[name] = tuple(data.get(name, ()))
+        if data.get("baseline_goal_set") is not None:
+            value = data["baseline_goal_set"]
+            if not isinstance(value, GoalSetSnapshot):
+                data["baseline_goal_set"] = GoalSetSnapshot(
+                    revision=int(value["revision"]),
+                    items=tuple(GoalItemSnapshot(**dict(item)) for item in value["items"]))
+        data["baseline_attention_last_seen"] = dict(
+            data.get("baseline_attention_last_seen") or {})
         return cls(**data)
+
+
+@dataclass(frozen=True)
+class TaskSetOutcome:
+    """Independent task-set deltas observed across one intervention window."""
+
+    targeted_progress_delta: int = 0
+    total_required_remaining_before: int = 0
+    total_required_remaining_after: int = 0
+    newly_verified: tuple[str, ...] = ()
+    newly_blocked: tuple[str, ...] = ()
+    regressions: tuple[str, ...] = ()
+    max_starvation_before: int = 0
+    max_starvation_after: int = 0
+    attention_coverage_delta: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("targeted_progress_delta", "total_required_remaining_before",
+                     "total_required_remaining_after", "max_starvation_before",
+                     "max_starvation_after"):
+            _nonnegative_int(getattr(self, name), name)
+        if type(self.attention_coverage_delta) is not int:
+            raise ValueError("attention coverage delta must be an integer")
+        for name in ("newly_verified", "newly_blocked", "regressions"):
+            object.__setattr__(self, name,
+                               _ids(getattr(self, name), name, limit=256))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"targeted_progress_delta": self.targeted_progress_delta,
+                "total_required_remaining_before": self.total_required_remaining_before,
+                "total_required_remaining_after": self.total_required_remaining_after,
+                "newly_verified": list(self.newly_verified),
+                "newly_blocked": list(self.newly_blocked),
+                "regressions": list(self.regressions),
+                "max_starvation_before": self.max_starvation_before,
+                "max_starvation_after": self.max_starvation_after,
+                "attention_coverage_delta": self.attention_coverage_delta}
 
 
 @dataclass(frozen=True)
@@ -153,6 +374,8 @@ class InterventionOutcome:
     repeated_approach: bool | None = None
     verification_quality: str = "unknown"
     comparison_id: str | None = None
+    target_criteria: tuple[str, ...] = ()
+    task_set_outcome: TaskSetOutcome | None = None
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
@@ -179,6 +402,12 @@ class InterventionOutcome:
         object.__setattr__(self, "criterion_ids_progressed",
                            _ids(self.criterion_ids_progressed,
                                 "criterion_ids_progressed", limit=8))
+        object.__setattr__(self, "target_criteria",
+                           _ids(self.target_criteria, "outcome target_criteria", limit=8))
+        task_set_outcome = self.task_set_outcome
+        if task_set_outcome is not None and not isinstance(task_set_outcome, TaskSetOutcome):
+            task_set_outcome = TaskSetOutcome(**dict(task_set_outcome))
+            object.__setattr__(self, "task_set_outcome", task_set_outcome)
 
     def to_dict(self) -> dict[str, Any]:
         return {"intervention_id": self.intervention_id, "cause": self.cause,
@@ -191,7 +420,10 @@ class InterventionOutcome:
                 "artifact_changed": self.artifact_changed,
                 "repeated_approach": self.repeated_approach,
                 "verification_quality": self.verification_quality,
-                "comparison_id": self.comparison_id}
+                "comparison_id": self.comparison_id,
+                "target_criteria": list(self.target_criteria),
+                "task_set_outcome": (self.task_set_outcome.to_dict()
+                                     if self.task_set_outcome is not None else None)}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "InterventionOutcome":
@@ -202,6 +434,12 @@ class InterventionOutcome:
             data.get("outcome"), data.get("outcome"))
         data["evidence_refs"] = tuple(data.get("evidence_refs", ()))
         data["criterion_ids_progressed"] = tuple(data.get("criterion_ids_progressed", ()))
+        data["target_criteria"] = tuple(data.get("target_criteria", ()))
+        if data.get("task_set_outcome") is not None:
+            data["task_set_outcome"] = (
+                data["task_set_outcome"]
+                if isinstance(data["task_set_outcome"], TaskSetOutcome)
+                else TaskSetOutcome(**dict(data["task_set_outcome"])))
         return cls(**data)
 
 
@@ -223,6 +461,8 @@ class BehaviorState:
     })
     active_stateworks: tuple[str, ...] = ()
     focus_criteria: tuple[str, ...] = ()
+    attention_lease: AttentionLease | None = None
+    attention_last_seen: Mapping[str, int] = field(default_factory=dict)
     verification_intensity: str = "normal"
     exploration_budget: str = "normal"
     retry_policy: str = "normal"
@@ -252,6 +492,21 @@ class BehaviorState:
                            _ids(self.active_stateworks, "active_stateworks", limit=16))
         object.__setattr__(self, "focus_criteria",
                            _ids(self.focus_criteria, "focus_criteria", limit=8))
+        lease = self.attention_lease
+        if lease is not None and not isinstance(lease, AttentionLease):
+            lease = AttentionLease.from_mapping(lease)
+            object.__setattr__(self, "attention_lease", lease)
+        if lease is not None and lease.criterion_ids != self.focus_criteria:
+            raise ValueError("focus criteria must match the active attention lease")
+        if (not isinstance(self.attention_last_seen, Mapping)
+                or len(self.attention_last_seen) > 256):
+            raise ValueError("attention history must be bounded to 256 criteria")
+        attention_last_seen = {}
+        for criterion_id, action_index in self.attention_last_seen.items():
+            attention_last_seen[_text(criterion_id, "attention criterion ID", limit=128)] = (
+                _nonnegative_int(action_index, "attention action index"))
+        object.__setattr__(self, "attention_last_seen",
+                           MappingProxyType(attention_last_seen))
         if self.verification_intensity not in {"passive", "normal", "high", "strict"}:
             raise ValueError("unsupported verification intensity")
         if self.exploration_budget not in {"disabled", "low", "normal", "bounded"}:
@@ -277,6 +532,9 @@ class BehaviorState:
                 "framework_modes": dict(self.framework_modes),
                 "active_stateworks": list(self.active_stateworks),
                 "focus_criteria": list(self.focus_criteria),
+                "attention_lease": (self.attention_lease.to_dict()
+                                    if self.attention_lease is not None else None),
+                "attention_last_seen": dict(self.attention_last_seen),
                 "verification_intensity": self.verification_intensity,
                 "exploration_budget": self.exploration_budget,
                 "retry_policy": self.retry_policy, "recovery_level": self.recovery_level,
@@ -298,6 +556,12 @@ class BehaviorState:
             for item in data.get("intervention_history", ()))
         for name in ("active_stateworks", "focus_criteria"):
             data[name] = tuple(data.get(name, ()))
+        if data.get("attention_lease") is not None:
+            data["attention_lease"] = (
+                data["attention_lease"]
+                if isinstance(data["attention_lease"], AttentionLease)
+                else AttentionLease.from_mapping(data["attention_lease"]))
+        data["attention_last_seen"] = dict(data.get("attention_last_seen") or {})
         return cls(**data)
 
 
@@ -319,7 +583,7 @@ class BehaviorDirective:
         _text(self.value, "directive value", limit=2048)
         _text(self.expected_effect, "expected effect", limit=512)
         if self.operation not in {"set_mode", "set_framework", "set_control",
-                                  "prefer_statework"}:
+                                  "prefer_statework", "release_statework"}:
             raise ValueError("unsupported behavior directive operation")
         if not 1 <= self.expires_after_actions <= 64:
             raise ValueError("directive expiry must be between one and 64 actions")
@@ -469,5 +733,7 @@ class BehavioralDecision:
 __all__ = [
     "BEHAVIOR_MODES", "INTERVENTION_ATTRIBUTIONS", "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
     "BehavioralDecision", "CSWBehaviorSnapshot", "FrameworkSignal",
+    "AttentionLease", "GoalItemSnapshot", "GoalSetSnapshot",
     "InterventionOutcome", "InterventionTarget", "StateWorkOption",
+    "TaskSetOutcome",
 ]

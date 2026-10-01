@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sqlite3
 from contextlib import contextmanager
-from typing import Mapping
+from typing import Any, Mapping, Sequence
 
 from ..behavior_state import BehaviorState
 
@@ -16,6 +16,13 @@ class RuntimeStateRecord:
     state: BehaviorState
     action_index: int
     application_receipts: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class RuntimeOutboxEvent:
+    scope: str
+    event_id: str
+    event: Mapping[str, Any]
 
 
 class BehaviorStateStore:
@@ -44,6 +51,15 @@ class BehaviorStateStore:
                     action_index INTEGER NOT NULL,
                     PRIMARY KEY (scope, intervention_id)
                 );
+                CREATE TABLE IF NOT EXISTS runtime_event_outbox (
+                    scope TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    action_index INTEGER NOT NULL,
+                    PRIMARY KEY (scope, event_id)
+                );
+                CREATE INDEX IF NOT EXISTS runtime_event_outbox_scope_order
+                    ON runtime_event_outbox(scope, action_index, event_id);
             """)
 
     @contextmanager
@@ -88,7 +104,8 @@ class BehaviorStateStore:
 
     def save(self, scope: str, *, expected_revision: int,
              expected_action_index: int, action_index: int, state: BehaviorState,
-             application_receipts: Mapping[str, tuple[str, ...]] | None = None) -> None:
+             application_receipts: Mapping[str, tuple[str, ...]] | None = None,
+             outbox_events: Sequence[Mapping[str, Any]] = ()) -> None:
         if state.revision != expected_revision + 1:
             raise ValueError("saved DP behavior state must advance exactly one revision")
         if action_index < 0:
@@ -96,6 +113,21 @@ class BehaviorStateStore:
         receipts = dict(application_receipts or {})
         if len(receipts) > 16:
             raise ValueError("intervention application receipt count exceeds its bound")
+        if not isinstance(outbox_events, (tuple, list)) or len(outbox_events) > 32:
+            raise ValueError("runtime outbox event batch exceeds its bound")
+        encoded_outbox: dict[str, str] = {}
+        for event in outbox_events:
+            if not isinstance(event, Mapping):
+                raise ValueError("runtime outbox events must be mappings")
+            event_id = event.get("event_id")
+            if (not isinstance(event_id, str) or not event_id
+                    or len(event_id) > 128 or event.get("scope") != scope):
+                raise ValueError("runtime outbox event identity escapes its DP scope")
+            encoded = json.dumps(dict(event), sort_keys=True, separators=(",", ":"))
+            prior = encoded_outbox.get(event_id)
+            if prior is not None and prior != encoded:
+                raise ValueError("runtime outbox event ID has conflicting payloads")
+            encoded_outbox[event_id] = encoded
         for intervention_id, directive_ids in receipts.items():
             if (not isinstance(intervention_id, str) or not intervention_id
                     or len(intervention_id) > 128
@@ -141,7 +173,45 @@ class BehaviorStateStore:
                     "(scope, intervention_id, directive_ids_json, action_index) "
                     "VALUES (?, ?, ?, ?)",
                     (scope, intervention_id, encoded, action_index))
+            for event_id, encoded in encoded_outbox.items():
+                prior = database.execute(
+                    "SELECT event_json FROM runtime_event_outbox "
+                    "WHERE scope=? AND event_id=?", (scope, event_id)).fetchone()
+                if prior is not None and prior[0] != encoded:
+                    database.rollback()
+                    raise RuntimeError("runtime outbox event payload changed")
+                database.execute(
+                    "INSERT OR IGNORE INTO runtime_event_outbox "
+                    "(scope, event_id, event_json, action_index) VALUES (?, ?, ?, ?)",
+                    (scope, event_id, encoded, action_index))
+            database.commit()
+
+    def pending_outbox(self, scope: str, *, limit: int = 64
+                       ) -> tuple[RuntimeOutboxEvent, ...]:
+        if type(limit) is not int or not 1 <= limit <= 256:
+            raise ValueError("runtime outbox read limit must be between one and 256")
+        with self._connect() as database:
+            rows = database.execute(
+                "SELECT event_id, event_json FROM runtime_event_outbox "
+                "WHERE scope=? ORDER BY action_index, event_id LIMIT ?",
+                (scope, limit)).fetchall()
+        events = []
+        for event_id, encoded in rows:
+            payload = json.loads(encoded)
+            if (not isinstance(payload, dict) or payload.get("event_id") != event_id
+                    or payload.get("scope") != scope):
+                raise RuntimeError("persisted runtime outbox event is malformed")
+            events.append(RuntimeOutboxEvent(scope, str(event_id), payload))
+        return tuple(events)
+
+    def acknowledge_outbox_event(self, scope: str, event_id: str) -> None:
+        """Remove an event only after the idempotent event sink accepts it."""
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            database.execute(
+                "DELETE FROM runtime_event_outbox WHERE scope=? AND event_id=?",
+                (scope, event_id))
             database.commit()
 
 
-__all__ = ["BehaviorStateStore", "RuntimeStateRecord"]
+__all__ = ["BehaviorStateStore", "RuntimeOutboxEvent", "RuntimeStateRecord"]

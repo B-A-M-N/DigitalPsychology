@@ -8,7 +8,9 @@ from typing import Any, Mapping, Sequence
 
 from ..behavior_state import (BehaviorDirective, BehaviorIntervention,
                               BehaviorState, BehavioralDecision,
-                              CSWBehaviorSnapshot, InterventionOutcome)
+                              CSWBehaviorSnapshot, GoalItemSnapshot,
+                              GoalSetSnapshot, InterventionOutcome)
+from ..attention import schedule_attention
 from ..fast_loop import FastLoopInput
 from ..outcomes import InterventionEvaluationFrame, InterventionEventContext
 from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
@@ -27,6 +29,7 @@ class RuntimeTurnResult:
     outcome_event_ids: tuple[str, ...]
     application_event_ids: tuple[str, ...]
     behavior_context: str
+    pending_event_ids: tuple[str, ...] = ()
 
 
 class RuntimeSession:
@@ -48,7 +51,7 @@ class RuntimeSession:
         self.identity = identity
         self.scope = identity.scope
         self.objective_criteria = tuple(objective_criteria)
-        if (len(self.objective_criteria) > 8
+        if (len(self.objective_criteria) > 256
                 or len(set(self.objective_criteria)) != len(self.objective_criteria)
                 or any(not isinstance(item, str) or not item or len(item) > 128
                        for item in self.objective_criteria)):
@@ -62,6 +65,7 @@ class RuntimeSession:
         self.outcome_evidence_authority = outcome_evidence_authority
         self.state_store = state_store
         self.system_one_frame_factory = system_one_frame_factory
+        self._latest_goal_set: GoalSetSnapshot | None = None
         if system_one_frame_factory is not None and not callable(
                 getattr(controller, "judge", None)):
             raise TypeError("System-1 frame construction requires a DP host judge")
@@ -71,12 +75,22 @@ class RuntimeSession:
                        judgment: Any = None) -> RuntimeTurnResult:
         """Observe one host action, decide, apply, and durably record DP changes."""
         with self._lock:
+            self._dispatch_outbox()
             record = self.state_store.load(self.scope)
             if observation.action_index <= record.action_index:
                 raise ValueError("host action index must advance the runtime session")
             unknown = set(observation.criterion_status) - set(self.objective_criteria)
             if unknown:
                 raise ValueError(f"host criteria escape the runtime objective: {sorted(unknown)}")
+            goal_set = self._goal_set(observation)
+            if goal_set is not None:
+                goal_ids = {item.criterion_id for item in goal_set.items}
+                if goal_ids != set(self.objective_criteria):
+                    raise ValueError("host goal set must cover the complete runtime objective")
+                attention = schedule_attention(
+                    goal_set, record.state, action_index=observation.action_index)
+            else:
+                attention = None
 
             snapshot = self._csw_snapshot()
             candidate_statework_ids = self._candidate_statework_ids(snapshot)
@@ -86,7 +100,8 @@ class RuntimeSession:
                 raise ValueError("CFW adapter returned malformed behavioral signals")
             if judgment is None and self.system_one_frame_factory is not None:
                 frame = self.system_one_frame_factory(
-                    self.identity, self.objective, self.objective_criteria,
+                    self.identity, self.objective,
+                    (attention.lease.criterion_ids if attention and attention.lease else ()),
                     record.state, observation, snapshot, signals)
                 if not isinstance(frame, SystemOneFrame):
                     raise TypeError("System-1 frame factory must return a validated frame")
@@ -94,12 +109,16 @@ class RuntimeSession:
                     raise ValueError("System-1 frame identity escapes the runtime session")
                 judgment = self.controller.judge(frame)
             outcome_assessments = self._assess_ready_interventions(
-                record, observation)
+                record, observation, goal_set=goal_set,
+                attention_last_seen=(attention.last_seen if attention else {}))
             decision_input = FastLoopInput(
                 scope=self.scope,
                 state=record.state,
                 csw_snapshot=snapshot,
                 objective_criteria=self.objective_criteria,
+                goal_set=goal_set,
+                attention_lease=attention.lease if attention else None,
+                attention_last_seen=attention.last_seen if attention else {},
                 cfw_signals=signals,
                 active_trigger_codes=observation.active_trigger_codes,
                 actions_since_goal_progress=observation.actions_since_goal_progress,
@@ -119,14 +138,20 @@ class RuntimeSession:
                 self.controller.decide_behavior(decision_input, judgment=judgment))
             if decision.expected_revision != record.state.revision:
                 raise RuntimeError("DP controller returned a stale behavior revision")
+            if decision.state.attention_lease != (attention.lease if attention else None):
+                raise RuntimeError("DP controller did not apply the host task-set attention lease")
 
             cfw_directives = tuple(item for item in decision.directives
-                                   if item.operation != "prefer_statework")
+                                   if item.operation not in {
+                                       "prefer_statework", "release_statework"})
             prepared = self.cfw.prepare_behavior_directives(
                 tuple(item.to_dict() for item in cfw_directives))
             applied: set[str] = set()
-            activated_statework: str | None = None
+            activation_attempted: str | None = None
+            release_attempts: list[str] = []
             updated_snapshot = snapshot
+            application_event_payloads: list[Mapping[str, Any]] = []
+            outcome_event_payloads: list[Mapping[str, Any]] = []
             try:
                 cfw_applied = tuple(self.cfw.apply_behavior_directives(
                     prepared, decision.state.to_dict()))
@@ -137,6 +162,25 @@ class RuntimeSession:
                     raise RuntimeError("CFW did not apply the exact prepared directives")
                 applied.update(cfw_applied)
 
+                releases = [item for item in decision.directives
+                            if item.operation == "release_statework"]
+                if len({item.target for item in releases}) != len(releases):
+                    raise RuntimeError("DP requested duplicate CSW StateWork releases")
+                for directive in releases:
+                    if directive.value != "unselected":
+                        raise RuntimeError("DP StateWork release must restore unselected state")
+                    if directive.target not in updated_snapshot.active_stateworks:
+                        raise RuntimeError(
+                            "DP cannot release a StateWork that is not active in CSW")
+                    release_attempts.append(directive.target)
+                    updated_snapshot = self.csw.deactivate_statework(
+                        directive.target,
+                        expected_selection_revision=updated_snapshot.revision,
+                        candidate_statework_ids=candidate_statework_ids)
+                    if directive.target in updated_snapshot.active_stateworks:
+                        raise RuntimeError("CSW did not confirm StateWork release")
+                    applied.add(directive.directive_id)
+
                 preferences = [item for item in decision.directives
                                if item.operation == "prefer_statework"]
                 if len(preferences) > 1 or len(decision.preferred_stateworks) > 1:
@@ -145,17 +189,17 @@ class RuntimeSession:
                     directive = preferences[0]
                     statework_id = directive.target
                     eligible = {item.statework_id
-                                for item in snapshot.eligible_stateworks}
+                                for item in updated_snapshot.eligible_stateworks}
                     if (statework_id not in eligible
                             or decision.preferred_stateworks != (statework_id,)):
                         raise RuntimeError("DP selected a StateWork outside CSW eligibility")
+                    activation_attempted = statework_id
                     updated_snapshot = self.csw.activate_statework(
                         statework_id,
-                        expected_selection_revision=snapshot.revision,
+                        expected_selection_revision=updated_snapshot.revision,
                         candidate_statework_ids=candidate_statework_ids)
                     if statework_id not in updated_snapshot.active_stateworks:
                         raise RuntimeError("CSW did not confirm StateWork activation")
-                    activated_statework = statework_id
                     applied.add(directive.directive_id)
 
                 confirmed_snapshot = self._csw_snapshot(
@@ -169,7 +213,30 @@ class RuntimeSession:
                     record.state, decision, applied)
                 # Commit only the DP projection here. CFW materializes it at
                 # the next model boundary through its explicit adapter API.
-                context = self.project_behavior_context(decision.state, updated_snapshot)
+                context = self.project_behavior_context(
+                    decision.state, updated_snapshot, goal_set=goal_set)
+                new_interventions = {item.intervention_id: item
+                                     for item in decision.state.active_interventions
+                                     if item.intervention_id not in {
+                                         old.intervention_id
+                                         for old in record.state.active_interventions}}
+                for intervention_id, intervention in new_interventions.items():
+                    directive_group = tuple(item for item in decision.directives
+                                            if item.intervention_id == intervention_id)
+                    directive_ids = tuple(sorted(
+                        item.directive_id for item in directive_group
+                        if item.directive_id in applied))
+                    if len(directive_ids) != len(directive_group):
+                        raise RuntimeError(
+                            "active intervention lacks a complete application receipt")
+                    application_event_payloads.append(
+                        self.controller.prepare_intervention_application(
+                            intervention, directive_group, directive_ids,
+                            event_context=self._event_context()))
+                for outcome in decision.intervention_outcomes:
+                    outcome_event_payloads.append(
+                        self.controller.prepare_intervention_outcome(
+                            outcome, event_context=self._event_context()))
                 self.state_store.save(
                     self.scope,
                     expected_revision=record.state.revision,
@@ -177,48 +244,53 @@ class RuntimeSession:
                     action_index=observation.action_index,
                     state=decision.state,
                     application_receipts=receipts,
+                    outbox_events=tuple(application_event_payloads
+                                        + outcome_event_payloads),
                 )
+                self._latest_goal_set = goal_set
             except Exception as failure:
                 compensation_errors = []
                 try:
                     self.cfw.rollback_behavior_directives(prepared)
                 except Exception as exc:
                     compensation_errors.append(f"CFW rollback failed: {exc}")
-                if activated_statework is not None:
+                if activation_attempted is not None:
                     try:
-                        self.csw.deactivate_statework(
-                            activated_statework,
-                            expected_selection_revision=updated_snapshot.revision,
+                        current = self._csw_snapshot(
                             candidate_statework_ids=candidate_statework_ids)
+                        if activation_attempted in current.active_stateworks:
+                            current = self.csw.deactivate_statework(
+                                activation_attempted,
+                                expected_selection_revision=current.revision,
+                                candidate_statework_ids=candidate_statework_ids)
                     except Exception as exc:
                         compensation_errors.append(f"CSW activation rollback failed: {exc}")
+                for statework_id in reversed(release_attempts):
+                    try:
+                        current = self._csw_snapshot(
+                            candidate_statework_ids=candidate_statework_ids)
+                        if statework_id not in current.active_stateworks:
+                            current = self.csw.activate_statework(
+                                statework_id,
+                                expected_selection_revision=current.revision,
+                                candidate_statework_ids=candidate_statework_ids)
+                        if statework_id not in current.active_stateworks:
+                            raise RuntimeError("CSW did not confirm StateWork release rollback")
+                    except Exception as exc:
+                        compensation_errors.append(f"CSW release rollback failed: {exc}")
                 if compensation_errors:
                     raise RuntimeError(
                         "DP decision application failed and compensation was incomplete: "
                         + "; ".join(compensation_errors)) from failure
                 raise
 
-            application_events = []
-            outcome_events = []
-            new_interventions = {item.intervention_id: item
-                                 for item in decision.state.active_interventions
-                                 if item.intervention_id not in {
-                                     old.intervention_id
-                                     for old in record.state.active_interventions}}
-            for intervention_id, intervention in new_interventions.items():
-                directive_group = tuple(item for item in decision.directives
-                                        if item.intervention_id == intervention_id)
-                directive_ids = tuple(sorted(
-                    item.directive_id for item in directive_group
-                    if item.directive_id in applied))
-                if len(directive_ids) != len(directive_group):
-                    raise RuntimeError("active intervention lacks a complete application receipt")
-                application_events.append(self.controller.record_intervention_application(
-                    intervention, directive_group, directive_ids,
-                    event_context=self._event_context()))
-            for outcome in decision.intervention_outcomes:
-                outcome_events.append(self.controller.record_intervention_outcome(
-                    outcome, event_context=self._event_context()))
+            self._dispatch_outbox()
+            application_events = [str(item["event_id"])
+                                  for item in application_event_payloads]
+            outcome_events = [str(item["event_id"])
+                              for item in outcome_event_payloads]
+            pending_event_ids = tuple(
+                item.event_id for item in self.state_store.pending_outbox(self.scope))
 
             return RuntimeTurnResult(
                 decision=decision, state=decision.state,
@@ -227,7 +299,21 @@ class RuntimeSession:
                 outcome_event_ids=tuple(outcome_events),
                 application_event_ids=tuple(application_events),
                 behavior_context=context,
+                pending_event_ids=pending_event_ids,
             )
+
+    def _dispatch_outbox(self) -> None:
+        """Deliver committed events idempotently, retaining any failed event."""
+        for item in self.state_store.pending_outbox(self.scope):
+            try:
+                delivered_id = self.controller.dispatch_runtime_event(item.event)
+                if delivered_id != item.event_id:
+                    raise RuntimeError("event sink returned another outbox event ID")
+                self.state_store.acknowledge_outbox_event(self.scope, item.event_id)
+            except Exception:
+                # The durable outbox is the source of retry. A transport/store
+                # failure cannot roll back the already committed behavior turn.
+                break
 
     def apply_workflow_step(self, statework_id: str, step_id: str, *,
                             evidence_refs: Sequence[str],
@@ -277,14 +363,32 @@ class RuntimeSession:
         return tuple(sorted(values))
 
     def project_behavior_context(self, state: BehaviorState | None = None,
-                                 snapshot: CSWBehaviorSnapshot | None = None) -> str:
+                                 snapshot: CSWBehaviorSnapshot | None = None,
+                                 *, goal_set: GoalSetSnapshot | None = None) -> str:
         state = state or self.state_store.load(self.scope).state
         snapshot = snapshot or self._csw_snapshot()
+        goal_set = goal_set or self._latest_goal_set
+        runnable = goal_set.runnable_items if goal_set is not None else ()
+        focused = set(state.focus_criteria)
+        next_ready = sorted(
+            (item for item in runnable if item.criterion_id not in focused),
+            key=lambda item: (-item.priority, item.criterion_id))[:2]
+        oldest_starved = sorted(
+            runnable,
+            key=lambda item: (state.attention_last_seen.get(item.criterion_id, -1),
+                              item.criterion_id))[:1]
         payload = {
             "revision": state.revision,
             "objective": self.objective,
-            "objective_criteria": list(self.objective_criteria),
-            "focus_criteria": list(state.focus_criteria or self.objective_criteria),
+            "task_set_summary": (goal_set.required_counts if goal_set is not None else {
+                "total": 0, "verified": 0, "ready": 0, "blocked": 0,
+                "dependency_blocked": 0, "deferred": 0, "remaining_required": 0,
+            }),
+            "attention_window": list(state.focus_criteria),
+            "attention_lease": (state.attention_lease.to_dict()
+                                if state.attention_lease is not None else None),
+            "next_ready": [item.criterion_id for item in next_ready],
+            "oldest_starved": (oldest_starved[0].criterion_id if oldest_starved else None),
             "cognitive_mode": state.cognitive_mode,
             "framework_modes": dict(state.framework_modes),
             "controls": {
@@ -304,18 +408,57 @@ class RuntimeSession:
                 key: list(value) for key, value in snapshot.eligible_steps.items()},
             "csw_eligible_stateworks": [item.to_dict()
                                          for item in snapshot.eligible_stateworks],
-            "active_interventions": [item.to_dict()
-                                     for item in state.active_interventions],
+            "active_interventions": [{
+                "intervention_id": item.intervention_id,
+                "cause": item.cause,
+                "expected_effect": item.expected_effect,
+                "actions_remaining": max(0, item.expires_after_actions - item.actions_elapsed),
+                "target_criteria": list(item.target_criteria),
+            } for item in state.active_interventions],
         }
         return ("===== DIGITAL PSYCHOLOGY BEHAVIOR STATE =====\n"
                 "Host-selected behavioral guidance; CFW/WARD/CSW authority gates remain active.\n"
                 + json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
+    def _goal_set(self, observation: RuntimeObservation) -> GoalSetSnapshot | None:
+        if observation.goal_set is not None:
+            return observation.goal_set
+        if not self.objective_criteria:
+            return None
+        # Compatibility for hosts that have not adopted GoalSetSnapshot yet.
+        # Task-global counters remain usable only for a single-criterion goal;
+        # multi-item callers must provide per-criterion facts for adaptation.
+        return self._goal_set_from_statuses(
+            observation.criterion_status, revision=0,
+            actions_since_progress=(observation.actions_since_goal_progress
+                                    if len(self.objective_criteria) == 1 else 0),
+            equivalent_retry_count=(observation.equivalent_retry_count
+                                    if len(self.objective_criteria) == 1 else 0))
+
+    def _goal_set_from_statuses(self, statuses: Mapping[str, str], *, revision: int,
+                                actions_since_progress: int = 0,
+                                equivalent_retry_count: int = 0) -> GoalSetSnapshot:
+        host_status = {
+            "unmet": "READY", "in_progress": "ACTIVE", "verified": "VERIFIED",
+            "blocked": "BLOCKED", "unknown": "READY",
+        }
+        items = tuple(GoalItemSnapshot(
+            criterion_id=criterion_id,
+            status=host_status.get(statuses.get(criterion_id, "unmet"), "READY"),
+            actions_since_progress=(actions_since_progress
+                                    if len(self.objective_criteria) == 1 else 0),
+            equivalent_retry_count=(equivalent_retry_count
+                                    if len(self.objective_criteria) == 1 else 0),
+        ) for criterion_id in self.objective_criteria)
+        return GoalSetSnapshot(revision=revision, items=items)
+
     def _assess_ready_interventions(
             self, record: RuntimeStateRecord,
-            observation: RuntimeObservation) -> list[InterventionOutcome]:
+            observation: RuntimeObservation, *, goal_set: GoalSetSnapshot | None,
+            attention_last_seen: Mapping[str, int]) -> list[InterventionOutcome]:
         results = []
-        applied_ids = tuple(sorted(record.application_receipts))
+        active_ids = {item.intervention_id for item in record.state.active_interventions}
+        applied_ids = tuple(sorted(active_ids & set(record.application_receipts)))
         competing_ids = tuple(sorted(item.intervention_id
                                       for item in record.state.active_interventions))
         next_revision = record.state.revision + 1
@@ -335,6 +478,8 @@ class RuntimeSession:
                     item for item in competing_ids
                     if item != intervention.intervention_id),
                 evidence_refs=observation.evidence_refs,
+                goal_set=goal_set,
+                attention_last_seen=attention_last_seen,
             )
             assessed = self.controller.assess_intervention_outcome(
                 intervention, frame,
