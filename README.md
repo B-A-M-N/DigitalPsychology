@@ -455,11 +455,6 @@ DP's promotion receipts are authoritative for its own experiment artifacts, but 
 
 These projects are released under the [MIT License](LICENSE). Contributions are welcome through repository issues and pull requests. Please include a focused regression or acceptance check for behavior changes, keep authority boundaries explicit, and do not claim model-performance improvements without the corresponding qualification evidence.
 
-## FreeInference attribution
-This work benefited in some way from inference provided by [freeinference.org](https://freeinference.org/).
-
-These are independent developments that are not reviewed, endorsed, or sponsored by FreeInference. If you find these projects genuinely useful, please consider donating to or sponsoring FreeInference, which provides a vital inference service.
-
 ## Controlled knowledge sharing
 
 Raw observations remain origin-scoped evidence. They do not become another agent's instructions merely by being stored.
@@ -467,3 +462,9 @@ Raw observations remain origin-scoped evidence. They do not become another agent
 Routing profiles declare `agent_private`, `application_shared`, or `cross_application` scope. Wider scope requires a candidate-bound, hash-authenticated promotion decision; cross-application sharing additionally requires explicit data-sharing authorization. CFW adoption remains a separate per-task decision tied to the exact profile hash.
 
 Provenance identity and experimental comparison context are separate. Exact session, task, attempt, interaction, and delegation IDs identify causal evidence, while model, harness, role, task family, environment, and effective policy determine whether trials are comparable. Shared interaction evidence is rejected when it crosses experimental cohorts, and all treatment failures inherited from one shared premise cannot create an individual corrective profile.
+
+## FreeInference Acknowledgement
+
+This work benefited in some way from inference provided by [freeinference.org](https://freeinference.org/).
+
+These are independent developments that are not reviewed, endorsed, or sponsored by FreeInference. If you find these projects useful, please consider donating to or sponsoring FreeInference, which provides a vital inference service.
