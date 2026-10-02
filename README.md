@@ -281,6 +281,10 @@ sends completed action observations to DP, applies prepared CFW and CSW
 directives through local adapters, and commits only after those authorities
 confirm their revisions.
 
+The private transport requires MCP Python SDK 2.2 or newer. Install the project
+and launch the host bridge from the same environment so the client and server
+use the declared MCP version.
+
 The host process can open a bridge directly:
 
 ```python

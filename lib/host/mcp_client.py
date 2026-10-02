@@ -126,12 +126,14 @@ class MCPControlClient:
                 session.call_tool(name, dict(arguments)), self.timeout_seconds)
         except Exception as exc:
             raise MCPControlUnavailable(f"DP MCP transport failed during {name}") from exc
-        if result.isError:
+        is_error = getattr(result, "is_error", getattr(result, "isError", False))
+        if is_error:
             details = "\n".join(
                 item.text for item in result.content
                 if getattr(item, "type", None) == "text")
             raise RuntimeError(f"DigitalPsychology MCP {name} failed: {details[:2048]}")
-        structured = getattr(result, "structuredContent", None)
+        structured = getattr(
+            result, "structured_content", getattr(result, "structuredContent", None))
         if isinstance(structured, Mapping):
             value = dict(structured)
         else:

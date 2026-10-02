@@ -4,18 +4,18 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 except ImportError:  # transport stays optional for library consumers
-    FastMCP = None
+    MCPServer = None
 
 from ..service import DigitalPsychologyService
 
 
 def create_admin_server(service: DigitalPsychologyService | None = None):
-    if FastMCP is None:
+    if MCPServer is None:
         raise RuntimeError("MCP transport dependency is not installed")
     service = service or DigitalPsychologyService()
-    server = FastMCP(
+    server = MCPServer(
         "digital-psychology-admin",
         instructions=("Operator-only telemetry, profile validation, and experiment "
                       "administration. This interface is separate from the private "

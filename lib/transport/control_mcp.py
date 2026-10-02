@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 except ImportError:  # transport stays optional for library-only consumers
-    FastMCP = None
+    MCPServer = None
 
 from ..control.service import ControlPlaneService
 from ..feedback_loop import trusted_state_root
@@ -37,10 +37,10 @@ def _control_from_environment() -> ControlPlaneService:
 
 
 def create_control_server(control: ControlPlaneService | None = None):
-    if FastMCP is None:
+    if MCPServer is None:
         raise RuntimeError("MCP transport dependency is not installed")
     control = control or _control_from_environment()
-    server = FastMCP(
+    server = MCPServer(
         "digital-psychology-control",
         instructions=("Host-only behavioral control protocol. This server applies no "
                       "CFW or CSW changes itself; the trusted host must apply returned "
