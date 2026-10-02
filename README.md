@@ -50,15 +50,17 @@ Install the package and configure the MCP client to launch its stdio command:
 
 ```bash
 python3 -m pip install -e .
-digital-psychology-mcp
+digital-psychology-admin-mcp
 ```
 
 The command runs as a child process of an operator MCP client and waits for
 protocol messages on stdin. Keep stdout reserved for MCP traffic. It exposes
 DP's telemetry, advice, profile-validation, and slow-loop administration
-tools; do not register it in the controlled agent's tool namespace. The
-private `digital-psychology-control-mcp` process is launched by
-`HostControlBridge` and is never registered with the model.
+tools. Register it only in a trusted operator namespace, never in the
+controlled agent's model-visible tool list. The old
+`digital-psychology-mcp` command remains a compatibility alias. The private
+`digital-psychology-control-mcp` process is launched by `HostControlBridge`
+over a separate host-only connection.
 
 The service stores ordinary state under `DIGITALPSYCHOLOGY_STATE_ROOT` (or the platform state directory). Ordinary, non-privileged events can be ingested without an authentication secret for local fixtures. In a deployment where agents can reach the MCP surface, configure `DIGITALPSYCHOLOGY_INGESTION_SECRET`; privileged categories (`validation`, `state_transition`, `completion`) and operator/repository-owner actors require host attestation.
 

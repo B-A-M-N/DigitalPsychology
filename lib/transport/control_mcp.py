@@ -16,7 +16,7 @@ except ImportError:  # transport stays optional for library-only consumers
 
 from ..control.service import ControlPlaneService
 from ..feedback_loop import trusted_state_root
-from ..mcp_server import DigitalPsychologyService
+from ..service import DigitalPsychologyService
 from ..runtime.store import BehaviorStateStore
 from ..system_one_service import SystemOneService
 

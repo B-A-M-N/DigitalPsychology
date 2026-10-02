@@ -16,6 +16,7 @@ system-one = ["laya==0.3.22"]
 
 [project.scripts]
 digital-psychology-mcp = "digital_psychology.mcp_server:main"
+digital-psychology-admin-mcp = "digital_psychology.transport.admin_mcp:main"
 digital-psychology-control-mcp = "digital_psychology.transport.control_mcp:main"
 
 [tool.setuptools]
