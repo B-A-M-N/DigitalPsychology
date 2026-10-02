@@ -11,8 +11,12 @@ from .outcomes import HostOutcomeFact
 from .runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
 
 
-PROTOCOL_VERSION = "1.1.0"
+PROTOCOL_VERSION = "1.2.0"
 MAX_CONTROL_PAYLOAD_BYTES = 131_072
+CONTROL_BOUNDARY_KINDS = frozenset({
+    "task_start", "pre_model_call", "pre_action", "post_action",
+    "validator", "workflow", "operator", "pre_completion",
+})
 
 
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
@@ -154,12 +158,20 @@ class ControlTickRequest:
     cfw_signals: tuple[FrameworkSignal, ...]
     csw_snapshot: CSWBehaviorSnapshot
     outcome_facts: tuple[HostOutcomeFact, ...] = ()
+    boundary_kind: str | None = None
+    boundary_sequence: int = 0
 
     def __post_init__(self) -> None:
         for name in ("control_session_id", "tick_id"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value or len(value) > 256:
                 raise ValueError(f"{name} must be bounded text")
+        kind = self.boundary_kind or (
+            "post_action" if self.observation.action_completed else "pre_action")
+        if kind not in CONTROL_BOUNDARY_KINDS:
+            raise ValueError("control boundary kind is unsupported")
+        if (type(self.boundary_sequence) is not int or self.boundary_sequence < 0):
+            raise ValueError("boundary_sequence must be a non-negative integer")
         if (type(self.expected_behavior_revision) is not int
                 or self.expected_behavior_revision < 0):
             raise ValueError("expected_behavior_revision must be non-negative")
@@ -181,6 +193,10 @@ class ControlTickRequest:
             raise ValueError("csw_snapshot is invalid")
         if not isinstance(self.observation, RuntimeObservation):
             raise ValueError("observation is invalid")
+        if self.observation.action_completed != (kind == "post_action"):
+            raise ValueError("only post_action boundaries confirm a completed host action")
+        if (kind == "pre_action") != (self.observation.candidate_action is not None):
+            raise ValueError("pre_action boundaries require exactly one action candidate")
         if self.observation.goal_set != self.goal_set:
             raise ValueError("observation and control request goal sets differ")
         refs = set(self.observation.evidence_refs)
@@ -191,6 +207,7 @@ class ControlTickRequest:
             raise ValueError("outcome facts must reference evidence in this observation")
         object.__setattr__(self, "cfw_signals", tuple(signals))
         object.__setattr__(self, "outcome_facts", tuple(outcomes))
+        object.__setattr__(self, "boundary_kind", kind)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ControlTickRequest":
@@ -198,7 +215,7 @@ class ControlTickRequest:
         expected = {"protocol_version", "control_session_id", "tick_id",
                     "expected_behavior_revision", "cfw_lifecycle_revision",
                     "observation", "goal_set", "cfw_signals", "csw_snapshot",
-                    "outcome_facts"}
+                    "outcome_facts", "boundary_kind", "boundary_sequence"}
         if set(data) != expected or data["protocol_version"] != PROTOCOL_VERSION:
             raise ValueError("control tick protocol version or fields are invalid")
         goal_set = parse_goal_set(data["goal_set"])
@@ -222,6 +239,8 @@ class ControlTickRequest:
             cfw_signals=tuple(FrameworkSignal(**dict(item)) for item in signals),
             csw_snapshot=parse_csw_snapshot(data["csw_snapshot"]),
             outcome_facts=tuple(HostOutcomeFact(**dict(item)) for item in outcome_facts),
+            boundary_kind=data["boundary_kind"],
+            boundary_sequence=data["boundary_sequence"],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -229,6 +248,8 @@ class ControlTickRequest:
             "protocol_version": PROTOCOL_VERSION,
             "control_session_id": self.control_session_id,
             "tick_id": self.tick_id,
+            "boundary_kind": self.boundary_kind,
+            "boundary_sequence": self.boundary_sequence,
             "expected_behavior_revision": self.expected_behavior_revision,
             "cfw_lifecycle_revision": self.cfw_lifecycle_revision,
             "observation": {

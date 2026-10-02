@@ -98,8 +98,7 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
         service.close()
 
     assert restored.sequence == 20
-    assert restored.question_ids == (
-        "action_relation", "progress_relation", "retry_relation", "goal_drift")
+    assert restored.question_ids == ("progress_relation",)
     assert restored.state.criteria[0].criterion_id == "criterion-visual"
     assert restored.state.criteria[0].status == "active"
 
@@ -117,7 +116,11 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
     candidate = ActionCandidate(
         action_class="file_edit",
         proposed_purpose="Implement the requested visual criterion",
-        affected_criterion_ids=("criterion-visual",), target_kind="repository")
+        affected_criterion_ids=("criterion-visual",),
+        action_id="action-visual-1", tool_name="apply_patch",
+        operation="edit_file", target_kind="repository",
+        mutating=True, reversible=True, external=False,
+        approach_epoch="approach-1")
     observation = RuntimeObservation(
         action_index=10, action_completed=False, goal_set=goals,
         candidate_action=candidate)
@@ -131,10 +134,22 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
         service.close()
 
     assert frame.sequence == 25
+    assert frame.question_ids == ("action_relation",)
     assert frame.state.candidate.source == "model_proposed"
     assert frame.state.candidate.action_class == "file_edit"
     assert frame.state.candidate.proposed_purpose == candidate.proposed_purpose
     assert frame.state.candidate.affected_criterion_ids == ("criterion-visual",)
+
+    request = ControlTickRequest(
+        control_session_id=identity.scope, tick_id="pre-action-roundtrip",
+        expected_behavior_revision=2, cfw_lifecycle_revision=0,
+        observation=observation, goal_set=goals, cfw_signals=(),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0),
+        boundary_kind="pre_action", boundary_sequence=37)
+    restored_request = ControlTickRequest.from_mapping(request.to_dict())
+    assert restored_request.boundary_kind == "pre_action"
+    assert restored_request.boundary_sequence == 37
+    assert restored_request.observation.candidate_action == candidate
 
 
 def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_path):
@@ -191,5 +206,5 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
     assert frame["state"]["workflows"][0]["current_state"] == "INSPECTING"
     assert audited["result"]["status"] == "shadow"
     assert {item["question_id"] for item in audited["result"]["judgment"]["answers"]} == {
-        "action_relation", "progress_relation", "retry_relation", "goal_drift"}
+        "retry_relation"}
     assert prepared["status"] == "prepared"

@@ -21,12 +21,11 @@ def create_system_one_frame_factory(system_one_service: Any):
                 else capability[name])
     enabled = set(system_one_service.enabled_question_families)
     supported = set(field("supported_question_families"))
-    question_ids = tuple(item for item in (
+    available_questions = tuple(item for item in (
         "action_relation", "progress_relation", "retry_relation", "goal_drift")
         if item in enabled and item in supported)
-    if not question_ids:
+    if not available_questions:
         return None
-
     def build(identity: RuntimeIdentity, objective: str,
               attention_criteria: Sequence[str], behavior_state: BehaviorState,
               observation: RuntimeObservation, csw: CSWBehaviorSnapshot,
@@ -81,6 +80,26 @@ def create_system_one_frame_factory(system_one_service: Any):
             artifact_changed=(None if candidate else observation.artifact_changed),
             progress_class=None if candidate else progress_class,
         )
+        # Laya's local checkpoint is a comparatively expensive CPU model. Ask
+        # the single question with the highest value for this boundary instead
+        # of batching every semantic family into every inference. This keeps
+        # inference within its host deadline and makes the requested judgment
+        # specific to the evidence currently available.
+        if candidate is not None:
+            preferred_question = "action_relation"
+        elif observation.equivalent_retry_count > 0 or any(
+                signal.active and any(token in signal.code.lower()
+                                      for token in ("retry", "repeat", "loop"))
+                for signal in cfw_signals):
+            preferred_question = "retry_relation"
+        elif (observation.progress_made or observation.regression_observed
+              or observation.artifact_changed or observation.evidence_refs):
+            preferred_question = "progress_relation"
+        else:
+            preferred_question = "goal_drift"
+        question_id = (preferred_question if preferred_question in available_questions
+                       else available_questions[0])
+        question_ids = (question_id,)
         workflows = tuple(WorkflowFact(
             statework_id=statework_id,
             current_state=csw.workflow_states.get(statework_id, "UNKNOWN"),

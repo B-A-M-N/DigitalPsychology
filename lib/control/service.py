@@ -73,6 +73,7 @@ class ControlPlaneService:
             "control_session_id": scope,
             "behavior_revision": record.state.revision,
             "host_action_index": record.action_index,
+            "boundary_sequence": self.state_store.latest_boundary_sequence(scope),
             "behavior_state": record.state.to_dict(),
             "capabilities": {
                 "prepare_commit": True,
@@ -100,16 +101,17 @@ class ControlPlaneService:
 
         preparation = self.engine.prepare(descriptor, record, request)
         decision = preparation.decision
-        boundary_phase = ("post_action" if request.observation.action_completed
-                          else "pre_action")
+        boundary_kind = str(request.boundary_kind)
         commit_action_index = (request.observation.action_index
-                               if boundary_phase == "post_action" else record.action_index)
+                               if boundary_kind == "post_action" else record.action_index)
         basis = {
             "expected_behavior_revision": record.state.revision,
             "expected_action_index": record.action_index,
             "host_action_index": request.observation.action_index,
             "commit_action_index": commit_action_index,
-            "boundary_phase": boundary_phase,
+            "boundary_phase": boundary_kind,
+            "boundary_kind": boundary_kind,
+            "boundary_sequence": request.boundary_sequence,
             "goal_set_revision": request.goal_set.revision,
             "cfw_lifecycle_revision": request.cfw_lifecycle_revision,
             "csw_selection_revision": request.csw_snapshot.revision,
@@ -217,6 +219,8 @@ class ControlPlaneService:
                 "commit_action_index", basis["host_action_index"])),
             "candidate_action_index": int(basis["host_action_index"]),
             "boundary_phase": basis.get("boundary_phase", "post_action"),
+            "boundary_kind": basis.get("boundary_kind", basis.get("boundary_phase", "post_action")),
+            "boundary_sequence": int(basis.get("boundary_sequence", 0)),
             "behavior_state": committed_state.to_dict(),
             "cfw_lifecycle_revision": request.cfw_lifecycle_revision,
             "csw_snapshot": request.csw_snapshot.to_dict(),
@@ -378,6 +382,7 @@ class ControlPlaneService:
             "behavior_state": record.state.to_dict(),
             "behavior_revision": record.state.revision,
             "host_action_index": record.action_index,
+            "boundary_sequence": self.state_store.latest_boundary_sequence(scope),
             "goal_set": latest_goal_set.to_dict(),
             "cfw_lifecycle_revision": data["cfw_lifecycle_revision"],
             "csw_snapshot": csw.to_dict(),

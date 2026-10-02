@@ -69,6 +69,7 @@ class BehaviorStateStore:
                 CREATE TABLE IF NOT EXISTS control_ticks (
                     scope TEXT NOT NULL,
                     tick_id TEXT NOT NULL,
+                    boundary_sequence INTEGER NOT NULL DEFAULT -1,
                     decision_id TEXT NOT NULL,
                     request_digest TEXT NOT NULL,
                     basis_json TEXT NOT NULL,
@@ -80,9 +81,15 @@ class BehaviorStateStore:
                     PRIMARY KEY (scope, tick_id),
                     UNIQUE (scope, decision_id)
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS control_ticks_one_pending
-                    ON control_ticks(scope) WHERE status='prepared';
+            CREATE UNIQUE INDEX IF NOT EXISTS control_ticks_one_pending
+                ON control_ticks(scope) WHERE status='prepared';
             """)
+            columns = {str(row[1]) for row in database.execute(
+                "PRAGMA table_info(control_ticks)").fetchall()}
+            if "boundary_sequence" not in columns:
+                database.execute(
+                    "ALTER TABLE control_ticks ADD COLUMN boundary_sequence "
+                    "INTEGER NOT NULL DEFAULT -1")
 
     @contextmanager
     def _connect(self):
@@ -187,11 +194,6 @@ class BehaviorStateStore:
                                          basis.get("host_action_index", -1))) != action_index):
                     database.rollback()
                     raise RuntimeError("control tick basis differs from the behavior-state commit")
-                if action_index < 0 and not (
-                        basis.get("boundary_phase") == "pre_action"
-                        and action_index == expected_action_index):
-                    database.rollback()
-                    raise ValueError("negative action index is valid only for initial pre-action state")
             row = database.execute(
                 "SELECT revision, action_index FROM behavior_state WHERE scope=?",
                 (scope,)).fetchone()
@@ -202,13 +204,14 @@ class BehaviorStateStore:
                 database.rollback()
                 raise RuntimeError(
                     "DP runtime compare-and-swap conflict; re-read session state")
-            pre_action_same_boundary = bool(
-                tick is not None
-                and json.loads(tick[1]).get("boundary_phase") == "pre_action"
-                and action_index == actual_action == expected_action_index)
-            if action_index <= actual_action and not pre_action_same_boundary:
+            basis = json.loads(tick[1]) if tick is not None else {}
+            advances_action = basis.get("boundary_kind", basis.get(
+                "boundary_phase", "post_action")) == "post_action"
+            valid_action_index = (action_index > actual_action if advances_action
+                                  else action_index == actual_action)
+            if not valid_action_index:
                 database.rollback()
-                raise ValueError("runtime action indexes must increase monotonically")
+                raise ValueError("control boundary action index is inconsistent")
             database.execute(
                 "INSERT INTO behavior_state(scope, revision, action_index, state_json) "
                 "VALUES (?, ?, ?, ?) ON CONFLICT(scope) DO UPDATE SET "
@@ -314,12 +317,18 @@ class BehaviorStateStore:
                     or actual_action != int(basis["expected_action_index"])):
                 database.rollback()
                 raise RuntimeError("control tick basis is stale")
+            latest_boundary = database.execute(
+                "SELECT COALESCE(MAX(boundary_sequence), -1) FROM control_ticks "
+                "WHERE scope=?", (scope,)).fetchone()[0]
+            if int(basis.get("boundary_sequence", -1)) <= int(latest_boundary):
+                database.rollback()
+                raise RuntimeError("control boundary sequence is stale")
             try:
                 database.execute(
-                    "INSERT INTO control_ticks(scope, tick_id, decision_id, request_digest, "
+                    "INSERT INTO control_ticks(scope, tick_id, boundary_sequence, decision_id, request_digest, "
                     "basis_json, decision_json, status, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)",
-                    (scope, tick_id, decision_id, request_digest,
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?)",
+                    (scope, tick_id, int(basis["boundary_sequence"]), decision_id, request_digest,
                      json.dumps(dict(basis), sort_keys=True, separators=(",", ":")),
                      json.dumps(dict(decision), sort_keys=True, separators=(",", ":")),
                      datetime.now(timezone.utc).isoformat()))
@@ -435,6 +444,13 @@ class BehaviorStateStore:
                 "SELECT basis_json FROM control_ticks WHERE scope=? AND status='committed' "
                 "ORDER BY created_at DESC LIMIT 1", (scope,)).fetchone()
         return json.loads(row[0]) if row is not None else None
+
+    def latest_boundary_sequence(self, scope: str) -> int:
+        with self._connect() as database:
+            row = database.execute(
+                "SELECT COALESCE(MAX(boundary_sequence), -1) FROM control_ticks "
+                "WHERE scope=?", (scope,)).fetchone()
+        return int(row[0]) if row is not None else -1
 
     def pending_outbox(self, scope: str, *, limit: int = 64
                        ) -> tuple[RuntimeOutboxEvent, ...]:

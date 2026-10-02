@@ -8,12 +8,13 @@ from typing import Any, Mapping, Sequence
 
 from ..behavior_state import (BehaviorState, CSWBehaviorSnapshot,
                               FrameworkSignal, GoalSetSnapshot)
-from ..control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
+from ..control_protocol import (CONTROL_BOUNDARY_KINDS, PROTOCOL_VERSION, ControlAbortRequest,
                                 ControlCommitRequest, ControlSessionDescriptor,
                                 ControlTickRequest)
 from ..outcomes import HostOutcomeFact
 from ..runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
-from ..runtime.projection import project_behavior_context
+from ..runtime.projection import (AuditProjection, build_behavior_projection,
+                                  replace_model_projection)
 from ..runtime.adapters.standalone import NullCSWWorkflowPort
 from .actuator import ActuationFailure, ControlActuator
 from .mcp_client import MCPControlClient, MCPControlUnavailable
@@ -47,12 +48,15 @@ class HostControlBridge:
         self._csw_identity = dict(csw_authority_identity or self._authority_identity())
         self._state = BehaviorState()
         self._action_index = -1
+        self._boundary_sequence = -1
         self._opened = False
         self._remote_open = False
         self._closed = False
         self._fault: str | None = None
         self._needs_reconciliation = False
+        self._offline_controls_expired = False
         self._latest_observation: RuntimeObservation | None = None
+        self._audit_projection = AuditProjection(metadata={})
         self._lock = asyncio.Lock()
 
     @property
@@ -62,6 +66,10 @@ class HostControlBridge:
     @property
     def behavior_state(self) -> BehaviorState:
         return self._state
+
+    @property
+    def audit_projection(self) -> Mapping[str, Any]:
+        return self._audit_projection.metadata
 
     async def open(self) -> Mapping[str, Any]:
         async with self._lock:
@@ -80,18 +88,70 @@ class HostControlBridge:
                            outcome_facts: Sequence[HostOutcomeFact] = ()
                            ) -> Mapping[str, Any]:
         """Run after a completed host-observed action or evidence boundary."""
+        return await self._control_boundary(
+            "post_action", observation, goal_set=goal_set,
+            outcome_facts=outcome_facts)
+
+    async def task_started(self) -> Mapping[str, Any]:
+        return await self._control_boundary("task_start")
+
+    async def before_action_candidate(self, candidate: ActionCandidate | Mapping[str, Any], *,
+                                      goal_set: GoalSetSnapshot | None = None
+                                      ) -> Mapping[str, Any]:
+        value = (candidate if isinstance(candidate, ActionCandidate)
+                 else ActionCandidate(**dict(candidate))
+                 if isinstance(candidate, Mapping) else None)
+        if value is None:
+            raise TypeError("pre-action boundary requires a validated ActionCandidate")
+        if not set(value.affected_criterion_ids).issubset(self.objective_criteria):
+            raise ValueError("candidate action criteria escape the control objective")
+        observation = self._boundary_observation(
+            "pre_action", goal_set=goal_set, candidate_action=value)
+        return await self._control_boundary(
+            "pre_action", observation, goal_set=goal_set)
+
+    async def observe_boundary(self, boundary_kind: str, *,
+                               observation: RuntimeObservation | None = None,
+                               goal_set: GoalSetSnapshot | None = None,
+                               outcome_facts: Sequence[HostOutcomeFact] = ()
+                               ) -> Mapping[str, Any]:
+        """Submit validator, workflow, operator, or pre-completion evidence."""
+        if boundary_kind not in {"validator", "workflow", "operator", "pre_completion"}:
+            raise ValueError("observe_boundary requires a validator, workflow, operator, or pre-completion boundary")
+        return await self._control_boundary(
+            boundary_kind, observation, goal_set=goal_set,
+            outcome_facts=outcome_facts)
+
+    async def _control_boundary(self, boundary_kind: str,
+                                observation: RuntimeObservation | None = None, *,
+                                goal_set: GoalSetSnapshot | None = None,
+                                outcome_facts: Sequence[HostOutcomeFact] = ()
+                                ) -> Mapping[str, Any]:
+        if boundary_kind not in CONTROL_BOUNDARY_KINDS:
+            raise ValueError("unsupported host control boundary kind")
         async with self._lock:
             self._require_open()
+            if observation is None:
+                observation = self._boundary_observation(
+                    boundary_kind, goal_set=goal_set)
             if not isinstance(observation, RuntimeObservation):
-                raise TypeError("host action observation is malformed")
-            if not observation.action_completed:
-                raise ValueError("DP control runs after completed host action boundaries")
+                raise TypeError("host control-boundary observation is malformed")
+            is_pre_action = boundary_kind == "pre_action"
+            if observation.action_completed != (boundary_kind == "post_action"):
+                raise ValueError("only post-action boundaries confirm a completed host action")
+            if is_pre_action != (observation.candidate_action is not None):
+                raise ValueError("pre-action boundary must contain exactly one action candidate")
             if not self._remote_open or self._needs_reconciliation:
                 if not await self._connect_or_degrade_locked(
-                        host_action_index=observation.action_index):
-                    self._expire_local_leases(observation.action_index)
+                        host_action_index=(observation.action_index
+                                           if boundary_kind in {"pre_action", "post_action"}
+                                           else None)):
+                    if boundary_kind in {"pre_action", "post_action"}:
+                        self._expire_local_leases(
+                            observation.action_index, expire_cfw=True)
                     return self._status()
-            if self._expire_local_leases(observation.action_index):
+            if (boundary_kind in {"pre_action", "post_action"}
+                    and self._expire_local_leases(observation.action_index)):
                 await self._reconcile_locked()
             goals = goal_set or observation.goal_set or self.goal_set
             if not isinstance(goals, GoalSetSnapshot):
@@ -99,19 +159,56 @@ class HostControlBridge:
             if goals.revision < self.goal_set.revision:
                 raise ValueError("host goal-set revision moved backwards")
             observation = replace(observation, goal_set=goals)
-            if observation.action_index <= self._action_index:
-                raise ValueError("host action index must advance DP control state")
+            if boundary_kind in {"pre_action", "post_action"}:
+                if observation.action_index <= self._action_index:
+                    raise ValueError("action boundary index must advance DP action state")
+            elif observation.action_index != max(0, self._action_index):
+                raise ValueError("non-action boundary must refer to the current DP action index")
             result = await self._apply_tick_locked(
-                observation, goals, outcome_facts=outcome_facts)
-            if result.get("status") == "ready":
+                observation, goals, boundary_kind=boundary_kind,
+                outcome_facts=outcome_facts)
+            if result.get("status") == "ready" and boundary_kind == "post_action":
                 self._latest_observation = observation
             return result
 
+    def _boundary_observation(self, boundary_kind: str, *,
+                              goal_set: GoalSetSnapshot | None = None,
+                              candidate_action: ActionCandidate | None = None
+                              ) -> RuntimeObservation:
+        if boundary_kind == "pre_action":
+            action_index = max(1, self._action_index + 1)
+            prior = self._latest_observation
+            return RuntimeObservation(
+                action_index=action_index, action_completed=False,
+                actions_since_goal_progress=(prior.actions_since_goal_progress if prior else 0),
+                equivalent_retry_count=(prior.equivalent_retry_count if prior else 0),
+                context_pressure=prior.context_pressure if prior else 0.0,
+                goal_set=goal_set or self.goal_set,
+                active_trigger_codes=(prior.active_trigger_codes if prior else ()),
+                approach_epoch=(candidate_action.approach_epoch if candidate_action
+                                and candidate_action.approach_epoch else
+                                prior.approach_epoch if prior else ""),
+                candidate_action=candidate_action,
+            )
+        prior = self._latest_observation
+        return RuntimeObservation(
+            action_index=max(0, self._action_index),
+            action_completed=False,
+            actions_since_goal_progress=(prior.actions_since_goal_progress if prior else 0),
+            equivalent_retry_count=(prior.equivalent_retry_count if prior else 0),
+            context_pressure=prior.context_pressure if prior else 0.0,
+            goal_set=goal_set or self.goal_set,
+            active_trigger_codes=(prior.active_trigger_codes if prior else ()),
+            approach_epoch=prior.approach_epoch if prior else "",
+        )
+
     async def _apply_tick_locked(self, observation: RuntimeObservation,
                                  goals: GoalSetSnapshot, *,
+                                 boundary_kind: str,
                                  outcome_facts: Sequence[HostOutcomeFact] = ()
                                  ) -> Mapping[str, Any]:
         snapshot, _candidates = self._csw_snapshot()
+        self._boundary_sequence += 1
         request = ControlTickRequest(
             control_session_id=self.identity.scope,
             tick_id=f"control-tick-{uuid.uuid4().hex}",
@@ -122,13 +219,17 @@ class HostControlBridge:
             cfw_signals=self._cfw_signals(observation),
             csw_snapshot=snapshot,
             outcome_facts=tuple(outcome_facts),
+            boundary_kind=boundary_kind,
+            boundary_sequence=self._boundary_sequence,
         )
         try:
             prepared = await self.client.prepare_control_tick(request.to_dict())
         except Exception as exc:
             if self._transport_failure(exc):
                 self._needs_reconciliation = True
-                self._expire_local_leases(observation.action_index)
+                if boundary_kind in {"pre_action", "post_action"}:
+                    self._expire_local_leases(
+                        observation.action_index, expire_cfw=True)
                 return self._degraded("DP control prepare unavailable", exc)
             raise
         if prepared.get("status") == "committed":
@@ -136,6 +237,7 @@ class HostControlBridge:
             if not isinstance(result, Mapping):
                 raise RuntimeError("DP returned a committed tick without its receipt")
             self._accept_committed(result, goals)
+            self._offline_controls_expired = False
             return self._status(result)
         if prepared.get("status") == "aborted":
             raise RuntimeError("DP returned an aborted control tick for a new action")
@@ -194,6 +296,7 @@ class HostControlBridge:
                 )
             raise
         self._accept_committed(result, goals)
+        self._offline_controls_expired = False
         self._fault = None
         self._needs_reconciliation = False
         return self._status(result)
@@ -205,19 +308,25 @@ class HostControlBridge:
 
     async def before_model_call(self, context: str, *, tool_capable: bool = False,
                                 action_hint: Mapping[str, Any] | None = None) -> str:
+        await self._control_boundary("pre_model_call")
         async with self._lock:
             self._require_open()
-            if not self._remote_open or self._needs_reconciliation:
-                await self._connect_or_degrade_locked()
             snapshot, _ = self._csw_snapshot()
-            projection = project_behavior_context(
-                self._state, snapshot, objective=self.objective,
+            projection_state = (BehaviorState() if self._offline_controls_expired
+                                else self._state)
+            projection = build_behavior_projection(
+                projection_state, snapshot, objective=self.objective,
                 goal_set=self.goal_set,
                 cfw_connected=bool(self._cfw_components),
                 csw_connected=self.csw is not None,
                 outcome_evidence_connected=self.outcome_evidence_connected,
             )
-            enriched = f"{context}\n{projection}" if context else projection
+            audit = dict(projection.audit.metadata)
+            if self._offline_controls_expired:
+                audit["offline_controls_expired"] = True
+                audit["committed_behavior_revision"] = self._state.revision
+            self._audit_projection = AuditProjection(metadata=audit)
+            enriched = replace_model_projection(context, projection.model)
             if self.cfw is None:
                 return enriched
             return self.cfw.before_model_call(
@@ -229,47 +338,28 @@ class HostControlBridge:
                                    action_hint: Mapping[str, Any] | None = None,
                                    candidate_action: ActionCandidate | Mapping[str, Any] | None = None
                                    ) -> str:
+        if candidate_action is None:
+            await self._control_boundary("pre_model_call")
+        else:
+            await self.before_action_candidate(candidate_action)
         async with self._lock:
             self._require_open()
-            if not self._remote_open or self._needs_reconciliation:
-                await self._connect_or_degrade_locked()
-            if candidate_action is not None and self._remote_open \
-                    and not self._needs_reconciliation:
-                candidate = (candidate_action if isinstance(candidate_action, ActionCandidate)
-                            else ActionCandidate(**dict(candidate_action))
-                            if isinstance(candidate_action, Mapping) else None)
-                if candidate is None:
-                    raise TypeError("candidate_action must be a validated action object")
-                unknown = (set(candidate.affected_criterion_ids)
-                           - set(self.objective_criteria))
-                if unknown:
-                    raise ValueError("candidate action criteria escape the control objective")
-                action_index = max(1, self._action_index + 1)
-                prior = self._latest_observation
-                observation = RuntimeObservation(
-                    action_index=action_index,
-                    action_completed=False,
-                    actions_since_goal_progress=(
-                        prior.actions_since_goal_progress if prior else 0),
-                    equivalent_retry_count=(prior.equivalent_retry_count if prior else 0),
-                    context_pressure=prior.context_pressure if prior else 0.0,
-                    goal_set=self.goal_set,
-                    active_trigger_codes=(prior.active_trigger_codes if prior else ()),
-                    approach_epoch=prior.approach_epoch if prior else "",
-                    candidate_action=candidate,
-                )
-                if self._expire_local_leases(action_index):
-                    await self._reconcile_locked()
-                await self._apply_tick_locked(observation, self.goal_set)
             snapshot, _ = self._csw_snapshot()
-            projection = project_behavior_context(
-                self._state, snapshot, objective=self.objective,
+            projection_state = (BehaviorState() if self._offline_controls_expired
+                                else self._state)
+            projection = build_behavior_projection(
+                projection_state, snapshot, objective=self.objective,
                 goal_set=self.goal_set,
                 cfw_connected=bool(self._cfw_components),
                 csw_connected=self.csw is not None,
                 outcome_evidence_connected=self.outcome_evidence_connected,
             )
-            enriched = f"{context}\n{projection}" if context else projection
+            audit = dict(projection.audit.metadata)
+            if self._offline_controls_expired:
+                audit["offline_controls_expired"] = True
+                audit["committed_behavior_revision"] = self._state.revision
+            self._audit_projection = AuditProjection(metadata=audit)
+            enriched = replace_model_projection(context, projection.model)
             if self.cfw is None:
                 return enriched
             return self.cfw.before_tool_planning(
@@ -314,6 +404,7 @@ class HostControlBridge:
                     raise RuntimeError("DP MCP opened a different host control session")
                 self._state = BehaviorState.from_mapping(response["behavior_state"])
                 self._action_index = int(response["host_action_index"])
+                self._boundary_sequence = int(response.get("boundary_sequence", -1))
                 self._remote_open = True
                 self._needs_reconciliation = True
             if self._needs_reconciliation:
@@ -330,11 +421,27 @@ class HostControlBridge:
                            exc)
             return False
 
-    def _expire_local_leases(self, host_action_index: int) -> bool:
+    def _expire_local_leases(self, host_action_index: int, *,
+                             expire_cfw: bool = False) -> bool:
         """Advance CSW-owned DP leases even when the private DP process is down."""
+        changed = False
+        if expire_cfw:
+            expire_controls = getattr(self.cfw, "expire_local_behavior_leases", None)
+            if callable(expire_controls):
+                try:
+                    cfw_changed = bool(expire_controls(max(0, host_action_index)))
+                    changed = cfw_changed or changed
+                    self._offline_controls_expired = (
+                        self._offline_controls_expired or cfw_changed)
+                except Exception as exc:
+                    self._fault = f"CFW local lease expiry failed at the host action boundary: {exc}"
+                    self._notify_fault(self._fault)
+                    self._needs_reconciliation = True
         expire = getattr(self.csw, "expire_leases", None)
         if not callable(expire):
-            return False
+            if changed:
+                self._needs_reconciliation = True
+            return changed
         try:
             before, _ = self._csw_snapshot()
             expire(host_action_index=host_action_index)
@@ -343,9 +450,9 @@ class HostControlBridge:
             self._fault = f"CSW lease expiry failed at the host action boundary: {exc}"
             self._notify_fault(self._fault)
             self._needs_reconciliation = True
-            return False
+            return changed
         changed = (before.revision != after.revision
-                   or before.snapshot_id != after.snapshot_id)
+                   or before.snapshot_id != after.snapshot_id or changed)
         if changed:
             self._needs_reconciliation = True
         return changed
@@ -363,6 +470,7 @@ class HostControlBridge:
             raise RuntimeError("DP reconciliation returned malformed pending decisions")
         self._state = BehaviorState.from_mapping(response["behavior_state"])
         self._action_index = int(response["host_action_index"])
+        self._boundary_sequence = int(response.get("boundary_sequence", -1))
         self.goal_set = self._reported_goal_set(response)
         unresolved = False
         for item in pending:
@@ -376,6 +484,7 @@ class HostControlBridge:
             })
             self._state = BehaviorState.from_mapping(response["behavior_state"])
             self._action_index = int(response["host_action_index"])
+            self._boundary_sequence = int(response.get("boundary_sequence", -1))
             self.goal_set = self._reported_goal_set(response)
         if not response.get("pending_decisions"):
             actual = self.actuator.applied_behavior_state()
@@ -507,6 +616,8 @@ class HostControlBridge:
             raise RuntimeError("DP did not commit the host control decision")
         self._state = BehaviorState.from_mapping(result["behavior_state"])
         self._action_index = int(result["host_action_index"])
+        self._boundary_sequence = int(result.get(
+            "boundary_sequence", self._boundary_sequence))
         self.goal_set = goal_set
 
     def _status(self, result: Mapping[str, Any] | None = None) -> dict[str, Any]:

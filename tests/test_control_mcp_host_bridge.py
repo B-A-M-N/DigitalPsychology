@@ -206,7 +206,7 @@ def test_dp_mcp_outage_keeps_host_runtime_usable():
         csw = _CSWPort()
         csw.active = ("repair",)
         csw.activation_interventions["repair"] = "intervention-offline"
-        csw.lease_expiries["repair"] = 1
+        csw.lease_expiries["repair"] = 0
         bridge = HostControlBridge(
             identity=_identity("offline-task"),
             objective="Render the requested page",
@@ -218,6 +218,7 @@ def test_dp_mcp_outage_keeps_host_runtime_usable():
         assert opened["status"] == "degraded"
         context = await bridge.before_model_call("host context")
         assert "host context" in context
+        assert csw.expiration_calls == []
         result = await bridge.after_action(RuntimeObservation(
             action_index=1, equivalent_retry_count=2,
             criterion_status={"criterion-visual": "unmet"},
@@ -253,7 +254,7 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
             assert cfw.applied_behavior_state["revision"] == 1
             assert cfw.controls
             context = await bridge.before_model_call("base host context")
-            assert "DIGITAL PSYCHOLOGY BEHAVIOR STATE" in context
+            assert "CURRENT BEHAVIOR GUIDANCE" in context
             assert "base host context" in context
         finally:
             await bridge.close()
@@ -276,9 +277,12 @@ def test_candidate_action_is_committed_before_execution_without_advancing_action
                     action_class="file_edit",
                     proposed_purpose="Implement the requested visual criterion",
                     affected_criterion_ids=("criterion-visual",),
+                    action_id="action-visual-1", tool_name="apply_patch",
+                    operation="edit_file", mutating=True, reversible=True,
+                    external=False,
                     target_kind="repository",
                 ))
-            assert "DIGITAL PSYCHOLOGY BEHAVIOR STATE" in context
+            assert "CURRENT BEHAVIOR GUIDANCE" in context
             assert bridge.behavior_state.revision == 1
             assert bridge._action_index == -1
             assert cfw.lifecycle_revision == 1

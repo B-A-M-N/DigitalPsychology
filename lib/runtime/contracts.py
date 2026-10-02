@@ -24,6 +24,15 @@ class ActionCandidate:
     action_class: str
     proposed_purpose: str
     affected_criterion_ids: tuple[str, ...]
+    action_id: str
+    tool_name: str
+    operation: str
+    target_ref_digests: tuple[str, ...] = ()
+    mutating: bool = True
+    reversible: bool = False
+    external: bool = False
+    proposed_reason: str = ""
+    approach_epoch: str = ""
     target_kind: str = "workspace"
     target_ref_digest: str | None = None
 
@@ -31,26 +40,56 @@ class ActionCandidate:
         for name, value, limit in (
                 ("action_class", self.action_class, 64),
                 ("proposed_purpose", self.proposed_purpose, 256),
-                ("target_kind", self.target_kind, 64)):
+                ("target_kind", self.target_kind, 64),
+                ("tool_name", self.tool_name, 128),
+                ("operation", self.operation, 128)):
             if not isinstance(value, str) or not value.strip() or len(value) > limit:
                 raise ValueError(f"candidate {name} must be bounded non-empty text")
+        if not isinstance(self.proposed_reason, str) or len(self.proposed_reason) > 256:
+            raise ValueError("candidate proposed_reason must be bounded text")
+        if not isinstance(self.approach_epoch, str) or len(self.approach_epoch) > 256:
+            raise ValueError("candidate approach_epoch must be bounded text")
+        if any(type(value) is not bool for value in
+               (self.mutating, self.reversible, self.external)):
+            raise ValueError("candidate effect flags must be booleans")
         criteria = tuple(self.affected_criterion_ids)
         if (not 1 <= len(criteria) <= 8 or len(criteria) != len(set(criteria))
                 or any(not isinstance(item, str) or not item or len(item) > 128
                        for item in criteria)):
             raise ValueError("candidate criteria must be unique bounded IDs")
+        target_refs = tuple(self.target_ref_digests)
+        if (len(target_refs) > 16 or len(target_refs) != len(set(target_refs))
+                or any(not isinstance(value, str) or len(value) != 64
+                       or any(char not in "0123456789abcdef" for char in value)
+                       for value in target_refs)):
+            raise ValueError("candidate target references must be bounded SHA-256 digests")
         if self.target_ref_digest is not None and (
                 not isinstance(self.target_ref_digest, str)
                 or len(self.target_ref_digest) != 64
                 or any(char not in "0123456789abcdef"
                        for char in self.target_ref_digest)):
             raise ValueError("candidate target reference must be a SHA-256 digest")
+        if (not isinstance(self.action_id, str) or not self.action_id.strip()
+                or len(self.action_id) > 128):
+            raise ValueError("candidate action_id must be bounded non-empty text")
+        if not self.proposed_reason:
+            object.__setattr__(self, "proposed_reason", self.proposed_purpose)
         object.__setattr__(self, "affected_criterion_ids", criteria)
+        object.__setattr__(self, "target_ref_digests", target_refs)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"action_class": self.action_class,
+        return {"action_id": self.action_id,
+                "action_class": self.action_class,
+                "tool_name": self.tool_name,
+                "operation": self.operation,
                 "proposed_purpose": self.proposed_purpose,
+                "proposed_reason": self.proposed_reason,
                 "affected_criterion_ids": list(self.affected_criterion_ids),
+                "target_ref_digests": list(self.target_ref_digests),
+                "mutating": self.mutating,
+                "reversible": self.reversible,
+                "external": self.external,
+                "approach_epoch": self.approach_epoch,
                 "target_kind": self.target_kind,
                 "target_ref_digest": self.target_ref_digest}
 
@@ -140,8 +179,8 @@ class RuntimeObservation:
             raise ValueError("candidate_action must be a validated ActionCandidate")
         if self.candidate_action is not None and self.action_completed:
             raise ValueError("candidate_action is valid only at a pre-action boundary")
-        if not self.action_completed and self.candidate_action is None:
-            raise ValueError("pre-action observations require a sanitized candidate action")
+        # The private control protocol also carries non-action host boundaries.
+        # It binds a sanitized candidate exactly when boundary_kind is pre_action.
         if not self.action_completed and (
                 self.progress_made or self.regression_observed or self.artifact_changed
                 or self.evidence_refs):

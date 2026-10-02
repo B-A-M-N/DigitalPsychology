@@ -34,11 +34,15 @@ Implemented capabilities include:
 - **Transactional intervention event outbox** that commits authenticated application and outcome events with the DP behavior revision, then retries delivery idempotently after restarts.
 - **Constrained StateWork preferences** ranked only from the eligible choices supplied by CSW. DP cannot commit or legalize a CSW transition.
 - **A versioned private MCP control protocol** with prepare/apply/commit/abort/reconcile transactions, exact directive receipts, and restart recovery against CFW and CSW revisions.
+- **One sequenced control boundary** for task start, pre-model, pre-action, post-action, validator, workflow, operator, and pre-completion observations. Pre-action candidates are bounded and sanitized; non-action boundaries do not age intervention horizons, and action counters advance only after completed host actions.
+- **Separate model and audit projections** so prompts receive replaceable goal guidance while intervention IDs, authority revisions, hashes, and reconciliation metadata remain host-private.
 - **Host failure semantics** that retain the last committed behavior projection when DP is unavailable; CFW hard action gates and CSW legality remain active.
 
 DP's telemetry, experiments, and deterministic controller do not require CFW or CSW packages. The cross-system `RuntimeHost` uses explicit ports to coordinate CFW and CSW. CFW and CSW also remain independently usable; the complete adaptive deployment runs CFW, CSW, and DP together, with each repository retaining its own authority.
 
 Runtime orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed through the model's tool registry. `RuntimeHost.open_control_bridge(...)` starts a private MCP child and returns the host lifecycle bridge; the bridge asks CFW to validate/apply controls and asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
+
+The private `digital-psychology-control-mcp` is started by `HostControlBridge` and is not a Codex model-visible MCP server. The legacy `digital-psychology-mcp` entry point fails closed unless explicitly enabled; `digital-psychology-admin-mcp` is for a trusted operator namespace. Keep the control process on the host side of the tool boundary.
 
 The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
 
@@ -161,6 +165,13 @@ DIGITALPSYCHOLOGY_LAYA_DEVICE=cpu
 DIGITALPSYCHOLOGY_LAYA_TIMEOUT_MS=30000
 ```
 
+The host asks one value-of-information question per boundary: candidate
+actions select action relation, repeated attempts select retry relation,
+host-observed progress/evidence selects progress relation, and other
+boundaries select goal drift. This keeps local CPU inference bounded while
+retaining the relevant semantic judgment. For predictable CPU latency, set
+`OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1` in the trusted host environment.
+
 The private `control_mcp` entrypoint constructs `SystemOneService` from these
 environment variables automatically. `MCPControlClient` launches that process
 as a separate host-owned child; set the variables in the host process
@@ -178,6 +189,10 @@ snapshot after installing the optional runtime:
 python3 -m pip install -e '.[laya]'
 python3 scripts/download_laya_model.py
 ```
+
+The package requires Starlette 1.7.0 or newer. The host MCP transport and its
+dependencies should be installed from the same locked environment used by the
+trusted runtime process.
 
 Set `DIGITALPSYCHOLOGY_LAYA_MODEL_PATH` to the downloaded snapshot directory. The SHA-256 pin
 above covers the checkpoint, encoder configuration, and tokenizer files used

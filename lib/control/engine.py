@@ -65,11 +65,17 @@ class ControlDecisionEngine:
             raise ValueError("host goal set must cover the complete control objective")
         if goal_set.revision < descriptor.initial_goal_set.revision:
             raise ValueError("host goal-set revision moved backwards")
-        if request.observation.action_index <= record.action_index:
-            raise ValueError("host action index must advance the control session")
-        if not request.observation.action_completed and (
+        boundary_kind = request.boundary_kind
+        if boundary_kind in {"pre_action", "post_action"}:
+            if request.observation.action_index <= record.action_index:
+                raise ValueError("action boundaries must advance the completed action index")
+        elif request.observation.action_index != max(0, record.action_index):
+            raise ValueError("non-action boundary must refer to the current action index")
+        if boundary_kind == "pre_action" and (
                 request.observation.candidate_action is None or request.outcome_facts):
             raise ValueError("pre-action control requires a candidate without outcome facts")
+        if boundary_kind != "pre_action" and request.observation.candidate_action is not None:
+            raise ValueError("candidate actions are accepted only at pre-action boundaries")
         if not set(request.observation.criterion_status).issubset(goal_ids):
             raise ValueError("host criterion status escapes the control objective")
         if (request.observation.candidate_action is not None
@@ -133,8 +139,8 @@ class ControlDecisionEngine:
             equivalent_retry_count=request.observation.equivalent_retry_count,
             host_action_index=request.observation.action_index,
             criterion_status=request.observation.criterion_status,
-            action_completed=request.observation.action_completed,
-            pre_action=not request.observation.action_completed,
+            action_completed=boundary_kind == "post_action",
+            pre_action=boundary_kind == "pre_action",
             progress_made=request.observation.progress_made,
             regression_observed=request.observation.regression_observed,
             artifact_changed=request.observation.artifact_changed,

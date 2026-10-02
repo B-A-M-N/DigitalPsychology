@@ -110,6 +110,10 @@ class CFWRuntimeAdapter:
             raise RuntimeError("CFW adapter cannot restore a behavior state after restart")
         restore(behavior_state, expected_current_revision=expected_current_revision)
 
+    def expire_local_behavior_leases(self, action_index: int) -> bool:
+        expire = getattr(self.component_port, "expire_local_behavior_leases", None)
+        return bool(expire(action_index)) if callable(expire) else False
+
     def render_behavior_context(self, context: str, *,
                                 active_statework_ids: Sequence[str] = ()) -> str:
         return self.component_port.render_behavior_context(

@@ -277,10 +277,11 @@ def test_runtime_host_applies_cfw_controls_and_credits_host_verified_progress(tm
     assert stored.action_index == 11
     assert stored.state.revision == 2
     assert second.state.active_stateworks == ()
-    assert "cognitive_mode" in context and "CFW context" in context
-    assert "DIGITAL PSYCHOLOGY BEHAVIOR STATE" in context
-    assert '"csw_eligible_steps":{}' in context
-    assert '"csw_workflow_states":{}' in context
+    assert "Required work:" in context and "CFW context" in context
+    assert "cognitive_mode" not in context
+    assert "DIGITAL PSYCHOLOGY BEHAVIOR STATE" not in context
+    assert "csw_eligible_steps" not in context
+    assert "csw_workflow_states" not in context
     assert ("repair",) in csw.requested_candidates
     assert all(candidates in {(), ("repair",)}
                for candidates in csw.requested_candidates)
@@ -317,14 +318,14 @@ def test_runtime_host_supports_every_optional_system_combination(tmp_path):
                 assert result.csw_snapshot.active_stateworks == ("repair",)
             else:
                 assert result.csw_snapshot.active_stateworks == ()
-                assert '"csw":"unavailable"' in context
+                assert "csw\"" not in context
             if with_cfw:
                 assert raw_cfw.controls
-                assert '"cfw":"connected"' in context
+                assert "cfw\"" not in context
             else:
                 assert not any(item.operation == "set_framework"
                                for item in result.decision.directives)
-                assert '"cfw":"unavailable"' in context
+                assert "cfw\"" not in context
 
             assert host.open_session(
                 identity=identity, objective="Render the requested page",
@@ -377,13 +378,13 @@ def test_runtime_host_keeps_twelve_item_task_set_complete_and_rotates_attention(
             if action_index == 4:
                 focus_after_first_lease = result.state.focus_criteria
                 projection = result.behavior_context
-                assert '"total":12' in projection
+                assert "0 of 12 criteria verified" in projection
                 assert "objective_criteria" not in projection
 
         assert observed == set(criteria)
         assert "criterion-1" not in focus_after_first_lease
         context = session.before_model_call()
-        assert '"attention_window"' in context
+        assert "Current focus" in context
         assert all(item in context for item in result.state.focus_criteria)
         assert session.project_behavior_context().count("criterion-") < 16
     finally:
