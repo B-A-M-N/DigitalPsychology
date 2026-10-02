@@ -232,6 +232,17 @@ class BehaviorStateStore:
                     "(scope, intervention_id, directive_ids_json, action_index) "
                     "VALUES (?, ?, ?, ?)",
                     (scope, intervention_id, encoded, action_index))
+            active_intervention_ids = tuple(
+                item.intervention_id for item in state.active_interventions)
+            if active_intervention_ids:
+                placeholders = ",".join("?" for _ in active_intervention_ids)
+                database.execute(
+                    "DELETE FROM intervention_receipts WHERE scope=? "
+                    f"AND intervention_id NOT IN ({placeholders})",
+                    (scope, *active_intervention_ids))
+            else:
+                database.execute(
+                    "DELETE FROM intervention_receipts WHERE scope=?", (scope,))
             for event_id, encoded in encoded_outbox.items():
                 prior = database.execute(
                     "SELECT event_json FROM runtime_event_outbox "
