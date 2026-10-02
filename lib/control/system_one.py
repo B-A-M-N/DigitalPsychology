@@ -6,6 +6,7 @@ from typing import Any, Sequence
 
 from ..behavior_state import (BehaviorState, CSWBehaviorSnapshot,
                               FrameworkSignal, GoalSetSnapshot)
+from .semantic_query_planner import SemanticQueryPlanner
 from ..protocol_artifact import QUESTION_REGISTRY
 from ..runtime.contracts import RuntimeIdentity, RuntimeObservation
 from ..system_one_contracts import (ActivityFact, CriterionState,
@@ -15,6 +16,8 @@ from ..system_one_contracts import (ActivityFact, CriterionState,
 
 def create_system_one_frame_factory(system_one_service: Any):
     """Return a provider-neutral frame factory bound to pinned provider metadata."""
+    if getattr(system_one_service, "mode", "disabled") == "disabled":
+        return None
     capability = system_one_service.capability()
     def field(name: str):
         return (getattr(capability, name) if hasattr(capability, name)
@@ -26,10 +29,14 @@ def create_system_one_frame_factory(system_one_service: Any):
         if item in enabled and item in supported)
     if not available_questions:
         return None
+    query_planner = SemanticQueryPlanner()
     def build(identity: RuntimeIdentity, objective: str,
               attention_criteria: Sequence[str], behavior_state: BehaviorState,
               observation: RuntimeObservation, csw: CSWBehaviorSnapshot,
-              cfw_signals: Sequence[FrameworkSignal]) -> SystemOneFrame:
+              cfw_signals: Sequence[FrameworkSignal]) -> SystemOneFrame | None:
+        query = query_planner.plan(observation, cfw_signals=cfw_signals)
+        if not query.should_query or query.question_id not in available_questions:
+            return None
         goals = observation.goal_set
         goal_items = ({item.criterion_id: item for item in goals.items}
                       if goals is not None else {})
@@ -80,26 +87,9 @@ def create_system_one_frame_factory(system_one_service: Any):
             artifact_changed=(None if candidate else observation.artifact_changed),
             progress_class=None if candidate else progress_class,
         )
-        # Laya's local checkpoint is a comparatively expensive CPU model. Ask
-        # the single question with the highest value for this boundary instead
-        # of batching every semantic family into every inference. This keeps
-        # inference within its host deadline and makes the requested judgment
-        # specific to the evidence currently available.
-        if candidate is not None:
-            preferred_question = "action_relation"
-        elif observation.equivalent_retry_count > 0 or any(
-                signal.active and any(token in signal.code.lower()
-                                      for token in ("retry", "repeat", "loop"))
-                for signal in cfw_signals):
-            preferred_question = "retry_relation"
-        elif (observation.progress_made or observation.regression_observed
-              or observation.artifact_changed or observation.evidence_refs):
-            preferred_question = "progress_relation"
-        else:
-            preferred_question = "goal_drift"
-        question_id = (preferred_question if preferred_question in available_questions
-                       else available_questions[0])
-        question_ids = (question_id,)
+        # Never substitute a different enabled question for a planned query:
+        # calibration and operator selection remain specific to each family.
+        question_ids = (query.question_id,)
         workflows = tuple(WorkflowFact(
             statework_id=statework_id,
             current_state=csw.workflow_states.get(statework_id, "UNKNOWN"),

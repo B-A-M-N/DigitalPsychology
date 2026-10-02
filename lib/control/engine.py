@@ -103,24 +103,25 @@ class ControlDecisionEngine:
                 attention.lease.criterion_ids if attention.lease else (),
                 record.state, request.observation, request.csw_snapshot,
                 request.cfw_signals)
-            if not isinstance(frame, SystemOneFrame):
+            if frame is not None and not isinstance(frame, SystemOneFrame):
                 raise TypeError("System-1 frame factory must return a validated frame")
-            if frame.identity.to_dict() != self._system_one_identity(identity).to_dict():
-                raise ValueError("System-1 frame identity escapes the control session")
-            system_one_frame = frame.canonical_payload()
-            judgment_result = self.decision_service.judge(frame)
-            if hasattr(judgment_result, "judgment"):
-                # Only calibrated/advisory output may influence executive
-                # selection. The typed result is retained in the trusted host
-                # transaction basis even when it remains in shadow mode.
-                serialize = getattr(judgment_result, "to_dict", None)
-                if callable(serialize):
-                    system_one_result = serialize()
-                judgment = (judgment_result.judgment
-                            if getattr(judgment_result, "status", None) == "ok"
-                            else None)
-            else:
-                judgment = judgment_result
+            if frame is not None:
+                if frame.identity.to_dict() != self._system_one_identity(identity).to_dict():
+                    raise ValueError("System-1 frame identity escapes the control session")
+                system_one_frame = frame.canonical_payload()
+                judgment_result = self.decision_service.judge(frame)
+                if hasattr(judgment_result, "judgment"):
+                    # Only calibrated/advisory output may influence executive
+                    # selection. The typed result is retained in the trusted host
+                    # transaction basis even when it remains in shadow mode.
+                    serialize = getattr(judgment_result, "to_dict", None)
+                    if callable(serialize):
+                        system_one_result = serialize()
+                    judgment = (judgment_result.judgment
+                                if getattr(judgment_result, "status", None) == "ok"
+                                else None)
+                else:
+                    judgment = judgment_result
 
         assessments = (self._assess_interventions(
             descriptor, record, request, goal_set, attention.last_seen)

@@ -112,17 +112,18 @@ class RuntimeSession:
                     self.identity, self.objective,
                     (attention.lease.criterion_ids if attention and attention.lease else ()),
                     record.state, observation, snapshot, signals)
-                if not isinstance(frame, SystemOneFrame):
+                if frame is not None and not isinstance(frame, SystemOneFrame):
                     raise TypeError("System-1 frame factory must return a validated frame")
-                if frame.identity.to_dict() != self._system_one_identity().to_dict():
-                    raise ValueError("System-1 frame identity escapes the runtime session")
-                judgment_result = self.controller.judge(frame)
-                if hasattr(judgment_result, "judgment"):
-                    judgment = (judgment_result.judgment
-                                if getattr(judgment_result, "status", None) == "ok"
-                                else None)
-                else:
-                    judgment = judgment_result
+                if frame is not None:
+                    if frame.identity.to_dict() != self._system_one_identity().to_dict():
+                        raise ValueError("System-1 frame identity escapes the runtime session")
+                    judgment_result = self.controller.judge(frame)
+                    if hasattr(judgment_result, "judgment"):
+                        judgment = (judgment_result.judgment
+                                    if getattr(judgment_result, "status", None) == "ok"
+                                    else None)
+                    else:
+                        judgment = judgment_result
             outcome_assessments = self._assess_ready_interventions(
                 record, observation, goal_set=goal_set,
                 attention_last_seen=(attention.last_seen if attention else {}))

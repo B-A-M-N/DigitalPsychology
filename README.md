@@ -165,12 +165,14 @@ DIGITALPSYCHOLOGY_LAYA_DEVICE=cpu
 DIGITALPSYCHOLOGY_LAYA_TIMEOUT_MS=30000
 ```
 
-The host asks one value-of-information question per boundary: candidate
-actions select action relation, repeated attempts select retry relation,
-host-observed progress/evidence selects progress relation, and other
-boundaries select goal drift. This keeps local CPU inference bounded while
-retaining the relevant semantic judgment. For predictable CPU latency, set
-`OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1` in the trusted host environment.
+The semantic query planner invokes Laya only when host signals leave a
+material ambiguity: a possible equivalent retry, a drift warning on a
+consequential candidate, or new artifact/evidence without confirmed progress.
+It skips routine reversible actions, host-confirmed progress/regression,
+already-established repeated attempts, and critical WARD vetoes. At most one
+question is sent per boundary; a disabled question family is never replaced
+with a different one. For predictable CPU latency, set `OMP_NUM_THREADS=1`
+and `MKL_NUM_THREADS=1` in the trusted host environment.
 
 The private `control_mcp` entrypoint constructs `SystemOneService` from these
 environment variables automatically. `MCPControlClient` launches that process

@@ -98,7 +98,7 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
         service.close()
 
     assert restored.sequence == 20
-    assert restored.question_ids == ("progress_relation",)
+    assert restored.question_ids == ("retry_relation",)
     assert restored.state.criteria[0].criterion_id == "criterion-visual"
     assert restored.state.criteria[0].status == "active"
 
@@ -123,7 +123,7 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
         approach_epoch="approach-1")
     observation = RuntimeObservation(
         action_index=10, action_completed=False, goal_set=goals,
-        candidate_action=candidate)
+        candidate_action=candidate, equivalent_retry_count=1)
     service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
     try:
         factory = create_system_one_frame_factory(service)
@@ -134,7 +134,7 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
         service.close()
 
     assert frame.sequence == 25
-    assert frame.question_ids == ("action_relation",)
+    assert frame.question_ids == ("retry_relation",)
     assert frame.state.candidate.source == "model_proposed"
     assert frame.state.candidate.action_class == "file_edit"
     assert frame.state.candidate.proposed_purpose == candidate.proposed_purpose
@@ -150,6 +150,37 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
     assert restored_request.boundary_kind == "pre_action"
     assert restored_request.boundary_sequence == 37
     assert restored_request.observation.candidate_action == candidate
+
+
+def test_frame_factory_does_not_substitute_an_unplanned_enabled_question():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-query-plan", task_id="task-query-plan",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0",
+        agent_id="codex", behavioral_subject="task-query-plan")
+    goals = GoalSetSnapshot(1, (GoalItemSnapshot(
+        "criterion-visual", status="ACTIVE", equivalent_retry_count=1),))
+    candidate = ActionCandidate(
+        action_id="candidate-query-plan", action_class="file_edit",
+        tool_name="apply_patch", operation="edit_file",
+        proposed_purpose="Implement the requested criterion",
+        affected_criterion_ids=("criterion-visual",))
+    observation = RuntimeObservation(
+        action_index=1, action_completed=False, goal_set=goals,
+        candidate_action=candidate, equivalent_retry_count=1)
+    service = SystemOneService(
+        DisabledSystemOneBackend(), mode="shadow",
+        enabled_question_families=("action_relation",))
+    try:
+        frame = create_system_one_frame_factory(service)(
+            identity, "Render the requested page", ("criterion-visual",),
+            BehaviorState(), observation, CSWBehaviorSnapshot(revision=0), ())
+    finally:
+        service.close()
+
+    assert frame is None
 
 
 def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_path):
