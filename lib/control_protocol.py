@@ -8,10 +8,10 @@ from typing import Any, Mapping, Sequence
 from .behavior_state import (CSWBehaviorSnapshot, FrameworkSignal,
                              GoalSetSnapshot, StateWorkOption)
 from .outcomes import HostOutcomeFact
-from .runtime.contracts import RuntimeIdentity, RuntimeObservation
+from .runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
 
 
-PROTOCOL_VERSION = "1.0.0"
+PROTOCOL_VERSION = "1.1.0"
 MAX_CONTROL_PAYLOAD_BYTES = 131_072
 
 
@@ -205,6 +205,12 @@ class ControlTickRequest:
         observation_data = dict(data["observation"])
         if "goal_set" in observation_data:
             raise ValueError("observation must not duplicate the goal set")
+        candidate = observation_data.get("candidate_action")
+        if candidate is not None:
+            if not isinstance(candidate, Mapping):
+                raise ValueError("candidate_action must be an object or null")
+            observation_data["candidate_action"] = ActionCandidate(
+                **dict(candidate))
         observation = RuntimeObservation(**observation_data, goal_set=goal_set)
         signals = _sequence(data["cfw_signals"], "cfw_signals", maximum=32)
         outcome_facts = _sequence(data["outcome_facts"], "outcome_facts", maximum=128)
@@ -238,6 +244,8 @@ class ControlTickRequest:
                 "evidence_refs": list(self.observation.evidence_refs),
                 "active_trigger_codes": list(self.observation.active_trigger_codes),
                 "approach_epoch": self.observation.approach_epoch,
+                "candidate_action": (self.observation.candidate_action.to_dict()
+                                     if self.observation.candidate_action else None),
             },
             "goal_set": self.goal_set.to_dict(),
             "cfw_signals": [{"source": item.source, "code": item.code,

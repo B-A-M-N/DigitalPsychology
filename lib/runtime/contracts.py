@@ -18,6 +18,44 @@ from ..system_one_contracts import SystemOneFrame
 
 
 @dataclass(frozen=True)
+class ActionCandidate:
+    """Sanitized host projection of an upcoming action for DP System-1."""
+
+    action_class: str
+    proposed_purpose: str
+    affected_criterion_ids: tuple[str, ...]
+    target_kind: str = "workspace"
+    target_ref_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        for name, value, limit in (
+                ("action_class", self.action_class, 64),
+                ("proposed_purpose", self.proposed_purpose, 256),
+                ("target_kind", self.target_kind, 64)):
+            if not isinstance(value, str) or not value.strip() or len(value) > limit:
+                raise ValueError(f"candidate {name} must be bounded non-empty text")
+        criteria = tuple(self.affected_criterion_ids)
+        if (not 1 <= len(criteria) <= 8 or len(criteria) != len(set(criteria))
+                or any(not isinstance(item, str) or not item or len(item) > 128
+                       for item in criteria)):
+            raise ValueError("candidate criteria must be unique bounded IDs")
+        if self.target_ref_digest is not None and (
+                not isinstance(self.target_ref_digest, str)
+                or len(self.target_ref_digest) != 64
+                or any(char not in "0123456789abcdef"
+                       for char in self.target_ref_digest)):
+            raise ValueError("candidate target reference must be a SHA-256 digest")
+        object.__setattr__(self, "affected_criterion_ids", criteria)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"action_class": self.action_class,
+                "proposed_purpose": self.proposed_purpose,
+                "affected_criterion_ids": list(self.affected_criterion_ids),
+                "target_kind": self.target_kind,
+                "target_ref_digest": self.target_ref_digest}
+
+
+@dataclass(frozen=True)
 class RuntimeIdentity:
     namespace_id: str
     application_id: str
@@ -83,6 +121,7 @@ class RuntimeObservation:
     evidence_refs: tuple[str, ...] = ()
     active_trigger_codes: tuple[str, ...] = ()
     approach_epoch: str = ""
+    candidate_action: ActionCandidate | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.action_index, int) or self.action_index < 0:
@@ -96,6 +135,17 @@ class RuntimeObservation:
             raise ValueError("runtime observation counters are out of bounds")
         if self.goal_set is not None and not isinstance(self.goal_set, GoalSetSnapshot):
             raise ValueError("goal_set must be a host-validated GoalSetSnapshot")
+        if (self.candidate_action is not None
+                and not isinstance(self.candidate_action, ActionCandidate)):
+            raise ValueError("candidate_action must be a validated ActionCandidate")
+        if self.candidate_action is not None and self.action_completed:
+            raise ValueError("candidate_action is valid only at a pre-action boundary")
+        if not self.action_completed and self.candidate_action is None:
+            raise ValueError("pre-action observations require a sanitized candidate action")
+        if not self.action_completed and (
+                self.progress_made or self.regression_observed or self.artifact_changed
+                or self.evidence_refs):
+            raise ValueError("pre-action observations cannot claim action outcomes")
         statuses = dict(self.criterion_status)
         if len(statuses) > 256 or any(
                 not isinstance(key, str) or not key or len(key) > 128

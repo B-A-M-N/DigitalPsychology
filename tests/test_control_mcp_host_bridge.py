@@ -11,7 +11,8 @@ from lib.behavior_state import (CSWBehaviorSnapshot, GoalItemSnapshot,
                                 GoalSetSnapshot, StateWorkOption)
 from lib.control_protocol import ControlTickRequest
 from lib.host import HostControlBridge, MCPControlClient, MCPControlUnavailable
-from lib.runtime import CFWRuntimeAdapter, RuntimeIdentity, RuntimeObservation
+from lib.runtime import (ActionCandidate, CFWRuntimeAdapter, RuntimeIdentity,
+                         RuntimeObservation)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -254,6 +255,41 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
             context = await bridge.before_model_call("base host context")
             assert "DIGITAL PSYCHOLOGY BEHAVIOR STATE" in context
             assert "base host context" in context
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_candidate_action_is_committed_before_execution_without_advancing_action_index(
+        tmp_path):
+    async def run():
+        cfw = _CFWPort()
+        goals = _goal_set()
+        bridge = _bridge(tmp_path, identity=_identity("candidate-task"),
+                         goal_set=goals, cfw_port=cfw, csw_port=_CSWPort())
+        try:
+            opened = await bridge.open()
+            assert opened["status"] == "ready"
+            context = await bridge.before_tool_planning(
+                "tool plan", candidate_action=ActionCandidate(
+                    action_class="file_edit",
+                    proposed_purpose="Implement the requested visual criterion",
+                    affected_criterion_ids=("criterion-visual",),
+                    target_kind="repository",
+                ))
+            assert "DIGITAL PSYCHOLOGY BEHAVIOR STATE" in context
+            assert bridge.behavior_state.revision == 1
+            assert bridge._action_index == -1
+            assert cfw.lifecycle_revision == 1
+
+            result = await bridge.after_action(RuntimeObservation(
+                action_index=1, goal_set=goals,
+                criterion_status={"criterion-visual": "unmet"},
+            ), goal_set=goals)
+            assert result["status"] == "ready"
+            assert bridge._action_index == 1
+            assert bridge.behavior_state.revision == 2
         finally:
             await bridge.close()
 

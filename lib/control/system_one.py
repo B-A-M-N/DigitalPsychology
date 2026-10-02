@@ -56,21 +56,30 @@ def create_system_one_frame_factory(system_one_service: Any):
         ) for criterion_id in criterion_ids)
         progress_class = ("GOAL_PROGRESS" if observation.progress_made else
                           "VALIDATION_EVIDENCE" if observation.evidence_refs else None)
+        candidate = observation.candidate_action
+        sequence = (observation.action_index * 2
+                    + (1 if not observation.action_completed else 2)
+                    + behavior_state.revision * 2)
         activity = ActivityFact(
-            sequence=observation.action_index + 1,
+            sequence=sequence,
             activity_type="action",
-            source="host_observed",
-            action_class="host_action",
-            host_declared_relation=("advances_primary_goal"
-                                    if observation.progress_made else "ambiguous"),
-            target_kind="workspace",
-            proposed_purpose=objective[:256],
-            proposed_purpose_source="derived",
-            affected_criterion_ids=tuple(attention_criteria[:8]),
-            result_class=("regression" if observation.regression_observed
-                          else "completed"),
-            artifact_changed=observation.artifact_changed,
-            progress_class=progress_class,
+            source="model_proposed" if candidate else "host_observed",
+            action_class=(candidate.action_class if candidate else "host_action"),
+            host_declared_relation=(
+                "ambiguous" if candidate else
+                "advances_primary_goal" if observation.progress_made else "ambiguous"),
+            target_kind=candidate.target_kind if candidate else "workspace",
+            target_ref_digest=(candidate.target_ref_digest if candidate else None),
+            proposed_purpose=(candidate.proposed_purpose if candidate
+                              else objective[:256]),
+            proposed_purpose_source="model_proposed" if candidate else "derived",
+            affected_criterion_ids=(
+                candidate.affected_criterion_ids if candidate
+                else tuple(attention_criteria[:8])),
+            result_class=(None if candidate else
+                          "regression" if observation.regression_observed else "completed"),
+            artifact_changed=(None if candidate else observation.artifact_changed),
+            progress_class=None if candidate else progress_class,
         )
         workflows = tuple(WorkflowFact(
             statework_id=statework_id,
@@ -136,7 +145,6 @@ def create_system_one_frame_factory(system_one_service: Any):
             task_id=identity.task_id,
             attempt_id=identity.attempt_id,
         )
-        sequence = observation.action_index + 1
         request_id = "sys1-" + canonical_hash({
             "identity": system_identity.to_dict(), "sequence": sequence,
             "state_digest": state_digest, "question_digest": question_digest,

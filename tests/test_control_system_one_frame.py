@@ -7,7 +7,7 @@ from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, FrameworkSig
                                 GoalItemSnapshot, GoalSetSnapshot)
 from lib.control_protocol import ControlSessionDescriptor, ControlTickRequest
 from lib.control.system_one import create_system_one_frame_factory
-from lib.runtime.contracts import RuntimeIdentity, RuntimeObservation
+from lib.runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
 from lib.runtime.store import BehaviorStateStore
 from lib.service import DigitalPsychologyService
 from lib.system_one_backends import DisabledSystemOneBackend
@@ -97,11 +97,44 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
     finally:
         service.close()
 
-    assert restored.sequence == 10
+    assert restored.sequence == 20
     assert restored.question_ids == (
         "action_relation", "progress_relation", "retry_relation", "goal_drift")
     assert restored.state.criteria[0].criterion_id == "criterion-visual"
     assert restored.state.criteria[0].status == "active"
+
+
+def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-1", task_id="task-candidate", attempt_id="attempt-1",
+        workflow_id="implementation", subject_ref="repo:example",
+        segment_id="segment-0", agent_id="codex", behavioral_subject="task-candidate",
+    )
+    goals = GoalSetSnapshot(4, (GoalItemSnapshot(
+        "criterion-visual", status="READY"),))
+    candidate = ActionCandidate(
+        action_class="file_edit",
+        proposed_purpose="Implement the requested visual criterion",
+        affected_criterion_ids=("criterion-visual",), target_kind="repository")
+    observation = RuntimeObservation(
+        action_index=10, action_completed=False, goal_set=goals,
+        candidate_action=candidate)
+    service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
+    try:
+        factory = create_system_one_frame_factory(service)
+        frame = factory(identity, "Render the requested page", ("criterion-visual",),
+                        BehaviorState(revision=2), observation,
+                        CSWBehaviorSnapshot(revision=0), ())
+    finally:
+        service.close()
+
+    assert frame.sequence == 25
+    assert frame.state.candidate.source == "model_proposed"
+    assert frame.state.candidate.action_class == "file_edit"
+    assert frame.state.candidate.proposed_purpose == candidate.proposed_purpose
+    assert frame.state.candidate.affected_criterion_ids == ("criterion-visual",)
 
 
 def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_path):

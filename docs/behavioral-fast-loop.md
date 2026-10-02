@@ -26,6 +26,14 @@ For each host action, `RuntimeSession.process_action()` gathers:
 - an optional DP System-1 judgment. Laya is one optional provider; deterministic
   policy works when System-1 is disabled or unavailable.
 
+The private MCP host bridge also supports a sanitized `ActionCandidate` at the
+tool-planning boundary. Its purpose and target are marked `model_proposed` in
+the System-1 frame, so Laya can assess the planned action before execution
+without treating the proposal as observed progress. A pre-action control tick
+may apply a behavior change, but it does not advance the completed-action
+index, age existing interventions, or assess intervention outcomes. The later
+host action result supplies the evidence needed for outcome attribution.
+
 For a live System-1 path, configure `RuntimeHost(system_one_frame_factory=...)`
 with a host-side builder that returns a validated `SystemOneFrame` for the
 current runtime identity, DP state, observation, CFW signals, and CSW snapshot.

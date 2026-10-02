@@ -67,8 +67,15 @@ class ControlDecisionEngine:
             raise ValueError("host goal-set revision moved backwards")
         if request.observation.action_index <= record.action_index:
             raise ValueError("host action index must advance the control session")
+        if not request.observation.action_completed and (
+                request.observation.candidate_action is None or request.outcome_facts):
+            raise ValueError("pre-action control requires a candidate without outcome facts")
         if not set(request.observation.criterion_status).issubset(goal_ids):
             raise ValueError("host criterion status escapes the control objective")
+        if (request.observation.candidate_action is not None
+                and not set(request.observation.candidate_action.affected_criterion_ids)
+                .issubset(goal_ids)):
+            raise ValueError("candidate action criterion escapes the control objective")
         if tuple(record.state.active_stateworks) != tuple(request.csw_snapshot.active_stateworks):
             raise RuntimeError("CSW state must be reconciled before preparing a control tick")
         for signal in request.cfw_signals:
@@ -81,9 +88,6 @@ class ControlDecisionEngine:
 
         attention = schedule_attention(
             goal_set, record.state, action_index=request.observation.action_index)
-        if request.observation.action_completed is False:
-            raise ValueError("control ticks require a completed host action boundary")
-
         judgment = None
         system_one_frame = None
         system_one_result = None
@@ -112,9 +116,9 @@ class ControlDecisionEngine:
             else:
                 judgment = judgment_result
 
-        assessments = self._assess_interventions(
-            descriptor, record, request, goal_set,
-            attention.last_seen)
+        assessments = (self._assess_interventions(
+            descriptor, record, request, goal_set, attention.last_seen)
+            if request.observation.action_completed else [])
         input_value = FastLoopInput(
             scope=identity.scope,
             state=record.state,
@@ -130,6 +134,7 @@ class ControlDecisionEngine:
             host_action_index=request.observation.action_index,
             criterion_status=request.observation.criterion_status,
             action_completed=request.observation.action_completed,
+            pre_action=not request.observation.action_completed,
             progress_made=request.observation.progress_made,
             regression_observed=request.observation.regression_observed,
             artifact_changed=request.observation.artifact_changed,

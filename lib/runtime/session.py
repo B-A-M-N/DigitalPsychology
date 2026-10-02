@@ -79,6 +79,10 @@ class RuntimeSession:
         """Observe one host action, decide, apply, and durably record DP changes."""
         with self._lock:
             self._require_open()
+            if not observation.action_completed:
+                raise ValueError(
+                    "in-process RuntimeSession accepts completed actions; use HostControlBridge "
+                    "for pre-action candidate evaluation")
             self._dispatch_outbox()
             record = self.state_store.load(self.scope)
             self._ensure_adapter_state_is_reconcilable(record.state)

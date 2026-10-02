@@ -105,13 +105,19 @@ independent standalone entry points and work together without DP installed.
 
 The host supplies explicit CFW and optional CSW ports to DP. It calls
 `RuntimeHost.open_control_bridge(...)` once per scoped task, then invokes the
-bridge after each completed host action and before model/tool-planning
-boundaries. The private MCP transport makes the decision; local host adapters
-apply it through CFW's component lifecycle and CSW's revision-checked
-selection API. The bridge stays in the trusted host and is never passed to the
-controlled model. `RuntimeHost.open_session(...)` and
+bridge before action planning when it has a sanitized candidate, and after
+each completed host action. The private MCP transport makes the decision;
+local host adapters apply it through CFW's component lifecycle and CSW's
+revision-checked selection API. The bridge stays in the trusted host and is
+never passed to the controlled model. `RuntimeHost.open_session(...)` and
 `RuntimeSession.process_action(...)` remain available for in-process
 deployments and compatibility.
+
+Pass a typed `ActionCandidate` to `before_tool_planning(...)` when the host can
+describe the proposed action without its raw arguments. DP and Laya assess the
+candidate before execution; it is labeled `model_proposed` and cannot count as
+host evidence or intervention success. The pre-action transaction applies any
+approved behavior change while leaving the completed-action counter unchanged.
 
 For multi-criterion goals, the host sends the complete `GoalSetSnapshot`
 (bounded to 256 criteria). DP leases attention to at most three criteria at a
@@ -274,10 +280,14 @@ bridge = HostControlBridge(
 await bridge.open()
 ```
 
-Call `bridge.after_action(...)` after each completed host-observed action or
-independent evidence boundary. `bridge.before_model_call(...)` and
-`bridge.before_tool_planning(...)` add the committed behavioral projection to
-the next model context. The client launches the control MCP as a private child
+Call `bridge.before_tool_planning(...)` with a sanitized candidate when one is
+available, and `bridge.after_action(...)` after each completed host-observed
+action or independent evidence boundary. The candidate contains only an action
+class, proposed purpose, affected criterion IDs, target kind, and optional
+hashed target reference; never pass tool arguments or secrets. DP commits
+pre-action controls before the candidate runs and assesses outcomes only from
+later host evidence. `bridge.before_model_call(...)` adds the current committed
+behavioral projection. The client launches the control MCP as a private child
 process; do not add its control tools to the model-visible MCP configuration.
 
 Laya remains optional. Install it only when the deployment selects the native

@@ -83,6 +83,7 @@ class FastLoopInput:
     host_action_index: int = 0
     criterion_status: Mapping[str, str] = field(default_factory=dict)
     action_completed: bool = False
+    pre_action: bool = False
     progress_made: bool = False
     regression_observed: bool = False
     artifact_changed: bool = False
@@ -115,6 +116,8 @@ class FastLoopInput:
         if (self.actions_since_goal_progress < 0 or self.equivalent_retry_count < 0
                 or self.host_action_index < 0):
             raise ValueError("outcome counters must be non-negative")
+        if not isinstance(self.pre_action, bool):
+            raise ValueError("pre_action must be boolean")
         if not 0.0 <= float(self.context_pressure) <= 1.0:
             raise ValueError("context pressure must be between zero and one")
         if len(self.evidence_refs) > 16 or any(
@@ -458,6 +461,11 @@ class BehavioralController:
             raise ValueError("outcome assessment does not match an active intervention")
         working = original
         for item in original.active_interventions:
+            if context.pre_action:
+                # Candidate evaluation can change the next behavior mode, but
+                # it cannot age or close an intervention before an action runs.
+                interventions.append(item)
+                continue
             elapsed = item.actions_elapsed + (1 if context.action_completed else 0)
             updated = replace(item, actions_elapsed=min(elapsed, item.expires_after_actions))
             assessment = assessments.get(item.intervention_id)
@@ -743,7 +751,8 @@ class BehavioralController:
                 expiry=expiry,
                 target_criteria=tuple(next_focus or attention_ids),
                 baseline_criterion_status=context.criterion_status,
-                baseline_action_index=context.host_action_index,
+                baseline_action_index=max(
+                    0, context.host_action_index - (1 if context.pre_action else 0)),
                 concurrent_intervention_ids=tuple(
                     item.intervention_id for item in interventions),
                 baseline_goal_set=context.goal_set,
@@ -816,7 +825,8 @@ class BehavioralController:
                     expiry=1,
                     target_criteria=tuple(next_focus or attention_ids),
                     baseline_criterion_status=context.criterion_status,
-                    baseline_action_index=context.host_action_index,
+                    baseline_action_index=max(
+                        0, context.host_action_index - (1 if context.pre_action else 0)),
                     concurrent_intervention_ids=tuple(
                         item.intervention_id for item in interventions),
                     baseline_goal_set=context.goal_set,

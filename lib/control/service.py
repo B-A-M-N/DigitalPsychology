@@ -100,10 +100,16 @@ class ControlPlaneService:
 
         preparation = self.engine.prepare(descriptor, record, request)
         decision = preparation.decision
+        boundary_phase = ("post_action" if request.observation.action_completed
+                          else "pre_action")
+        commit_action_index = (request.observation.action_index
+                               if boundary_phase == "post_action" else record.action_index)
         basis = {
             "expected_behavior_revision": record.state.revision,
             "expected_action_index": record.action_index,
             "host_action_index": request.observation.action_index,
+            "commit_action_index": commit_action_index,
+            "boundary_phase": boundary_phase,
             "goal_set_revision": request.goal_set.revision,
             "cfw_lifecycle_revision": request.cfw_lifecycle_revision,
             "csw_selection_revision": request.csw_snapshot.revision,
@@ -207,7 +213,10 @@ class ControlPlaneService:
             "decision_id": request.decision_id,
             "status": "committed",
             "behavior_revision": committed_state.revision,
-            "host_action_index": int(basis["host_action_index"]),
+            "host_action_index": int(basis.get(
+                "commit_action_index", basis["host_action_index"])),
+            "candidate_action_index": int(basis["host_action_index"]),
+            "boundary_phase": basis.get("boundary_phase", "post_action"),
             "behavior_state": committed_state.to_dict(),
             "cfw_lifecycle_revision": request.cfw_lifecycle_revision,
             "csw_snapshot": request.csw_snapshot.to_dict(),
@@ -222,7 +231,8 @@ class ControlPlaneService:
             scope,
             expected_revision=record.state.revision,
             expected_action_index=record.action_index,
-            action_index=int(basis["host_action_index"]),
+            action_index=int(basis.get(
+                "commit_action_index", basis["host_action_index"])),
             state=committed_state,
             application_receipts=receipts,
             outbox_events=event_values,

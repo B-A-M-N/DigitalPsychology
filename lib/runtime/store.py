@@ -140,7 +140,7 @@ class BehaviorStateStore:
              control_tick_result: Mapping[str, Any] | None = None) -> None:
         if state.revision != expected_revision + 1:
             raise ValueError("saved DP behavior state must advance exactly one revision")
-        if action_index < 0:
+        if action_index < 0 and control_tick_id is None:
             raise ValueError("host action index must be non-negative")
         receipts = dict(application_receipts or {})
         if len(receipts) > 16:
@@ -183,9 +183,15 @@ class BehaviorStateStore:
                 basis = json.loads(tick[1])
                 if (int(basis.get("expected_behavior_revision", -1)) != expected_revision
                         or int(basis.get("expected_action_index", -2)) != expected_action_index
-                        or int(basis.get("host_action_index", -1)) != action_index):
+                        or int(basis.get("commit_action_index",
+                                         basis.get("host_action_index", -1))) != action_index):
                     database.rollback()
                     raise RuntimeError("control tick basis differs from the behavior-state commit")
+                if action_index < 0 and not (
+                        basis.get("boundary_phase") == "pre_action"
+                        and action_index == expected_action_index):
+                    database.rollback()
+                    raise ValueError("negative action index is valid only for initial pre-action state")
             row = database.execute(
                 "SELECT revision, action_index FROM behavior_state WHERE scope=?",
                 (scope,)).fetchone()
@@ -196,7 +202,11 @@ class BehaviorStateStore:
                 database.rollback()
                 raise RuntimeError(
                     "DP runtime compare-and-swap conflict; re-read session state")
-            if action_index <= actual_action:
+            pre_action_same_boundary = bool(
+                tick is not None
+                and json.loads(tick[1]).get("boundary_phase") == "pre_action"
+                and action_index == actual_action == expected_action_index)
+            if action_index <= actual_action and not pre_action_same_boundary:
                 database.rollback()
                 raise ValueError("runtime action indexes must increase monotonically")
             database.execute(
