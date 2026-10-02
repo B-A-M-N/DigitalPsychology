@@ -18,6 +18,7 @@ from .behavior_state import (
     InterventionOutcome,
     InterventionTarget, StateWorkOption,
 )
+from .condition_identity import identify_condition
 
 
 class _Answer(Protocol):
@@ -84,6 +85,7 @@ class FastLoopInput:
     context_pressure: float = 0.0
     evidence_refs: tuple[str, ...] = ()
     intervention_assessments: tuple[InterventionOutcome, ...] = ()
+    approach_epoch: str = ""
     available_frameworks: tuple[str, ...] = (
         "owl", "anchor", "fuse", "ward", "flow", "sispis", "dox")
 
@@ -145,6 +147,8 @@ class FastLoopInput:
             raise ValueError("intervention assessments must be unique per decision")
         if any(item.scope != self.scope for item in self.intervention_assessments):
             raise ValueError("intervention assessments must match the decision scope")
+        if not isinstance(self.approach_epoch, str) or len(self.approach_epoch) > 256:
+            raise ValueError("approach epoch must be bounded text")
 
 
 class BehavioralController:
@@ -243,7 +247,9 @@ class BehavioralController:
                           baseline_action_index: int = 0,
                           concurrent_intervention_ids: tuple[str, ...] = (),
                           baseline_goal_set: GoalSetSnapshot | None = None,
-                          baseline_attention_last_seen: Mapping[str, int] | None = None
+                          baseline_attention_last_seen: Mapping[str, int] | None = None,
+                          condition_id: str = "legacy-condition",
+                          condition_basis_digest: str = "legacy-condition"
                           ) -> BehaviorIntervention:
         intervention_id = "intv-" + self._digest({
             "scope": scope, "revision": revision, "cause": cause,
@@ -266,7 +272,9 @@ class BehavioralController:
             evaluation_horizon_actions=expiry or self.intervention_expiry_actions,
             concurrent_intervention_ids=concurrent_intervention_ids,
             baseline_goal_set=baseline_goal_set,
-            baseline_attention_last_seen=baseline_attention_last_seen or {})
+            baseline_attention_last_seen=baseline_attention_last_seen or {},
+            condition_id=condition_id,
+            condition_basis_digest=condition_basis_digest)
 
     @staticmethod
     def _rank_stateworks(mode: str, options: tuple[StateWorkOption, ...],
@@ -362,15 +370,52 @@ class BehavioralController:
             triggers.add("goal_drift")
         if pressure:
             triggers.add("context_pressure")
+
+        condition_criteria = tuple(context.attention_lease.criterion_ids
+                                   if context.attention_lease is not None
+                                   else original.focus_criteria)[:8]
+
+        def condition_for(cause: str,
+                          target_criteria: tuple[str, ...] = condition_criteria):
+            return identify_condition(
+                cause=cause,
+                target_criteria=target_criteria,
+                goal_set=context.goal_set,
+                csw_snapshot=context.csw_snapshot,
+                evidence_refs=context.evidence_refs,
+                approach_epoch=context.approach_epoch,
+            )
+
         def applies_to_attention(criterion_ids: tuple[str, ...]) -> bool:
             return not criterion_ids or not attention_ids or bool(
                 set(criterion_ids) & set(attention_ids))
 
+        active_interventions_by_id = {
+            item.intervention_id: item for item in original.active_interventions
+        }
+        normalized_assessments = []
+        for assessment in context.intervention_assessments:
+            active_intervention = active_interventions_by_id.get(
+                assessment.intervention_id)
+            if (active_intervention is not None
+                    and assessment.condition_id == "legacy-condition"
+                    and assessment.condition_basis_digest == "legacy-condition"):
+                assessment = replace(
+                    assessment,
+                    condition_id=active_intervention.condition_id,
+                    condition_basis_digest=active_intervention.condition_basis_digest,
+                )
+            normalized_assessments.append(assessment)
+
+        current_condition_ids = {
+            cause: condition_for(cause).condition_id for cause in triggers
+        }
         previously_failed = {
             item.cause for item in original.intervention_history
             if item.outcome in {"ineffective", "regressed", "unattributed",
                                 "inconclusive", "expired"}
             and applies_to_attention(item.target_criteria)
+            and current_condition_ids.get(item.cause) == item.condition_id
         }
         blocking_failed_causes = previously_failed & triggers
         if blocking_failed_causes:
@@ -378,15 +423,17 @@ class BehavioralController:
         previously_effective = {
             item.cause for item in original.intervention_history
             if item.outcome == "effective" and applies_to_attention(item.target_criteria)
-        } | {item.cause for item in context.intervention_assessments
-             if item.outcome == "effective" and applies_to_attention(item.target_criteria)}
+            and current_condition_ids.get(item.cause) == item.condition_id
+        } | {item.cause for item in normalized_assessments
+             if item.outcome == "effective" and applies_to_attention(item.target_criteria)
+             and current_condition_ids.get(item.cause) == item.condition_id}
 
         interventions: list[BehaviorIntervention] = []
         outcomes: list[InterventionOutcome] = []
         directives: list[BehaviorDirective] = []
-        expired_causes: set[tuple[str, tuple[str, ...]]] = set()
+        expired_causes: set[tuple[str, tuple[str, ...], str]] = set()
         assessments = {item.intervention_id: item
-                       for item in context.intervention_assessments}
+                       for item in normalized_assessments}
         active_ids = {item.intervention_id for item in original.active_interventions}
         if not set(assessments).issubset(active_ids):
             raise ValueError("outcome assessment does not match an active intervention")
@@ -396,8 +443,17 @@ class BehavioralController:
             updated = replace(item, actions_elapsed=min(elapsed, item.expires_after_actions))
             assessment = assessments.get(item.intervention_id)
             if assessment is not None:
+                if (assessment.condition_id not in {"legacy-condition", item.condition_id}
+                        or assessment.condition_basis_digest not in {
+                            "legacy-condition", item.condition_basis_digest}):
+                    raise ValueError("intervention outcome condition differs from its receipt")
+                assessment = replace(
+                    assessment, condition_id=item.condition_id,
+                    condition_basis_digest=item.condition_basis_digest)
                 if (assessment.cause != item.cause
-                        or assessment.observed_revision <= item.start_revision):
+                        or assessment.observed_revision <= item.start_revision
+                        or assessment.condition_id != item.condition_id
+                        or assessment.condition_basis_digest != item.condition_basis_digest):
                     raise ValueError("intervention outcome does not match its active record")
                 if (assessment.outcome == "inconclusive"
                         and updated.actions_elapsed < item.evaluation_horizon_actions):
@@ -409,22 +465,28 @@ class BehavioralController:
                 outcomes.append(assessment)
                 if assessment.outcome in {"ineffective", "regressed", "unattributed",
                                           "inconclusive", "expired"}:
-                    expired_causes.add((item.cause, item.target_criteria))
+                    expired_causes.add((item.cause, item.target_criteria,
+                                        item.condition_id))
                 continue
             if item.cause not in triggers:
                 outcomes.append(InterventionOutcome(
                     intervention_id=item.intervention_id, cause=item.cause,
                     outcome="withdrawn", observed_revision=next_revision,
                     scope=context.scope, attribution="insufficient",
-                    target_criteria=item.target_criteria))
+                    target_criteria=item.target_criteria,
+                    condition_id=item.condition_id,
+                    condition_basis_digest=item.condition_basis_digest))
                 continue
             if elapsed >= item.evaluation_horizon_actions:
                 outcomes.append(InterventionOutcome(
                     intervention_id=item.intervention_id, cause=item.cause,
                     outcome="expired", observed_revision=next_revision,
                     scope=context.scope, attribution="insufficient",
-                    target_criteria=item.target_criteria))
-                expired_causes.add((item.cause, item.target_criteria))
+                    target_criteria=item.target_criteria,
+                    condition_id=item.condition_id,
+                    condition_basis_digest=item.condition_basis_digest))
+                expired_causes.add((item.cause, item.target_criteria,
+                                    item.condition_id))
                 continue
             interventions.append(updated)
 
@@ -490,7 +552,8 @@ class BehavioralController:
         failed_intervention = bool(
             blocking_failed_causes
             or any(cause in triggers and applies_to_attention(target_criteria)
-                   for cause, target_criteria in expired_causes))
+                   and current_condition_ids.get(cause) == condition_id
+                   for cause, target_criteria, condition_id in expired_causes))
         if failed_intervention:
             triggers.add("failed_cause_blocked")
 
@@ -563,9 +626,10 @@ class BehavioralController:
                 attention_cause,
                 "Give runnable required criteria a bounded, starvation-aware attention window."))
 
-        existing_causes = ({item.cause for item in interventions
-                            if applies_to_attention(item.target_criteria)}
-                           | (previously_effective & triggers))
+        existing_condition_ids = ({item.condition_id for item in interventions
+                                   if applies_to_attention(item.target_criteria)}
+                                  | {current_condition_ids[cause]
+                                     for cause in previously_effective & triggers})
         grouped: dict[str, list[tuple[str, str, str, str]]] = {}
         for target, value, cause, effect in proposed:
             if (target.startswith("framework:")
@@ -580,7 +644,9 @@ class BehavioralController:
             grouped.setdefault(cause, []).append((target, previous, value, effect))
 
         for cause, target_values in grouped.items():
-            if cause in existing_causes:
+            target_criteria = tuple(next_focus or attention_ids)[:8]
+            condition = condition_for(cause, target_criteria)
+            if condition.condition_id in existing_condition_ids:
                 continue
             expected_effect = target_values[0][3]
             expiry = 1 if cause == "progress_observed" else self.intervention_expiry_actions
@@ -596,7 +662,9 @@ class BehavioralController:
                 concurrent_intervention_ids=tuple(
                     item.intervention_id for item in interventions),
                 baseline_goal_set=context.goal_set,
-                baseline_attention_last_seen=context.attention_last_seen)
+                baseline_attention_last_seen=context.attention_last_seen,
+                condition_id=condition.condition_id,
+                condition_basis_digest=condition.condition_basis_digest)
             interventions.append(intervention)
             for target, _previous, value, effect in target_values:
                 operation = ("set_framework" if target.startswith("framework:")
@@ -657,6 +725,8 @@ class BehavioralController:
                 # evidence window closes.
                 preference = ()
             else:
+                condition = condition_for(
+                    "statework_fit", tuple(next_focus or attention_ids)[:8])
                 intervention = self._new_intervention(
                     scope=context.scope, revision=next_revision, cause="statework_fit",
                     expected_effect="Use the eligible StateWork that best fits the current behavioral mode; CSW validates and commits it.",
@@ -668,7 +738,9 @@ class BehavioralController:
                     concurrent_intervention_ids=tuple(
                         item.intervention_id for item in interventions),
                     baseline_goal_set=context.goal_set,
-                    baseline_attention_last_seen=context.attention_last_seen)
+                    baseline_attention_last_seen=context.attention_last_seen,
+                    condition_id=condition.condition_id,
+                    condition_basis_digest=condition.condition_basis_digest)
                 interventions = list(working.active_interventions) + [intervention]
             if preference:
                 directive = BehaviorDirective(

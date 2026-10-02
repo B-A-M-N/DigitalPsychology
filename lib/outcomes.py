@@ -12,7 +12,7 @@ from typing import Mapping, Protocol
 
 from .behavior_state import (BehaviorIntervention, GoalSetSnapshot,
                              InterventionOutcome, TaskSetOutcome)
-from .attention import MAX_FAIRNESS_AGE_ACTIONS
+from .attention import fairness_bound_actions
 
 
 _SOURCE_KINDS = {
@@ -237,7 +237,8 @@ class InterventionEvaluator:
         if task_set_outcome is not None:
             regression = regression or bool(task_set_outcome.regressions)
             regression = regression or (
-                task_set_outcome.max_starvation_after > MAX_FAIRNESS_AGE_ACTIONS)
+                task_set_outcome.max_starvation_after > fairness_bound_actions(
+                    len(frame.goal_set.runnable_items) if frame.goal_set is not None else 0))
         comparative = [fact for fact in facts if fact.kind in _COMPARATIVE_KINDS]
         comparison_ids = {fact.comparison_id for fact in comparative}
         if len(comparison_ids) > 1:

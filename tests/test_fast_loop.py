@@ -177,6 +177,33 @@ def test_effective_fast_loop_intervention_is_recorded_then_restored():
     assert second.state.framework_modes["fuse"] == "normal"
 
 
+def test_failed_intervention_does_not_poison_a_new_approach_epoch():
+    from lib.behavior_state import InterventionOutcome
+    from lib.condition_identity import identify_condition
+
+    scope = "tenant/app/agent/session/task/attempt"
+    snapshot = CSWBehaviorSnapshot(revision=1)
+    old_condition = identify_condition(
+        cause="equivalent_retry", target_criteria=("criterion-1",),
+        goal_set=None, csw_snapshot=snapshot, evidence_refs=(),
+        approach_epoch="hypothesis-1")
+    history = InterventionOutcome(
+        intervention_id="intv-old", cause="equivalent_retry",
+        outcome="ineffective", observed_revision=1, scope=scope,
+        condition_id=old_condition.condition_id,
+        condition_basis_digest=old_condition.condition_basis_digest,
+        target_criteria=("criterion-1",))
+    state = BehaviorState(revision=1, intervention_history=(history,))
+
+    decision = BehavioralController().decide(FastLoopInput(
+        scope=scope, state=state, csw_snapshot=snapshot,
+        objective_criteria=("criterion-1",), equivalent_retry_count=2,
+        approach_epoch="hypothesis-2"))
+
+    assert decision.state.cognitive_mode == "RECOVER"
+    assert decision.state.active_interventions[0].condition_id != old_condition.condition_id
+
+
 def test_intervention_identity_is_scoped_per_agent_session():
     controller = BehavioralController()
     state = BehaviorState()

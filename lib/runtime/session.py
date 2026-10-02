@@ -1,7 +1,7 @@
 """DP-owned host session and behavioral event loop."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from threading import RLock
 from typing import Any, Mapping, Sequence
@@ -18,6 +18,7 @@ from .contracts import (BehavioralDecisionService, CFWComponentPort,
                         CSWWorkflowPort, RuntimeIdentity, RuntimeObservation,
                         SystemOneFrameFactory)
 from .adapters.standalone import NullCFWComponentPort, NullCSWWorkflowPort
+from .projection import project_behavior_context as _project_behavior_context
 from .store import BehaviorStateStore, RuntimeStateRecord
 
 
@@ -67,6 +68,7 @@ class RuntimeSession:
         self.state_store = state_store
         self.system_one_frame_factory = system_one_frame_factory
         self._latest_goal_set: GoalSetSnapshot | None = None
+        self._closed = False
         if system_one_frame_factory is not None and not callable(
                 getattr(controller, "judge", None)):
             raise TypeError("System-1 frame construction requires a DP host judge")
@@ -76,6 +78,7 @@ class RuntimeSession:
                        judgment: Any = None) -> RuntimeTurnResult:
         """Observe one host action, decide, apply, and durably record DP changes."""
         with self._lock:
+            self._require_open()
             self._dispatch_outbox()
             record = self.state_store.load(self.scope)
             self._ensure_adapter_state_is_reconcilable(record.state)
@@ -109,7 +112,13 @@ class RuntimeSession:
                     raise TypeError("System-1 frame factory must return a validated frame")
                 if frame.identity.to_dict() != self._system_one_identity().to_dict():
                     raise ValueError("System-1 frame identity escapes the runtime session")
-                judgment = self.controller.judge(frame)
+                judgment_result = self.controller.judge(frame)
+                if hasattr(judgment_result, "judgment"):
+                    judgment = (judgment_result.judgment
+                                if getattr(judgment_result, "status", None) == "ok"
+                                else None)
+                else:
+                    judgment = judgment_result
             outcome_assessments = self._assess_ready_interventions(
                 record, observation, goal_set=goal_set,
                 attention_last_seen=(attention.last_seen if attention else {}))
@@ -135,6 +144,7 @@ class RuntimeSession:
                 evidence_refs=observation.evidence_refs,
                 intervention_assessments=tuple(outcome_assessments),
                 available_frameworks=available_frameworks,
+                approach_epoch=observation.approach_epoch,
             )
             decision = self._parse_decision(
                 self.controller.decide_behavior(decision_input, judgment=judgment))
@@ -317,10 +327,23 @@ class RuntimeSession:
                 # failure cannot roll back the already committed behavior turn.
                 break
 
+    def close(self) -> None:
+        """Flush any deliverable committed events and detach the cached session."""
+        with self._lock:
+            if self._closed:
+                return
+            self._dispatch_outbox()
+            self._closed = True
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("DP runtime session is closed")
+
     def apply_workflow_step(self, statework_id: str, step_id: str, *,
                             evidence_refs: Sequence[str],
                             expected_workflow_revision: int) -> Any:
         """Submit a legal-step request through CSW's current snapshot boundary."""
+        self._require_open()
         snapshot = self._csw_snapshot(candidate_statework_ids=(statework_id,))
         if statework_id not in snapshot.active_stateworks:
             raise ValueError("StateWork is not active in the CSW-owned selection")
@@ -333,6 +356,7 @@ class RuntimeSession:
     def before_model_call(self, *, tool_capable: bool = False,
                           action_hint: Mapping[str, Any] | None = None) -> str:
         """Ask the CFW component port to inject the committed DP projection."""
+        self._require_open()
         record = self.state_store.load(self.scope)
         self._ensure_adapter_state_is_reconcilable(record.state)
         snapshot = self._csw_snapshot()
@@ -344,6 +368,7 @@ class RuntimeSession:
 
     def before_tool_planning(self, *,
                              action_hint: Mapping[str, Any] | None = None) -> str:
+        self._require_open()
         record = self.state_store.load(self.scope)
         self._ensure_adapter_state_is_reconcilable(record.state)
         snapshot = self._csw_snapshot()
@@ -389,71 +414,12 @@ class RuntimeSession:
         state = state or self.state_store.load(self.scope).state
         snapshot = snapshot or self._csw_snapshot()
         goal_set = goal_set or self._latest_goal_set
-        runnable = goal_set.runnable_items if goal_set is not None else ()
-        focused = set(state.focus_criteria)
-        next_ready = sorted(
-            (item for item in runnable if item.criterion_id not in focused),
-            key=lambda item: (-item.priority, item.criterion_id))[:2]
-        oldest_starved = sorted(
-            runnable,
-            key=lambda item: (state.attention_last_seen.get(item.criterion_id, -1),
-                              item.criterion_id))[:1]
-        payload = {
-            "revision": state.revision,
-            "bound_authorities": {
-                "cfw": ("unavailable" if isinstance(self.cfw, NullCFWComponentPort)
-                        else "connected"),
-                "csw": ("unavailable" if isinstance(self.csw, NullCSWWorkflowPort)
-                        else "connected"),
-                "outcome_evidence": ("unavailable"
-                                     if self.outcome_evidence_authority is None
-                                     else "connected"),
-            },
-            "objective": self.objective,
-            "task_set_summary": (goal_set.required_counts if goal_set is not None else {
-                "total": 0, "verified": 0, "ready": 0, "blocked": 0,
-                "dependency_blocked": 0, "deferred": 0, "remaining_required": 0,
-            }),
-            "attention_window": list(state.focus_criteria),
-            "attention_lease": (state.attention_lease.to_dict()
-                                if state.attention_lease is not None else None),
-            "next_ready": [item.criterion_id for item in next_ready],
-            "oldest_starved": (oldest_starved[0].criterion_id if oldest_starved else None),
-            "cognitive_mode": state.cognitive_mode,
-            "framework_modes": ({} if isinstance(self.cfw, NullCFWComponentPort)
-                                else dict(state.framework_modes)),
-            "unapplied_framework_modes": (
-                dict(state.framework_modes)
-                if isinstance(self.cfw, NullCFWComponentPort) else {}),
-            "controls": {
-                "verification_intensity": state.verification_intensity,
-                "exploration_budget": state.exploration_budget,
-                "retry_policy": state.retry_policy,
-                "recovery_level": state.recovery_level,
-                "context_strategy": state.context_strategy,
-                "response_strategy": state.response_strategy,
-            },
-            "csw_active_stateworks": list(snapshot.active_stateworks),
-            "csw_selection_revision": snapshot.revision,
-            "csw_snapshot_id": snapshot.snapshot_id,
-            "csw_workflow_states": dict(snapshot.workflow_states),
-            "csw_workflow_revisions": dict(snapshot.workflow_revisions),
-            "csw_eligible_steps": {
-                key: list(value) for key, value in snapshot.eligible_steps.items()},
-            "csw_eligible_stateworks": [item.to_dict()
-                                         for item in snapshot.eligible_stateworks],
-            "active_interventions": [{
-                "intervention_id": item.intervention_id,
-                "cause": item.cause,
-                "expected_effect": item.expected_effect,
-                "actions_remaining": max(0, item.expires_after_actions - item.actions_elapsed),
-                "target_criteria": list(item.target_criteria),
-            } for item in state.active_interventions],
-        }
-        return ("===== DIGITAL PSYCHOLOGY BEHAVIOR STATE =====\n"
-                "Host-selected behavioral guidance. Bound authorities and available "
-                "components are listed in the state projection.\n"
-                + json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return _project_behavior_context(
+            state, snapshot, objective=self.objective, goal_set=goal_set,
+            cfw_connected=not isinstance(self.cfw, NullCFWComponentPort),
+            csw_connected=not isinstance(self.csw, NullCSWWorkflowPort),
+            outcome_evidence_connected=self.outcome_evidence_authority is not None,
+        )
 
     def _goal_set(self, observation: RuntimeObservation) -> GoalSetSnapshot | None:
         if observation.goal_set is not None:
@@ -519,7 +485,11 @@ class RuntimeSession:
             assessed = self.controller.assess_intervention_outcome(
                 intervention, frame,
                 evidence_authority=self.outcome_evidence_authority)
-            result = InterventionOutcome.from_mapping(assessed)
+            result = replace(
+                InterventionOutcome.from_mapping(assessed),
+                condition_id=intervention.condition_id,
+                condition_basis_digest=intervention.condition_basis_digest,
+            )
             # The outcome evaluator may see the same evidence for multiple
             # active interventions. IDs and scope stay tied to each record.
             results.append(result)

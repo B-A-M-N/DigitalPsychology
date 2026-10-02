@@ -82,6 +82,7 @@ class RuntimeObservation:
     criterion_status: Mapping[str, str] = field(default_factory=dict)
     evidence_refs: tuple[str, ...] = ()
     active_trigger_codes: tuple[str, ...] = ()
+    approach_epoch: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.action_index, int) or self.action_index < 0:
@@ -114,6 +115,8 @@ class RuntimeObservation:
                 raise ValueError("criterion_status must agree with the host goal-set snapshot")
             statuses = snapshot_statuses
         object.__setattr__(self, "criterion_status", statuses)
+        if not isinstance(self.approach_epoch, str) or len(self.approach_epoch) > 256:
+            raise ValueError("host approach epoch must be bounded text")
         for name, limit in (("evidence_refs", 16), ("active_trigger_codes", 32)):
             values = getattr(self, name)
             if (not isinstance(values, (tuple, list)) or len(values) > limit

@@ -33,6 +33,34 @@ class CFWRuntimeAdapter:
             raise ValueError("CFW returned malformed component capability IDs")
         return values
 
+    def lifecycle_revision(self) -> int:
+        raw = getattr(self.component_port, "lifecycle_revision", None)
+        value = raw() if callable(raw) else raw
+        if type(value) is not int or value < -1:
+            raise RuntimeError("CFW did not expose a valid lifecycle revision")
+        return value
+
+    def authority_identity(self) -> Mapping[str, str] | None:
+        """Return stable CFW authority identity when the host port provides it."""
+        provider = getattr(self.component_port, "authority_identity", None)
+        value = provider() if callable(provider) else provider
+        if value is None:
+            return None
+        if (not isinstance(value, Mapping)
+                or any(not isinstance(key, str) or not isinstance(item, str)
+                       for key, item in value.items())):
+            raise RuntimeError("CFW returned a malformed authority identity")
+        return dict(value)
+
+    def applied_behavior_state(self) -> Mapping[str, Any] | None:
+        raw = getattr(self.component_port, "applied_behavior_state", None)
+        value = raw() if callable(raw) else raw
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise RuntimeError("CFW returned a malformed applied behavior state")
+        return dict(value)
+
     def collect_behavior_signals(self, observation: RuntimeObservation
                                  ) -> tuple[FrameworkSignal, ...]:
         raw = self.component_port.collect_behavior_signals(observation)
@@ -74,6 +102,13 @@ class CFWRuntimeAdapter:
 
     def rollback_behavior_directives(self, prepared: Any) -> None:
         self.component_port.rollback_behavior_directives(prepared)
+
+    def restore_behavior_state(self, behavior_state: Mapping[str, Any], *,
+                               expected_current_revision: int) -> None:
+        restore = getattr(self.component_port, "restore_behavior_state", None)
+        if not callable(restore):
+            raise RuntimeError("CFW adapter cannot restore a behavior state after restart")
+        restore(behavior_state, expected_current_revision=expected_current_revision)
 
     def render_behavior_context(self, context: str, *,
                                 active_statework_ids: Sequence[str] = ()) -> str:

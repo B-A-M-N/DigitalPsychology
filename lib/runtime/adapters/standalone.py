@@ -28,8 +28,24 @@ class NullCFWComponentPort:
         self._controls: dict[str, dict[str, Any]] = {}
         self._behavior_state: dict[str, Any] | None = None
 
+    def authority_identity(self) -> Mapping[str, str]:
+        return {"adapter_kind": "null-cfw", "authority_id": "none",
+                "protocol_version": "1.0.0", "scope": "none",
+                "capability_hash": sha256(b"digitalpsychology:null-cfw").hexdigest()}
+
     def available_component_ids(self) -> tuple[str, ...]:
         return ()
+
+    def lifecycle_revision(self) -> int:
+        return 0
+
+    def applied_behavior_state(self) -> Mapping[str, Any] | None:
+        return self._behavior_state
+
+    def restore_behavior_state(self, behavior_state: Mapping[str, Any], *,
+                               expected_current_revision: int) -> None:
+        del expected_current_revision
+        self._behavior_state = dict(behavior_state)
 
     def collect_behavior_signals(self, _observation: Any) -> tuple[()]:
         return ()
@@ -106,6 +122,11 @@ class NullCSWWorkflowPort:
     """Report an empty workflow set when no CSW authority is connected."""
 
     _SNAPSHOT_ID = sha256(b"digitalpsychology:no-csw-workflows").hexdigest()
+
+    def authority_identity(self) -> Mapping[str, str]:
+        return {"adapter_kind": "null-csw", "authority_id": "none",
+                "protocol_version": "1.0.0", "scope": "none",
+                "capability_hash": self._SNAPSHOT_ID}
 
     def behavioral_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None
                             ) -> CSWBehaviorSnapshot:

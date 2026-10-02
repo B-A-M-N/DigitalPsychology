@@ -16,10 +16,12 @@ system-one = ["laya==0.3.22"]
 
 [project.scripts]
 digital-psychology-mcp = "digital_psychology.mcp_server:main"
+digital-psychology-control-mcp = "digital_psychology.transport.control_mcp:main"
 
 [tool.setuptools]
 packages = ["digital_psychology", "digital_psychology.runtime",
-            "digital_psychology.runtime.adapters"]
+            "digital_psychology.runtime.adapters", "digital_psychology.control",
+            "digital_psychology.host", "digital_psychology.transport"]
 package-dir = {digital_psychology = "lib"}
 
 [tool.setuptools.package-data]

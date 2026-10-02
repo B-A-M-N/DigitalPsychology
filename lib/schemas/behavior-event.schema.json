@@ -945,7 +945,9 @@
         "behavior_intervention_repeated_approach": {"type": ["boolean", "null"]},
         "behavior_intervention_verification_quality": {
           "enum": ["improved", "unchanged", "degraded", "unknown"]
-        }
+        },
+        "behavior_condition_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "behavior_condition_basis_digest": {"type": "string", "minLength": 1, "maxLength": 128}
       },
       "additionalProperties": false
     }

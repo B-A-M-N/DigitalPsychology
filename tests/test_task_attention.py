@@ -89,13 +89,16 @@ def test_attention_lease_rotates_when_host_marks_focused_item_verified():
 
 def test_all_256_required_criteria_receive_attention_within_fairness_bound():
     from dataclasses import replace
-    from lib.attention import MAX_FAIRNESS_AGE_ACTIONS
+    from lib.attention import (MAX_FAIRNESS_AGE_ACTIONS,
+                               fairness_bound_actions)
 
     goal_set = GoalSetSnapshot(1, tuple(
         GoalItemSnapshot(f"criterion-{index:03d}") for index in range(256)))
     state = BehaviorState()
     seen: dict[str, int] = {}
-    for action_index in range(1, MAX_FAIRNESS_AGE_ACTIONS + 1):
+    bound = fairness_bound_actions(256)
+    assert bound == MAX_FAIRNESS_AGE_ACTIONS
+    for action_index in range(1, bound + 1):
         schedule = schedule_attention(goal_set, state, action_index=action_index)
         assert schedule.lease is not None
         for criterion_id in schedule.lease.criterion_ids:
@@ -108,7 +111,17 @@ def test_all_256_required_criteria_receive_attention_within_fairness_bound():
         )
 
     assert len(seen) == 256
-    assert max(seen.values()) <= MAX_FAIRNESS_AGE_ACTIONS
+    assert max(seen.values()) <= fairness_bound_actions(len(goal_set.runnable_items))
+
+
+def test_fairness_bound_tracks_the_current_runnable_set():
+    from lib.attention import fairness_bound_actions
+
+    assert fairness_bound_actions(0) == 0
+    assert fairness_bound_actions(1) == 3
+    assert fairness_bound_actions(4) == 6
+    assert fairness_bound_actions(20) == 21
+    assert fairness_bound_actions(256) == 258
 
 
 def test_goal_set_rejects_unknown_dependencies_and_criterion_overflow():

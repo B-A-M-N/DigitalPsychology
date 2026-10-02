@@ -15,7 +15,7 @@ DP does not infer subjective experience. It uses observable behavior to decide w
 
 ## Current implementation
 
-DigitalPsychology owns the cross-system runtime host in `lib/runtime/`. Its per-task `RuntimeSession` coordinates the behavioral loop, persists `BehaviorState`, projects context, resolves intervention outcomes, and talks to explicit CFW and CSW adapters. It does not grant permissions, define legal StateWork transitions, validate evidence, or replace either system's authority.
+DigitalPsychology owns the cross-system runtime host. The private control MCP in `lib/transport/control_mcp.py` runs DP's decision engine out of process; `lib/host/` keeps the persistent MCP client, lifecycle bridge, and local CFW/CSW actuators. The older `RuntimeSession` remains an in-process compatibility adapter. DP does not grant permissions, define legal StateWork transitions, validate evidence, or replace either system's authority.
 
 Implemented capabilities include:
 
@@ -27,15 +27,18 @@ Implemented capabilities include:
 - **Authoritative lifecycle state** with explicit rollback/rejection transitions, durable deployment revisions, and known-good previous profiles.
 - **Versioned advice-exchange contracts** so the host can record trusted context, eligible choices, requested adjustments, and the final effective routing decision.
 - **A deterministic fast-loop controller** that emits typed `BehavioralDecision`, `BehaviorDirective`, and `BehaviorState` values from bounded CFW/CSW/runtime inputs.
+- **Condition-scoped intervention history** bound to target criteria, goal-set revision, workflow state, host evidence, and approach epoch. A failed intervention cannot suppress recovery after the host reports a new hypothesis or materially changed state.
+- **Derived attention fairness** with a round-robin bound based on the current runnable criterion count and bounded lease size. The 258-action ceiling applies only to a full 256-item task set.
 - **An independent intervention outcome evaluator** that accepts only scoped, post-intervention host/CSW/validator evidence and an exact applied-directive receipt. It distinguishes supported progress, regression, confounding, missing evidence, and expired windows; agent success claims are not evidence.
 - **Intervention lifecycle records** with cause, expected effect, target criteria, baseline status, start action, bounded horizon, scope, expiry, and measured outcome; cleared or expired interventions emit explicit release directives.
 - **Transactional intervention event outbox** that commits authenticated application and outcome events with the DP behavior revision, then retries delivery idempotently after restarts.
 - **Constrained StateWork preferences** ranked only from the eligible choices supplied by CSW. DP cannot commit or legalize a CSW transition.
-- **Revisioned DP runtime sessions** that coordinate CFW signals and directives, CSW snapshots and activation, context projection, evidence assessment, and authenticated intervention/outcome events.
+- **A versioned private MCP control protocol** with prepare/apply/commit/abort/reconcile transactions, exact directive receipts, and restart recovery against CFW and CSW revisions.
+- **Host failure semantics** that retain the last committed behavior projection when DP is unavailable; CFW hard action gates and CSW legality remain active.
 
 DP's telemetry, experiments, and deterministic controller do not require CFW or CSW packages. The cross-system `RuntimeHost` uses explicit ports to coordinate CFW and CSW. CFW and CSW also remain independently usable; the complete adaptive deployment runs CFW, CSW, and DP together, with each repository retaining its own authority.
 
-Runtime session orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed as agent-facing MCP tools. `RuntimeHost` opens scoped `RuntimeSession` instances; each session uses compare-and-swap for DP state, asks CFW to validate/apply controls, and asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
+Runtime orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed through the model's tool registry. `RuntimeHost.open_control_bridge(...)` starts a private MCP child and returns the host lifecycle bridge; the bridge asks CFW to validate/apply controls and asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
 
 The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
 
@@ -50,11 +53,12 @@ python3 -m pip install -e .
 digital-psychology-mcp
 ```
 
-The command runs as a child process of the MCP client and waits for protocol
-messages on stdin. Keep stdout reserved for MCP traffic. Starting this
-transport exposes DP's telemetry, advice, profile-validation, and slow-loop
-tools; it does not construct a task runtime session. A trusted host constructs
-the runtime session through the library API below.
+The command runs as a child process of an operator MCP client and waits for
+protocol messages on stdin. Keep stdout reserved for MCP traffic. It exposes
+DP's telemetry, advice, profile-validation, and slow-loop administration
+tools; do not register it in the controlled agent's tool namespace. The
+private `digital-psychology-control-mcp` process is launched by
+`HostControlBridge` and is never registered with the model.
 
 The service stores ordinary state under `DIGITALPSYCHOLOGY_STATE_ROOT` (or the platform state directory). Ordinary, non-privileged events can be ingested without an authentication secret for local fixtures. In a deployment where agents can reach the MCP surface, configure `DIGITALPSYCHOLOGY_INGESTION_SECRET`; privileged categories (`validation`, `state_transition`, `completion`) and operator/repository-owner actors require host attestation.
 
@@ -85,6 +89,8 @@ The slow loop is explicitly invoked; it is not an automatic background worker. I
 | **DP alone** | Event store, trajectory analysis, experiments, and slow-loop service | DP owns its telemetry and validated profiles; no CFW or CSW is required |
 | **CFW alone** | CFW components, task policy, and action gates | CFW's component and action contracts |
 | **CSW alone** | CSW workflow selection, durable state, and evidence checks | CSW's transition and evidence contracts |
+| **CFW + DP** | CFW components and action gates with DP-controlled behavioral settings | CFW retains hard action authority |
+| **CSW + DP** | DP may request a StateWork from CSW's eligible set | CSW retains workflow selection, evidence, and transition authority |
 | **CFW + CSW** | CFW task-local enforcement with CSW workflows | CFW governs component/action policy; CSW governs workflow eligibility, state, evidence, and transitions |
 | **CFW + CSW + DP** | The complete adaptive runtime | DP coordinates behavioral interventions; CFW and CSW retain their authorities |
 
@@ -94,22 +100,27 @@ independent standalone entry points and work together without DP installed.
 
 ### Wiring the trusted runtime host
 
-The host supplies explicit CFW and CSW ports to DP. It calls
-`RuntimeHost.open_session(...)` once per scoped task, then reports each
-completed action through `RuntimeSession.process_action(RuntimeObservation)`.
-At model and tool-planning boundaries it requests context through
-`before_model_call(...)` and `before_tool_planning(...)`. CFW's adapter
-validates and applies DP directives; CSW's adapter exposes only its current
-eligible workflows and revision-checked operations.
+The host supplies explicit CFW and optional CSW ports to DP. It calls
+`RuntimeHost.open_control_bridge(...)` once per scoped task, then invokes the
+bridge after each completed host action and before model/tool-planning
+boundaries. The private MCP transport makes the decision; local host adapters
+apply it through CFW's component lifecycle and CSW's revision-checked
+selection API. The bridge stays in the trusted host and is never passed to the
+controlled model. `RuntimeHost.open_session(...)` and
+`RuntimeSession.process_action(...)` remain available for in-process
+deployments and compatibility.
 
 For multi-criterion goals, the host sends the complete `GoalSetSnapshot`
 (bounded to 256 criteria). DP leases attention to at most three criteria at a
-time and gives every runnable required criterion an attention opportunity
-within 258 actions. The prompt may show the current attention window, while
-the host keeps the full goal set for completion checks.
+time. Its service bound is `ceil(runnable_count / 3) * 3` actions, so the
+maximum is 258 only when all 256 criteria are runnable. The prompt may show
+the current attention window, while the host keeps the full goal set for
+completion checks.
 
-Every intervention records its cause, target criteria, expected effect,
-baseline, action horizon, and applied-directive receipt. After the horizon,
+Every intervention records its cause, condition identity, target criteria,
+expected effect, baseline, action horizon, and applied-directive receipt. The
+condition identity includes the host's approach epoch, evidence basis,
+goal-set revision, and relevant CSW workflow state. After the horizon,
 DP evaluates objective progress from independent host, CSW, or validator
 evidence. Agent claims and changed files alone do not establish success.
 Targeted progress can earn credit only when the measured window also accounts
@@ -188,9 +199,12 @@ The diagram above describes the optional combined loop. It is not a requirement 
 Together they form a **closed-loop cognitive-behavioral control architecture**:
 
 ```text
-MCP transport ── public telemetry/advice tools
+Public MCP transport ── telemetry/advice tools
 
-Trusted host runtime (lib/runtime/)
+Private DP control MCP (lib/transport/control_mcp.py)
+  └── versioned prepare / commit / abort / reconcile API
+
+Trusted DP host runtime (lib/host/)
   ├── CSW: authoritative state snapshots and legal transitions
   ├── CFW: component signals and validated cognitive actuators
   └── DP: BehaviorState, bounded attention, intervention lifecycle
@@ -207,6 +221,44 @@ Trusted host runtime (lib/runtime/)
 ```
 
 This makes the system adaptive without making it self-modifying in an uncontrolled way.
+
+## Host-only control MCP
+
+`digital-psychology-control-mcp` is a private stdio process launched by the
+trusted host. It is separate from the public telemetry and advice server. The
+controlled agent must not receive this server's tools. `HostControlBridge`
+sends completed action observations to DP, applies prepared CFW and CSW
+directives through local adapters, and commits only after those authorities
+confirm their revisions.
+
+The host process can open a bridge directly:
+
+```python
+from digital_psychology.host import HostControlBridge
+
+bridge = HostControlBridge(
+    identity=runtime_identity,
+    objective=objective,
+    objective_criteria=criterion_ids,
+    initial_goal_set=goal_set,
+    cfw=cfw_port,
+    csw=csw_port,
+)
+await bridge.open()
+```
+
+Call `bridge.after_action(...)` after each completed host-observed action or
+independent evidence boundary. `bridge.before_model_call(...)` and
+`bridge.before_tool_planning(...)` add the committed behavioral projection to
+the next model context. The client launches the control MCP as a private child
+process; do not add its control tools to the model-visible MCP configuration.
+
+Laya remains optional. Install it only when the deployment selects the native
+Laya semantic backend:
+
+```bash
+pip install 'digital-psychology[laya]'
+```
 
 ## What “why” means here
 

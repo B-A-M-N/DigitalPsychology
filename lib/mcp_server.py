@@ -100,6 +100,14 @@ class DigitalPsychologyService:
             raise RuntimeError("System-1 service is not configured")
         return self._system_one_service.judge(frame, mode=mode)
 
+    def control_system_one_frame_factory(self):
+        """Build frames only when an enabled host-only System-1 backend exists."""
+        if (self._system_one_service is None
+                or self._system_one_service.mode == "disabled"):
+            return None
+        from .control.system_one import create_system_one_frame_factory
+        return create_system_one_frame_factory(self._system_one_service)
+
     def reset_identity(self, identity: SystemOneIdentity) -> None:
         if self._system_one_service is None:
             raise RuntimeError("System-1 service is not configured")
@@ -177,6 +185,8 @@ class DigitalPsychologyService:
             "behavior_intervention_competing_ids":
                 list(intervention.concurrent_intervention_ids),
             "behavior_intervention_directive_ids": sorted(applied),
+            "behavior_condition_id": intervention.condition_id,
+            "behavior_condition_basis_digest": intervention.condition_basis_digest,
         }
         return self._build_intervention_event(
             event_context, category="decision", event_type="behavior_intervention_applied",
@@ -209,6 +219,8 @@ class DigitalPsychologyService:
             "behavior_intervention_artifact_changed": outcome.artifact_changed,
             "behavior_intervention_repeated_approach": outcome.repeated_approach,
             "behavior_intervention_verification_quality": outcome.verification_quality,
+            "behavior_condition_id": outcome.condition_id,
+            "behavior_condition_basis_digest": outcome.condition_basis_digest,
         }
         return self._build_intervention_event(
             event_context, category="validation", event_type="behavior_intervention_assessed",

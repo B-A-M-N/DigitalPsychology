@@ -7,6 +7,8 @@ for DP's behavioral policy.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -84,6 +86,34 @@ class CSWRuntimeAdapter:
             workflow_revisions=revisions,
             eligible_steps=steps,
         )
+
+    def available_statework_ids(self) -> tuple[str, ...]:
+        """Return IDs backed by explicit bindings in this CSW authority."""
+        return tuple(sorted(self.bindings))
+
+    def authority_identity(self) -> dict[str, str]:
+        """Stable identity for this CSW scope and its bound workflow contracts."""
+        scope = json.dumps(self.identity.csw_scope(), sort_keys=True,
+                           separators=(",", ":"))
+        root = getattr(self.authority, "root", None)
+        authority_basis = (str(root.resolve())
+                           if callable(getattr(root, "resolve", None))
+                           else f"{type(self.authority).__module__}.{type(self.authority).__qualname__}")
+        authority_id = "csw-authority:" + hashlib.sha256(
+            authority_basis.encode()).hexdigest()
+        capabilities = json.dumps({
+            statework_id: {"identity": dict(binding.identity),
+                           "contract_hash": binding.contract_hash}
+            for statework_id, binding in sorted(self.bindings.items())
+        }, sort_keys=True, separators=(",", ":"))
+        return {
+            "adapter_kind": "csw-workflow-authority",
+            "authority_id": authority_id,
+            "protocol_version": "1.0.0",
+            "scope": hashlib.sha256(scope.encode()).hexdigest(),
+            "scope_hash": hashlib.sha256(scope.encode()).hexdigest(),
+            "capability_hash": hashlib.sha256(capabilities.encode()).hexdigest(),
+        }
 
     def activate_statework(self, statework_id: str, *,
                            expected_selection_revision: int,

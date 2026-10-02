@@ -91,7 +91,9 @@
           "type": "object", "maxProperties": 256,
           "propertyNames": {"type": "string", "minLength": 1, "maxLength": 128},
           "additionalProperties": {"type": "integer", "minimum": 0}
-        }
+        },
+        "condition_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "condition_basis_digest": {"type": "string", "minLength": 1, "maxLength": 128}
       }
     },
     "outcome": {
@@ -112,7 +114,9 @@
         "verification_quality": {"enum": ["improved", "unchanged", "degraded", "unknown"]},
         "comparison_id": {"type": ["string", "null"], "maxLength": 128},
         "target_criteria": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
-        "task_set_outcome": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/taskSetOutcome"}]}
+        "task_set_outcome": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/taskSetOutcome"}]},
+        "condition_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "condition_basis_digest": {"type": "string", "minLength": 1, "maxLength": 128}
       }
     },
     "goalSet": {

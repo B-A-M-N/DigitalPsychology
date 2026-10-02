@@ -235,12 +235,16 @@ class BehaviorIntervention:
     concurrent_intervention_ids: tuple[str, ...] = ()
     baseline_goal_set: GoalSetSnapshot | None = None
     baseline_attention_last_seen: Mapping[str, int] = field(default_factory=dict)
+    condition_id: str = "legacy-condition"
+    condition_basis_digest: str = "legacy-condition"
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
         _text(self.cause, "intervention cause", limit=128)
         _text(self.expected_effect, "expected effect", limit=512)
         _text(self.scope, "intervention scope", limit=256)
+        _text(self.condition_id, "intervention condition ID", limit=128)
+        _text(self.condition_basis_digest, "intervention condition digest", limit=128)
         if self.start_revision < 0 or self.expires_after_actions < 1:
             raise ValueError("intervention revision and expiry must be positive bounds")
         if not 0 <= self.actions_elapsed <= self.expires_after_actions:
@@ -303,7 +307,9 @@ class BehaviorIntervention:
                 "concurrent_intervention_ids": list(self.concurrent_intervention_ids),
                 "baseline_goal_set": (self.baseline_goal_set.to_dict()
                                       if self.baseline_goal_set is not None else None),
-                "baseline_attention_last_seen": dict(self.baseline_attention_last_seen)}
+                "baseline_attention_last_seen": dict(self.baseline_attention_last_seen),
+                "condition_id": self.condition_id,
+                "condition_basis_digest": self.condition_basis_digest}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "BehaviorIntervention":
@@ -376,11 +382,15 @@ class InterventionOutcome:
     comparison_id: str | None = None
     target_criteria: tuple[str, ...] = ()
     task_set_outcome: TaskSetOutcome | None = None
+    condition_id: str = "legacy-condition"
+    condition_basis_digest: str = "legacy-condition"
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
         _text(self.cause, "intervention cause", limit=128)
         _text(self.scope, "outcome scope", limit=256)
+        _text(self.condition_id, "outcome condition ID", limit=128)
+        _text(self.condition_basis_digest, "outcome condition digest", limit=128)
         if self.outcome not in INTERVENTION_OUTCOMES:
             raise ValueError("unsupported intervention outcome")
         if self.attribution not in INTERVENTION_ATTRIBUTIONS:
@@ -423,7 +433,9 @@ class InterventionOutcome:
                 "comparison_id": self.comparison_id,
                 "target_criteria": list(self.target_criteria),
                 "task_set_outcome": (self.task_set_outcome.to_dict()
-                                     if self.task_set_outcome is not None else None)}
+                                     if self.task_set_outcome is not None else None),
+                "condition_id": self.condition_id,
+                "condition_basis_digest": self.condition_basis_digest}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "InterventionOutcome":
