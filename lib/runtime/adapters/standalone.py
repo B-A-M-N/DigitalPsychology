@@ -136,15 +136,25 @@ class NullCSWWorkflowPort:
 
     def activate_statework(self, statework_id: str, *,
                            expected_selection_revision: int,
-                           candidate_statework_ids: Sequence[str]) -> CSWBehaviorSnapshot:
-        del statework_id, expected_selection_revision, candidate_statework_ids
+                           candidate_statework_ids: Sequence[str],
+                           intervention_id: str,
+                           expires_at_action: int) -> CSWBehaviorSnapshot:
+        del (statework_id, expected_selection_revision, candidate_statework_ids,
+             intervention_id, expires_at_action)
         raise RuntimeError("no CSW authority is connected to activate a StateWork")
 
     def deactivate_statework(self, statework_id: str, *,
                              expected_selection_revision: int,
-                             candidate_statework_ids: Sequence[str]) -> CSWBehaviorSnapshot:
-        del statework_id, expected_selection_revision, candidate_statework_ids
+                             candidate_statework_ids: Sequence[str],
+                             intervention_id: str) -> CSWBehaviorSnapshot:
+        del (statework_id, expected_selection_revision, candidate_statework_ids,
+             intervention_id)
         raise RuntimeError("no CSW authority is connected to deactivate a StateWork")
+
+    def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot:
+        if host_action_index < 0:
+            raise ValueError("host action index must be non-negative")
+        return self.behavioral_snapshot()
 
     def apply_step(self, statework_id: str, step_id: str, *,
                    evidence_refs: Sequence[str], expected_workflow_revision: int) -> Any:

@@ -76,6 +76,9 @@ class _CSWPort:
     def __init__(self) -> None:
         self.revision = 0
         self.active: tuple[str, ...] = ()
+        self.activation_interventions = {}
+        self.lease_expiries = {}
+        self.expiration_calls = []
         self.options = (StateWorkOption(
             "repair", behavior_tags=("recovery",),
             purpose="Rebuild a failed approach from evidence."),)
@@ -107,22 +110,45 @@ class _CSWPort:
         )
 
     def activate_statework(self, statework_id, *, expected_selection_revision,
-                           candidate_statework_ids):
+                           candidate_statework_ids, intervention_id,
+                           expires_at_action):
+        assert intervention_id
+        assert expires_at_action >= 0
         if expected_selection_revision != self.revision:
             raise RuntimeError("stale CSW selection revision")
         if statework_id not in candidate_statework_ids:
             raise ValueError("unbound StateWork")
         self.active = tuple(sorted(set(self.active) | {statework_id}))
+        self.activation_interventions[statework_id] = intervention_id
+        self.lease_expiries[statework_id] = expires_at_action
         self.revision += 1
         return self.behavioral_snapshot(candidate_statework_ids=candidate_statework_ids)
 
     def deactivate_statework(self, statework_id, *, expected_selection_revision,
-                             candidate_statework_ids):
+                             candidate_statework_ids, intervention_id):
+        assert intervention_id
         if expected_selection_revision != self.revision:
             raise RuntimeError("stale CSW selection revision")
         self.active = tuple(item for item in self.active if item != statework_id)
+        self.activation_interventions.pop(statework_id, None)
+        self.lease_expiries.pop(statework_id, None)
         self.revision += 1
         return self.behavioral_snapshot(candidate_statework_ids=candidate_statework_ids)
+
+    def expire_leases(self, *, host_action_index):
+        self.expiration_calls.append(host_action_index)
+        expired = {statework_id for statework_id, expires_at in self.lease_expiries.items()
+                   if expires_at <= host_action_index}
+        self.active = tuple(item for item in self.active if item not in expired)
+        for statework_id in expired:
+            self.activation_interventions.pop(statework_id, None)
+            self.lease_expiries.pop(statework_id, None)
+        if expired:
+            self.revision += 1
+        return self.behavioral_snapshot()
+
+    def activation_matches(self, statework_id, *, intervention_id):
+        return self.activation_interventions.get(statework_id) == intervention_id
 
 
 def _identity(task_id="control-mcp-task"):
@@ -176,11 +202,15 @@ class _UnavailableControlClient:
 def test_dp_mcp_outage_keeps_host_runtime_usable():
     async def run():
         cfw = _CFWPort()
+        csw = _CSWPort()
+        csw.active = ("repair",)
+        csw.activation_interventions["repair"] = "intervention-offline"
+        csw.lease_expiries["repair"] = 1
         bridge = HostControlBridge(
             identity=_identity("offline-task"),
             objective="Render the requested page",
             objective_criteria=("criterion-visual",),
-            initial_goal_set=_goal_set(), cfw=CFWRuntimeAdapter(cfw),
+            initial_goal_set=_goal_set(), cfw=CFWRuntimeAdapter(cfw), csw=csw,
             client=_UnavailableControlClient(),
         )
         opened = await bridge.open()
@@ -193,6 +223,8 @@ def test_dp_mcp_outage_keeps_host_runtime_usable():
         ))
         assert result["status"] == "degraded"
         assert cfw.applied_behavior_state is None
+        assert csw.expiration_calls == [1]
+        assert csw.active == ()
         await bridge.close()
 
     asyncio.run(run())

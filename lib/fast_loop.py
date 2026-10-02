@@ -529,21 +529,22 @@ class BehavioralController:
                 if target.target.startswith("statework:"):
                     if target.previous_value == "unselected":
                         statework_id = target.target.split(":", 1)[1]
-                        directives.append(BehaviorDirective(
-                            directive_id="dir-" + self._digest({
-                                "intervention": closed.intervention_id,
-                                "target": target.target, "value": "unselected",
-                                "revision": next_revision})[:24],
-                            operation="release_statework", target=statework_id,
-                            value="unselected", cause=(
-                                "intervention_expired" if any(
-                                    outcome.intervention_id == closed.intervention_id
-                                    and outcome.outcome == "expired"
-                                    for outcome in outcomes) else "trigger_cleared"),
-                            expected_effect=(
-                                "Release the CSW StateWork activated by this temporary DP lease."),
-                            scope=context.scope, expires_after_actions=1,
-                            intervention_id=closed.intervention_id))
+                        if statework_id in working.active_stateworks:
+                            directives.append(BehaviorDirective(
+                                directive_id="dir-" + self._digest({
+                                    "intervention": closed.intervention_id,
+                                    "target": target.target, "value": "unselected",
+                                    "revision": next_revision})[:24],
+                                operation="release_statework", target=statework_id,
+                                value="unselected", cause=(
+                                    "intervention_expired" if any(
+                                        outcome.intervention_id == closed.intervention_id
+                                        and outcome.outcome == "expired"
+                                        for outcome in outcomes) else "trigger_cleared"),
+                                expected_effect=(
+                                    "Release the CSW StateWork activated by this temporary DP lease."),
+                                scope=context.scope, expires_after_actions=1,
+                                intervention_id=closed.intervention_id))
                     continue
                 before = self._target_value(working, target.target)
                 working = self._set_target(working, target.target, target.previous_value)

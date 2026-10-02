@@ -159,8 +159,8 @@ class RuntimeSession:
             prepared = self.cfw.prepare_behavior_directives(
                 tuple(item.to_dict() for item in cfw_directives))
             applied: set[str] = set()
-            activation_attempted: str | None = None
-            release_attempts: list[str] = []
+            activation_attempted: BehaviorDirective | None = None
+            release_attempts: list[BehaviorDirective] = []
             updated_snapshot = snapshot
             application_event_payloads: list[Mapping[str, Any]] = []
             outcome_event_payloads: list[Mapping[str, Any]] = []
@@ -184,11 +184,12 @@ class RuntimeSession:
                     if directive.target not in updated_snapshot.active_stateworks:
                         raise RuntimeError(
                             "DP cannot release a StateWork that is not active in CSW")
-                    release_attempts.append(directive.target)
+                    release_attempts.append(directive)
                     updated_snapshot = self.csw.deactivate_statework(
                         directive.target,
                         expected_selection_revision=updated_snapshot.revision,
-                        candidate_statework_ids=candidate_statework_ids)
+                        candidate_statework_ids=candidate_statework_ids,
+                        intervention_id=directive.intervention_id)
                     if directive.target in updated_snapshot.active_stateworks:
                         raise RuntimeError("CSW did not confirm StateWork release")
                     applied.add(directive.directive_id)
@@ -205,11 +206,14 @@ class RuntimeSession:
                     if (statework_id not in eligible
                             or decision.preferred_stateworks != (statework_id,)):
                         raise RuntimeError("DP selected a StateWork outside CSW eligibility")
-                    activation_attempted = statework_id
+                    activation_attempted = directive
                     updated_snapshot = self.csw.activate_statework(
                         statework_id,
                         expected_selection_revision=updated_snapshot.revision,
-                        candidate_statework_ids=candidate_statework_ids)
+                        candidate_statework_ids=candidate_statework_ids,
+                        intervention_id=directive.intervention_id,
+                        expires_at_action=(observation.action_index
+                                           + directive.expires_after_actions))
                     if statework_id not in updated_snapshot.active_stateworks:
                         raise RuntimeError("CSW did not confirm StateWork activation")
                     applied.add(directive.directive_id)
@@ -270,22 +274,27 @@ class RuntimeSession:
                     try:
                         current = self._csw_snapshot(
                             candidate_statework_ids=candidate_statework_ids)
-                        if activation_attempted in current.active_stateworks:
+                        if activation_attempted.target in current.active_stateworks:
                             current = self.csw.deactivate_statework(
-                                activation_attempted,
+                                activation_attempted.target,
                                 expected_selection_revision=current.revision,
-                                candidate_statework_ids=candidate_statework_ids)
+                                candidate_statework_ids=candidate_statework_ids,
+                                intervention_id=activation_attempted.intervention_id)
                     except Exception as exc:
                         compensation_errors.append(f"CSW activation rollback failed: {exc}")
-                for statework_id in reversed(release_attempts):
+                for directive in reversed(release_attempts):
                     try:
+                        statework_id = directive.target
                         current = self._csw_snapshot(
                             candidate_statework_ids=candidate_statework_ids)
                         if statework_id not in current.active_stateworks:
                             current = self.csw.activate_statework(
                                 statework_id,
                                 expected_selection_revision=current.revision,
-                                candidate_statework_ids=candidate_statework_ids)
+                                candidate_statework_ids=candidate_statework_ids,
+                                intervention_id=directive.intervention_id,
+                                expires_at_action=(observation.action_index
+                                                   + directive.expires_after_actions))
                         if statework_id not in current.active_stateworks:
                             raise RuntimeError("CSW did not confirm StateWork release rollback")
                     except Exception as exc:

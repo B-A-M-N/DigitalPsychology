@@ -159,16 +159,22 @@ class CFWComponentPort(Protocol):
 class CSWWorkflowPort(Protocol):
     """CSW-owned workflow selection and transition operations."""
 
-    def behavioral_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None
+    def behavioral_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None,
+                            host_action_index: int | None = None
                             ) -> CSWBehaviorSnapshot: ...
 
     def activate_statework(self, statework_id: str, *,
                            expected_selection_revision: int,
-                           candidate_statework_ids: Sequence[str]) -> CSWBehaviorSnapshot: ...
+                           candidate_statework_ids: Sequence[str],
+                           intervention_id: str,
+                           expires_at_action: int) -> CSWBehaviorSnapshot: ...
 
     def deactivate_statework(self, statework_id: str, *,
                              expected_selection_revision: int,
-                             candidate_statework_ids: Sequence[str]) -> CSWBehaviorSnapshot: ...
+                             candidate_statework_ids: Sequence[str],
+                             intervention_id: str) -> CSWBehaviorSnapshot: ...
+
+    def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot: ...
 
     def apply_step(self, statework_id: str, step_id: str, *,
                    evidence_refs: Sequence[str], expected_workflow_revision: int) -> Any: ...

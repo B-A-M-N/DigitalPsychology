@@ -52,7 +52,8 @@ class CSWRuntimeAdapter:
                 if binding.identity.get(name) != value:
                     raise ValueError("CSW workflow binding escapes the runtime scope")
 
-    def behavioral_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None
+    def behavioral_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None,
+                            host_action_index: int | None = None
                             ) -> CSWBehaviorSnapshot:
         candidates = (tuple(sorted(self.bindings)) if candidate_statework_ids is None
                       else tuple(candidate_statework_ids))
@@ -60,7 +61,8 @@ class CSWRuntimeAdapter:
             raise ValueError("DP requested a StateWork without a CSW binding")
         raw = self.authority.behavioral_snapshot(
             workflow_scope=self.identity.csw_scope(),
-            candidate_statework_ids=candidates)
+            candidate_statework_ids=candidates,
+            host_action_index=host_action_index)
         active_rows = raw.get("active_workflows") or ()
         active_ids = tuple(sorted(str(row["identity"]["statework_id"])
                                    for row in active_rows))
@@ -117,27 +119,51 @@ class CSWRuntimeAdapter:
 
     def activate_statework(self, statework_id: str, *,
                            expected_selection_revision: int,
-                           candidate_statework_ids: Sequence[str]) -> CSWBehaviorSnapshot:
+                           candidate_statework_ids: Sequence[str],
+                           intervention_id: str,
+                           expires_at_action: int) -> CSWBehaviorSnapshot:
         if statework_id not in candidate_statework_ids:
             raise ValueError("StateWork activation is outside the CSW candidate set")
         binding = self._binding(statework_id)
         self.authority.activate_workflow(
             binding.identity, contract_hash=binding.contract_hash,
-            expected_selection_revision=expected_selection_revision)
+            expected_selection_revision=expected_selection_revision,
+            activation_owner="digitalpsychology",
+            control_session_id=self.identity.scope,
+            intervention_id=intervention_id,
+            expires_at_action=expires_at_action)
         return self.behavioral_snapshot(
             candidate_statework_ids=candidate_statework_ids)
 
     def deactivate_statework(self, statework_id: str, *,
                              expected_selection_revision: int,
-                             candidate_statework_ids: Sequence[str]) -> CSWBehaviorSnapshot:
+                             candidate_statework_ids: Sequence[str],
+                             intervention_id: str) -> CSWBehaviorSnapshot:
         if statework_id not in candidate_statework_ids:
             raise ValueError("StateWork deactivation is outside the CSW candidate set")
         self._binding(statework_id)
         self.authority.deactivate_workflow(
             workflow_scope=self.identity.csw_scope(), statework_id=statework_id,
-            expected_selection_revision=expected_selection_revision)
+            expected_selection_revision=expected_selection_revision,
+            expected_activation_owner="digitalpsychology",
+            expected_control_session_id=self.identity.scope,
+            expected_intervention_id=intervention_id)
         return self.behavioral_snapshot(
             candidate_statework_ids=candidate_statework_ids)
+
+    def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot:
+        """Let CSW release overdue DP activations while DP transport is unavailable."""
+        return self.behavioral_snapshot(host_action_index=host_action_index)
+
+    def activation_matches(self, statework_id: str, *,
+                           intervention_id: str) -> bool:
+        """Check a pending DP activation against CSW's recorded owner receipt."""
+        self._binding(statework_id)
+        metadata = self.authority.workflow_activation_metadata(
+            workflow_scope=self.identity.csw_scope(), statework_id=statework_id)
+        return bool(metadata and metadata.get("activation_owner") == "digitalpsychology"
+                    and metadata.get("control_session_id") == self.identity.scope
+                    and metadata.get("intervention_id") == intervention_id)
 
     def apply_step(self, statework_id: str, step_id: str, *,
                    evidence_refs: Sequence[str], expected_workflow_revision: int) -> Any:

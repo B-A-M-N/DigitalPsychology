@@ -81,11 +81,13 @@ class HostControlBridge:
         """Run after a completed host-observed action or evidence boundary."""
         async with self._lock:
             self._require_open()
-            if not self._remote_open or self._needs_reconciliation:
-                if not await self._connect_or_degrade_locked():
-                    return self._status()
             if not isinstance(observation, RuntimeObservation):
                 raise TypeError("host action observation is malformed")
+            if not self._remote_open or self._needs_reconciliation:
+                if not await self._connect_or_degrade_locked(
+                        host_action_index=observation.action_index):
+                    self._expire_local_leases(observation.action_index)
+                    return self._status()
             if not observation.action_completed:
                 raise ValueError("DP control runs after completed action boundaries")
             goals = goal_set or observation.goal_set or self.goal_set
@@ -113,6 +115,7 @@ class HostControlBridge:
             except Exception as exc:
                 if self._transport_failure(exc):
                     self._needs_reconciliation = True
+                    self._expire_local_leases(observation.action_index)
                     return self._degraded("DP control prepare unavailable", exc)
                 raise
             if prepared.get("status") == "committed":
@@ -259,7 +262,8 @@ class HostControlBridge:
             self._opened = False
             self._remote_open = False
 
-    async def _connect_or_degrade_locked(self) -> bool:
+    async def _connect_or_degrade_locked(self, *,
+                                         host_action_index: int | None = None) -> bool:
         try:
             start = getattr(self.client, "start", None)
             if callable(start):
@@ -275,6 +279,9 @@ class HostControlBridge:
                 self._needs_reconciliation = True
             if self._needs_reconciliation:
                 await self._reconcile_locked()
+            if host_action_index is not None and self._remote_open:
+                if self._expire_local_leases(host_action_index):
+                    await self._reconcile_locked()
             return not self._needs_reconciliation
         except Exception as exc:
             if not self._transport_failure(exc):
@@ -283,6 +290,21 @@ class HostControlBridge:
             self._degraded("DP control MCP unavailable; retaining the last committed behavior",
                            exc)
             return False
+
+    def _expire_local_leases(self, host_action_index: int) -> bool:
+        """Advance CSW-owned DP leases even when the private DP process is down."""
+        expire = getattr(self.csw, "expire_leases", None)
+        if not callable(expire):
+            return False
+        try:
+            expire(host_action_index=host_action_index)
+        except Exception as exc:
+            self._fault = f"CSW lease expiry failed at the host action boundary: {exc}"
+            self._notify_fault(self._fault)
+            self._needs_reconciliation = True
+            return False
+        self._needs_reconciliation = True
+        return True
 
     async def _reconcile_locked(self) -> Mapping[str, Any]:
         snapshot, candidates = self._csw_snapshot()
@@ -328,6 +350,14 @@ class HostControlBridge:
         candidate = dict(prepared.get("candidate_behavior_state") or {})
         directives = self._directives(prepared.get("directives"))
         expected_active = set(basis.get("csw_active_stateworks") or ())
+        activations = {
+            item["target"]: item for item in directives
+            if item["operation"] == "prefer_statework"
+        }
+        releases = {
+            item["target"]: item for item in directives
+            if item["operation"] == "release_statework"
+        }
         for directive in directives:
             if directive["operation"] == "release_statework":
                 expected_active.discard(directive["target"])
@@ -339,6 +369,13 @@ class HostControlBridge:
             actual_cfw == candidate
             and self._current_cfw_revision() == int(candidate["revision"])))
         csw_matches = set(snapshot.active_stateworks) == expected_active
+        owns_activation = getattr(self.csw, "activation_matches", None)
+        for statework_id, directive in activations.items():
+            if statework_id in snapshot.active_stateworks and (
+                    not callable(owns_activation)
+                    or not owns_activation(
+                        statework_id, intervention_id=directive["intervention_id"])):
+                csw_matches = False
         if cfw_matches and csw_matches:
             receipt = ControlCommitRequest(
                 control_session_id=self.identity.scope,
@@ -356,20 +393,39 @@ class HostControlBridge:
         rollback_errors = []
         desired_active = set(basis.get("csw_active_stateworks") or ())
         for statework_id in sorted(set(snapshot.active_stateworks) - desired_active):
+            directive = activations.get(statework_id)
+            if directive is None:
+                rollback_errors.append(
+                    f"unrequested CSW activation {statework_id} preserved during recovery")
+                continue
+            if (not callable(owns_activation) or not owns_activation(
+                    statework_id, intervention_id=directive["intervention_id"])):
+                rollback_errors.append(
+                    f"CSW activation {statework_id} has another owner and was preserved")
+                continue
             try:
                 snapshot = self.csw.deactivate_statework(
                     statework_id,
                     expected_selection_revision=snapshot.revision,
                     candidate_statework_ids=candidates,
+                    intervention_id=directive["intervention_id"],
                 )
             except Exception as exc:
                 rollback_errors.append(f"CSW release recovery failed: {exc}")
         for statework_id in sorted(desired_active - set(snapshot.active_stateworks)):
+            directive = releases.get(statework_id)
+            if directive is None:
+                rollback_errors.append(
+                    f"unrequested CSW release {statework_id} was not reversed")
+                continue
             try:
                 snapshot = self.csw.activate_statework(
                     statework_id,
                     expected_selection_revision=snapshot.revision,
                     candidate_statework_ids=candidates,
+                    intervention_id=directive["intervention_id"],
+                    expires_at_action=(int(basis["host_action_index"])
+                                       + int(directive["expires_after_actions"])),
                 )
             except Exception as exc:
                 rollback_errors.append(f"CSW activation recovery failed: {exc}")

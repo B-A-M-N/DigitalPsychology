@@ -58,7 +58,7 @@ class ControlActuator:
 
         cfw_prepared = None
         cfw_attempted = False
-        csw_changes: list[tuple[str, str]] = []
+        csw_changes: list[tuple[str, dict[str, Any]]] = []
         applied: set[str] = set()
         try:
             if cfw_connected:
@@ -82,15 +82,23 @@ class ControlActuator:
 
             for directive in releases + activations:
                 statework_id = directive["target"]
+                intervention_id = directive.get("intervention_id")
+                if not isinstance(intervention_id, str) or not intervention_id:
+                    raise ValueError("CSW directive lacks its owning DP intervention")
                 if directive["operation"] == "release_statework":
                     if directive.get("value") != "unselected" or statework_id not in \
                             snapshot.active_stateworks:
                         raise RuntimeError("CSW release does not match the current selection")
-                    csw_changes.append(("release_statework", statework_id))
+                    csw_changes.append(("release_statework", {
+                        **directive,
+                        "expires_at_action": (int(basis["host_action_index"])
+                                              + int(directive["expires_after_actions"])),
+                    }))
                     snapshot = self.csw.deactivate_statework(
                         statework_id,
                         expected_selection_revision=snapshot.revision,
                         candidate_statework_ids=candidate_ids,
+                        intervention_id=intervention_id,
                     )
                     if statework_id in snapshot.active_stateworks:
                         raise RuntimeError("CSW did not confirm StateWork release")
@@ -98,11 +106,16 @@ class ControlActuator:
                     eligible = {item.statework_id for item in snapshot.eligible_stateworks}
                     if directive.get("value") != "preferred" or statework_id not in eligible:
                         raise RuntimeError("CSW activation is outside current eligibility")
-                    csw_changes.append(("prefer_statework", statework_id))
+                    expires_at_action = (int(basis["host_action_index"])
+                                         + int(directive["expires_after_actions"]))
+                    csw_changes.append(("prefer_statework", {
+                        **directive, "expires_at_action": expires_at_action}))
                     snapshot = self.csw.activate_statework(
                         statework_id,
                         expected_selection_revision=snapshot.revision,
                         candidate_statework_ids=candidate_ids,
+                        intervention_id=intervention_id,
+                        expires_at_action=expires_at_action,
                     )
                     if statework_id not in snapshot.active_stateworks:
                         raise RuntimeError("CSW did not confirm StateWork activation")
@@ -125,8 +138,10 @@ class ControlActuator:
                     self.cfw.rollback_behavior_directives(cfw_prepared)
                 except Exception as exc:
                     errors.append(f"CFW rollback failed: {exc}")
-            for operation, statework_id in reversed(csw_changes):
+            for operation, directive in reversed(csw_changes):
                 try:
+                    statework_id = directive["target"]
+                    intervention_id = directive["intervention_id"]
                     current = self._snapshot(candidate_ids)
                     if operation == "prefer_statework":
                         if statework_id in current.active_stateworks:
@@ -134,6 +149,7 @@ class ControlActuator:
                                 statework_id,
                                 expected_selection_revision=current.revision,
                                 candidate_statework_ids=candidate_ids,
+                                intervention_id=intervention_id,
                             )
                         if statework_id in current.active_stateworks:
                             raise RuntimeError("CSW did not confirm activation rollback")
@@ -143,11 +159,14 @@ class ControlActuator:
                                 statework_id,
                                 expected_selection_revision=current.revision,
                                 candidate_statework_ids=candidate_ids,
+                                intervention_id=intervention_id,
+                                expires_at_action=int(directive["expires_at_action"]),
                             )
                         if statework_id not in current.active_stateworks:
                             raise RuntimeError("CSW did not confirm release rollback")
                 except Exception as exc:
-                    errors.append(f"CSW rollback failed for {statework_id}: {exc}")
+                    errors.append(
+                        f"CSW rollback failed for {directive.get('target')}: {exc}")
             message = str(failure)
             if errors:
                 message += "; " + "; ".join(errors)

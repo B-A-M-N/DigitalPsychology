@@ -68,6 +68,7 @@ class _CSWPort:
     def __init__(self):
         self.revision = 0
         self.active = ()
+        self.activation_interventions = {}
         self.requested_candidates = []
         self.released = []
         self.options = (StateWorkOption(
@@ -88,22 +89,31 @@ class _CSWPort:
         )
 
     def activate_statework(self, statework_id, *, expected_selection_revision,
-                           candidate_statework_ids):
+                           candidate_statework_ids, intervention_id,
+                           expires_at_action):
+        assert intervention_id
+        assert expires_at_action >= 0
         assert statework_id in candidate_statework_ids
         if expected_selection_revision != self.revision:
             raise RuntimeError("stale CSW selection revision")
         self.active = tuple(sorted(set(self.active) | {statework_id}))
+        self.activation_interventions[statework_id] = intervention_id
         self.revision += 1
         return self.behavioral_snapshot()
 
     def deactivate_statework(self, statework_id, *, expected_selection_revision,
-                             candidate_statework_ids):
+                             candidate_statework_ids, intervention_id):
+        assert intervention_id
         if expected_selection_revision != self.revision:
             raise RuntimeError("stale CSW selection revision")
         self.released.append(statework_id)
         self.active = tuple(item for item in self.active if item != statework_id)
+        self.activation_interventions.pop(statework_id, None)
         self.revision += 1
         return self.behavioral_snapshot()
+
+    def activation_matches(self, statework_id, *, intervention_id):
+        return self.activation_interventions.get(statework_id) == intervention_id
 
     def apply_step(self, statework_id, step_id, *, evidence_refs,
                    expected_workflow_revision):
