@@ -348,7 +348,8 @@ class ControlPlaneService:
             request.control_session_id, request.tick_id,
             decision_id=request.decision_id, detail=detail)
         state = self.state_store.load(request.control_session_id).state
-        return {**aborted, "behavior_revision": state.revision,
+        return {"protocol_version": PROTOCOL_VERSION,
+                **aborted, "behavior_revision": state.revision,
                 "behavior_state": state.to_dict(),
                 "requires_reconciliation": not request.rollback_completed}
 

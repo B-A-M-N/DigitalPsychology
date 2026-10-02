@@ -9,7 +9,8 @@ import sys
 
 from lib.behavior_state import (CSWBehaviorSnapshot, GoalItemSnapshot,
                                 GoalSetSnapshot, StateWorkOption)
-from lib.control_protocol import ControlTickRequest
+from lib.control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
+                                  ControlTickRequest)
 from lib.host import HostControlBridge, MCPControlClient, MCPControlUnavailable
 from lib.runtime import (ActionCandidate, CFWRuntimeAdapter, RuntimeIdentity,
                          RuntimeObservation)
@@ -285,6 +286,43 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
             context = await bridge.before_model_call("base host context")
             assert "CURRENT BEHAVIOR GUIDANCE" in context
             assert "base host context" in context
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_private_stdio_mcp_abort_response_keeps_protocol_version(tmp_path):
+    async def run():
+        identity = _identity("abort-protocol-task")
+        goals = _goal_set()
+        bridge = _bridge(tmp_path, identity=identity, goal_set=goals,
+                         cfw_port=_CFWPort(), csw_port=_CSWPort())
+        try:
+            await bridge.open()
+            observation = RuntimeObservation(
+                action_index=1, equivalent_retry_count=2,
+                criterion_status={"criterion-visual": "unmet"}, goal_set=goals)
+            snapshot, _ = bridge._csw_snapshot()
+            request = ControlTickRequest(
+                control_session_id=identity.scope, tick_id="abort-protocol-tick",
+                expected_behavior_revision=bridge.behavior_state.revision,
+                cfw_lifecycle_revision=bridge._current_cfw_revision(),
+                observation=observation, goal_set=goals,
+                cfw_signals=bridge._cfw_signals(observation), csw_snapshot=snapshot)
+            prepared = await bridge.client.prepare_control_tick(request.to_dict())
+            abort = ControlAbortRequest(
+                control_session_id=identity.scope, tick_id=prepared["tick_id"],
+                decision_id=prepared["decision_id"],
+                basis_digest=prepared["basis_digest"], applied_directive_ids=(),
+                rollback_completed=True, failure_class="integration_test_abort",
+                cfw_lifecycle_revision=bridge._current_cfw_revision(),
+                csw_snapshot=snapshot)
+
+            result = await bridge.client.abort_control_tick(abort.to_dict())
+
+            assert result["protocol_version"] == PROTOCOL_VERSION
+            assert result["status"] == "aborted"
         finally:
             await bridge.close()
 

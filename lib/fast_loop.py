@@ -522,6 +522,10 @@ class BehavioralController:
         active_targets = {target.target for item in interventions for target in item.targets}
         next_focus = (context.attention_lease.criterion_ids
                       if context.attention_lease is not None else ())
+        # Attention is host-owned. A closing intervention must not restore a
+        # stale focus value while the current lease still owns focus_criteria.
+        if context.attention_lease is not None:
+            active_targets.add("focus_criteria")
         if next_focus != working.focus_criteria:
             active_targets.add("focus_criteria")
         closed_ids = {item.intervention_id for item in original.active_interventions} - {

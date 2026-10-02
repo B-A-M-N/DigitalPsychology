@@ -7,7 +7,9 @@ from types import SimpleNamespace
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
-from lib.behavior_state import BehaviorState, CSWBehaviorSnapshot, FrameworkSignal, StateWorkOption
+from lib.attention import schedule_attention
+from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
+                                GoalItemSnapshot, GoalSetSnapshot, StateWorkOption)
 from lib.fast_loop import BehavioralController, FastLoopInput
 from lib.mcp_server import DigitalPsychologyService
 
@@ -283,3 +285,34 @@ def test_shadow_system_one_result_cannot_change_behavior(tmp_path):
         service.close()
 
     assert result["state"]["cognitive_mode"] == "DELIVER"
+
+
+def test_closing_intervention_cannot_restore_focus_over_host_attention_lease():
+    controller = BehavioralController()
+    goals = GoalSetSnapshot(1, (GoalItemSnapshot("criterion-visual", status="READY"),))
+    schedule = schedule_attention(goals, BehaviorState(), action_index=0)
+    first = controller.decide(FastLoopInput(
+        scope="tenant/app/agent/session/task/attempt",
+        state=BehaviorState(), csw_snapshot=CSWBehaviorSnapshot(revision=1),
+        objective_criteria=("criterion-visual",), goal_set=goals,
+        attention_lease=schedule.lease, attention_last_seen=schedule.last_seen,
+        equivalent_retry_count=2,
+    ))
+    assert first.state.focus_criteria == ("criterion-visual",)
+    assert any(target.target == "focus_criteria"
+               for item in first.state.active_interventions for target in item.targets)
+
+    refreshed = schedule_attention(goals, first.state, action_index=1)
+    cleared = controller.decide(FastLoopInput(
+        scope="tenant/app/agent/session/task/attempt",
+        state=first.state, csw_snapshot=CSWBehaviorSnapshot(revision=2),
+        objective_criteria=("criterion-visual",), goal_set=goals,
+        attention_lease=refreshed.lease,
+        attention_last_seen=refreshed.last_seen,
+        action_completed=True,
+    ))
+
+    focus_directives = [item for item in cleared.directives
+                        if item.target == "focus_criteria"]
+    assert not focus_directives
+    assert cleared.state.focus_criteria == ("criterion-visual",)
