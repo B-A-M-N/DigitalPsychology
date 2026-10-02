@@ -238,6 +238,8 @@ def test_native_laya_adapter_renders_typed_questions_and_pins_local_content(tmp_
         path.write_bytes(content)
     content_hash = model_content_digest(tmp_path)
     received = {}
+    loaded = []
+    load_started, finish_load = threading.Event(), threading.Event()
 
     class FakeLayaAgent:
         def decide(self, state, *, questions, return_details, lang):
@@ -255,12 +257,25 @@ def test_native_laya_adapter_renders_typed_questions_and_pins_local_content(tmp_
             return SimpleNamespace(values=answers, answers=answers,
                                    probabilities=probabilities)
 
+    def loader(path, device):
+        load_started.set()
+        assert finish_load.wait(timeout=2)
+        loaded.append((path, device))
+        return FakeLayaAgent()
+
     backend = LayaSystemOneBackend(
         tmp_path, model_id="fixture-laya", model_revision="local-test-revision",
         expected_model_content_hash=content_hash,
         max_latency_ms=30000,
-        loader=lambda path, device: FakeLayaAgent())
+        loader=loader)
     assert backend.max_latency_ms == 30000
+    assert loaded == []
+    backend.warmup()
+    assert load_started.wait(timeout=1)
+    assert backend.capability().model_id == "fixture-laya"
+    finish_load.set()
+    assert backend._agent_ready.wait(timeout=2)
+    assert loaded == [(str(tmp_path), "cpu")]
     request = frame(backend=backend.backend_id, model=backend.model_id,
                     revision=backend.model_revision,
                     content_hash=backend.model_content_hash,

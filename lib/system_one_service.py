@@ -85,10 +85,13 @@ class SystemOneService:
             calibration_bundle = CalibrationBundle({})
         enabled = tuple(filter(None, os.environ.get(
             "DIGITALPSYCHOLOGY_SYSTEM_ONE_QUESTIONS", ",".join(QUESTION_REGISTRY)).split(",")))
-        return cls(backend, mode=mode, calibration_bundle=calibration_bundle,
-                   enabled_question_families=enabled,
-                   max_concurrent_requests=int(os.environ.get(
-                       "DIGITALPSYCHOLOGY_SYSTEM_ONE_MAX_CONCURRENCY", "4")))
+        service = cls(backend, mode=mode, calibration_bundle=calibration_bundle,
+                      enabled_question_families=enabled,
+                      max_concurrent_requests=int(os.environ.get(
+                          "DIGITALPSYCHOLOGY_SYSTEM_ONE_MAX_CONCURRENCY", "4")))
+        if isinstance(backend, LayaSystemOneBackend):
+            backend.warmup()
+        return service
 
     @property
     def cache_size(self) -> int:

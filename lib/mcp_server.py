@@ -10,6 +10,7 @@ import os
 
 from .service import DigitalPsychologyService, _canonical
 from .transport.admin_mcp import create_admin_server
+from .transport.stdio import run_stdio_server
 
 
 def create_server(service: DigitalPsychologyService | None = None):
@@ -29,7 +30,7 @@ def main() -> None:
     service = DigitalPsychologyService()
     server = create_admin_server(service)
     try:
-        server.run("stdio")
+        run_stdio_server(server)
     finally:
         service.close()
 

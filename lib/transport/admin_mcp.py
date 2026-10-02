@@ -9,6 +9,7 @@ except ImportError:  # transport stays optional for library consumers
     MCPServer = None
 
 from ..service import DigitalPsychologyService
+from .stdio import run_stdio_server
 
 
 def create_admin_server(service: DigitalPsychologyService | None = None):
@@ -23,24 +24,26 @@ def create_admin_server(service: DigitalPsychologyService | None = None):
     )
 
     @server.tool()
-    def ingest_behavior_event(event: dict[str, Any]) -> dict[str, Any]:
+    async def ingest_behavior_event(event: dict[str, Any]) -> dict[str, Any]:
         """Ingest one schema-validated, origin-scoped behavioral event."""
         return service.ingest_behavior_event(event)
 
     @server.tool()
-    def behavioral_advice(context: dict[str, Any], eligible_routes: list[Any],
-                          static_policy: dict[str, Any]) -> dict[str, Any]:
+    async def behavioral_advice(context: dict[str, Any], eligible_routes: list[Any],
+                                static_policy: dict[str, Any]) -> dict[str, Any]:
         """Return bounded advice for routes already legal under CFW policy."""
-        return service.behavioral_advice(context=context, eligible_routes=eligible_routes,
-                                         static_policy=static_policy)
+        return service.behavioral_advice(
+            context=context, eligible_routes=eligible_routes,
+            static_policy=static_policy)
 
     @server.tool()
-    def validate_routing_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    async def validate_routing_profile(profile: dict[str, Any]) -> dict[str, Any]:
         """Validate a deployable profile and its exact scope contract."""
         return service.validate_routing_profile(profile)
 
     @server.tool()
-    def run_registered_slow_loop(experiment_id: str, authorization: dict[str, Any]) -> dict[str, Any]:
+    async def run_registered_slow_loop(experiment_id: str,
+                                       authorization: dict[str, Any]) -> dict[str, Any]:
         """Run a protected experiment record after host authorization."""
         return service.run_registered_slow_loop(experiment_id, authorization)
 
@@ -51,7 +54,7 @@ def main() -> None:
     service = DigitalPsychologyService()
     server = create_admin_server(service)
     try:
-        server.run("stdio")
+        run_stdio_server(server)
     finally:
         service.close()
 

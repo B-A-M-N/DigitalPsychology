@@ -19,6 +19,7 @@ from ..feedback_loop import trusted_state_root
 from ..service import DigitalPsychologyService
 from ..runtime.store import BehaviorStateStore
 from ..system_one_service import SystemOneService
+from .stdio import run_stdio_server
 
 
 def _control_from_environment() -> ControlPlaneService:
@@ -47,33 +48,36 @@ def create_control_server(control: ControlPlaneService | None = None):
                       "directives and submit authoritative receipts."),
     )
 
+    # MCP 2.x's sync tool wrapper stalls on this private stdio child. These
+    # bounded DP operations run inline through async handlers; model inference
+    # remains capped by the System-1 provider deadline.
     @server.tool()
-    def open_control_session(session: dict[str, Any]) -> dict[str, Any]:
+    async def open_control_session(session: dict[str, Any]) -> dict[str, Any]:
         """Open or restore a host-bound control session."""
         return control.open_control_session(session)
 
     @server.tool()
-    def prepare_control_tick(request: dict[str, Any]) -> dict[str, Any]:
+    async def prepare_control_tick(request: dict[str, Any]) -> dict[str, Any]:
         """Prepare a decision without committing it or actuating CFW/CSW."""
         return control.prepare_control_tick(request)
 
     @server.tool()
-    def commit_control_tick(receipt: dict[str, Any]) -> dict[str, Any]:
+    async def commit_control_tick(receipt: dict[str, Any]) -> dict[str, Any]:
         """Commit a prepared decision after the host confirms local application."""
         return control.commit_control_tick(receipt)
 
     @server.tool()
-    def abort_control_tick(receipt: dict[str, Any]) -> dict[str, Any]:
+    async def abort_control_tick(receipt: dict[str, Any]) -> dict[str, Any]:
         """Abort a prepared decision after host compensation or report recovery."""
         return control.abort_control_tick(receipt)
 
     @server.tool()
-    def reconcile_control_session(report: dict[str, Any]) -> dict[str, Any]:
+    async def reconcile_control_session(report: dict[str, Any]) -> dict[str, Any]:
         """Reconcile persisted DP state against current host authority revisions."""
         return control.reconcile_control_session(report)
 
     @server.tool()
-    def close_control_session(request: dict[str, Any]) -> dict[str, Any]:
+    async def close_control_session(request: dict[str, Any]) -> dict[str, Any]:
         """Close a session when no control decision remains prepared."""
         return control.close_control_session(request)
 
@@ -84,7 +88,7 @@ def main() -> None:
     control = _control_from_environment()
     server = create_control_server(control)
     try:
-        server.run("stdio")
+        run_stdio_server(server)
     finally:
         control.close()
 

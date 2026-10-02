@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -265,18 +266,12 @@ class LayaSystemOneBackend:
                 f"Laya inference timeout must be between 1 and {MAX_SYSTEM_ONE_LATENCY_MS}ms")
         if device not in {"cpu", "cuda", "mps", "xpu"}:
             raise ValueError("unsupported Laya device")
-        if loader is None:
-            try:
-                laya = importlib.import_module("laya")
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Laya System-1 support is optional; install digital-psychology[laya]") from exc
-            loader = laya.load
-        try:
-            self._agent = loader(str(self.model_path), device=device)
-        except ImportError as exc:
-            raise RuntimeError(
-                "Laya System-1 support is optional; install digital-psychology[laya]") from exc
+        self._loader = loader
+        self._agent = None
+        self._agent_lock = threading.Lock()
+        self._agent_ready = threading.Event()
+        self._agent_loading = False
+        self._agent_error: Optional[BaseException] = None
         self._queue: queue.Queue[_Inference | None] = queue.Queue(maxsize=1)
         self._worker: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
@@ -291,6 +286,9 @@ class LayaSystemOneBackend:
     @classmethod
     def from_environment(cls, *, model_id: str = "laya-typed-decisions") -> "LayaSystemOneBackend":
         """Construct only from explicit, predownloaded model identity settings."""
+        if importlib.util.find_spec("laya") is None:
+            raise RuntimeError(
+                "Laya System-1 support is optional; install digital-psychology[laya]")
         path = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_PATH", "")
         revision = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION", "")
         content_hash = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256", "")
@@ -306,6 +304,57 @@ class LayaSystemOneBackend:
 
     def capability(self) -> SystemOneCapability:
         return self._capability
+
+    def _ensure_agent(self) -> None:
+        with self._agent_lock:
+            if self._agent is not None:
+                return
+            if self._agent_error is not None:
+                raise ProviderHealthError("Laya model initialization failed") from self._agent_error
+            owner = not self._agent_loading
+            if owner:
+                self._agent_loading = True
+        if not owner:
+            self._agent_ready.wait()
+            with self._agent_lock:
+                if self._agent is not None:
+                    return
+                error = self._agent_error
+            raise ProviderHealthError("Laya model initialization failed") from error
+        try:
+            loader = self._loader
+            if loader is None:
+                try:
+                    loader = importlib.import_module("laya").load
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Laya System-1 support is optional; install digital-psychology[laya]") from exc
+            agent = loader(str(self.model_path), device=self.device)
+        except BaseException as exc:
+            with self._agent_lock:
+                self._agent_error = exc
+                self._agent_loading = False
+                self._agent_ready.set()
+            raise ProviderHealthError("Laya model initialization failed") from exc
+        with self._agent_lock:
+            self._agent = agent
+            self._agent_loading = False
+            self._agent_ready.set()
+
+    def warmup(self) -> None:
+        """Load the pinned model in the background without delaying MCP startup."""
+        with self._agent_lock:
+            if self._agent is not None or self._agent_loading or self._agent_error is not None:
+                return
+        def initialize() -> None:
+            try:
+                self._ensure_agent()
+            except Exception:
+                # The first inference reports a bounded host-visible fallback.
+                pass
+
+        threading.Thread(target=initialize, name="digitalpsychology-laya-load",
+                         daemon=True).start()
 
     def reset_identity(self, identity: SystemOneIdentity) -> None:
         # Native Laya is stateless; no session state crosses calls or identities.
@@ -333,6 +382,12 @@ class LayaSystemOneBackend:
                 job.done.set()
                 continue
             try:
+                self._ensure_agent()
+                if job.cancelled or time.monotonic() >= job.deadline_monotonic:
+                    job.error = ProviderHealthError("Laya request expired during model initialization")
+                    job.done.set()
+                    continue
+                assert self._agent is not None
                 result = self._agent.decide(
                     job.frame.state.to_dict(), questions=_laya_questions(job.frame),
                     return_details=True, lang="en")
