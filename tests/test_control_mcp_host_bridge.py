@@ -262,6 +262,60 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
     asyncio.run(run())
 
 
+def test_system_one_receipt_stays_in_host_audit_not_model_context():
+    async def run():
+        bridge = HostControlBridge(
+            identity=_identity("system-one-audit"),
+            objective="Render the requested page",
+            objective_criteria=("criterion-visual",),
+            initial_goal_set=_goal_set(), cfw=CFWRuntimeAdapter(_CFWPort()),
+            csw=_CSWPort(), client=_UnavailableControlClient(),
+        )
+        try:
+            await bridge.open()
+            bridge._record_system_one_observation({
+                "tick_id": "semantic-tick",
+                "basis": {"system_one": {
+                    "frame": {"questions": [{"question_id": "retry_relation"}]},
+                    "result": {
+                        "status": "shadow", "cache_hit": False,
+                        "calibrated_question_ids": [],
+                        "judgment": {
+                            "backend_id": "digitalpsychology-laya-native",
+                            "model_id": "laya-typed-decisions",
+                            "model_revision": "pinned-revision",
+                            "model_content_hash": "a" * 64,
+                            "provider_protocol_hash": "b" * 64,
+                            "calibration_bundle_hash": "",
+                            "state_digest": "c" * 64,
+                            "question_bundle_digest": "d" * 64,
+                            "sequence": 1,
+                            "answers": [{
+                                "question_id": "retry_relation",
+                                "selected": "materially_new",
+                                "raw_probabilities": [{
+                                    "label": "materially_new", "probability": 0.8}],
+                                "calibrated_probabilities": None,
+                            }],
+                        },
+                    },
+                }}}, tick_status="committed")
+            context = await bridge.before_model_call("ordinary host context")
+            receipt = bridge.system_one_observation
+            assert receipt is not None
+            assert receipt["status"] == "shadow"
+            assert receipt["backend_id"] == "digitalpsychology-laya-native"
+            assert receipt["answers"][0]["selected"] == "materially_new"
+            assert receipt["answers"][0]["raw_confidence"] == 0.8
+            assert bridge.audit_projection["system_one"]["tick_id"] == "semantic-tick"
+            assert "materially_new" not in context
+            assert "digitalpsychology-laya-native" not in context
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
 def test_candidate_action_is_committed_before_execution_without_advancing_action_index(
         tmp_path):
     async def run():

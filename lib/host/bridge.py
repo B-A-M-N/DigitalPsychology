@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import replace
 import uuid
 from typing import Any, Mapping, Sequence
@@ -18,6 +19,7 @@ from ..runtime.projection import (AuditProjection, build_behavior_projection,
 from ..runtime.adapters.standalone import NullCSWWorkflowPort
 from .actuator import ActuationFailure, ControlActuator
 from .mcp_client import MCPControlClient, MCPControlUnavailable
+from .system_one_audit import summarize_system_one_observation
 
 
 class HostControlBridge:
@@ -56,6 +58,7 @@ class HostControlBridge:
         self._needs_reconciliation = False
         self._offline_controls_expired = False
         self._latest_observation: RuntimeObservation | None = None
+        self._latest_system_one_observation: Mapping[str, Any] | None = None
         self._audit_projection = AuditProjection(metadata={})
         self._lock = asyncio.Lock()
 
@@ -70,6 +73,12 @@ class HostControlBridge:
     @property
     def audit_projection(self) -> Mapping[str, Any]:
         return self._audit_projection.metadata
+
+    @property
+    def system_one_observation(self) -> Mapping[str, Any] | None:
+        """Return the last bounded semantic-provider receipt to the trusted host."""
+        return (deepcopy(dict(self._latest_system_one_observation))
+                if self._latest_system_one_observation is not None else None)
 
     async def open(self) -> Mapping[str, Any]:
         async with self._lock:
@@ -237,6 +246,7 @@ class HostControlBridge:
             if not isinstance(result, Mapping):
                 raise RuntimeError("DP returned a committed tick without its receipt")
             self._accept_committed(result, goals)
+            self._record_system_one_observation(prepared, tick_status="committed")
             self._offline_controls_expired = False
             return self._status(result)
         if prepared.get("status") == "aborted":
@@ -296,6 +306,7 @@ class HostControlBridge:
                 )
             raise
         self._accept_committed(result, goals)
+        self._record_system_one_observation(prepared, tick_status="committed")
         self._offline_controls_expired = False
         self._fault = None
         self._needs_reconciliation = False
@@ -325,6 +336,9 @@ class HostControlBridge:
             if self._offline_controls_expired:
                 audit["offline_controls_expired"] = True
                 audit["committed_behavior_revision"] = self._state.revision
+            if self._latest_system_one_observation is not None:
+                audit["system_one"] = deepcopy(
+                    dict(self._latest_system_one_observation))
             self._audit_projection = AuditProjection(metadata=audit)
             enriched = replace_model_projection(context, projection.model)
             if self.cfw is None:
@@ -358,6 +372,9 @@ class HostControlBridge:
             if self._offline_controls_expired:
                 audit["offline_controls_expired"] = True
                 audit["committed_behavior_revision"] = self._state.revision
+            if self._latest_system_one_observation is not None:
+                audit["system_one"] = deepcopy(
+                    dict(self._latest_system_one_observation))
             self._audit_projection = AuditProjection(metadata=audit)
             enriched = replace_model_projection(context, projection.model)
             if self.cfw is None:
@@ -655,6 +672,18 @@ class HostControlBridge:
                 "host_initiated": True,
             },
         )
+
+    def _record_system_one_observation(self, prepared: Mapping[str, Any], *,
+                                       tick_status: str) -> None:
+        """Keep provider evidence in host audit state, outside model context."""
+        observation = summarize_system_one_observation(
+            prepared, tick_status=tick_status)
+        if observation is None:
+            return
+        self._latest_system_one_observation = observation
+        metadata = dict(self._audit_projection.metadata)
+        metadata["system_one"] = deepcopy(observation)
+        self._audit_projection = AuditProjection(metadata=metadata)
 
     def _available_frameworks(self) -> tuple[str, ...]:
         if self.cfw is None:

@@ -42,6 +42,10 @@ DP's telemetry, experiments, and deterministic controller do not require CFW or 
 
 Runtime orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed through the model's tool registry. `RuntimeHost.open_control_bridge(...)` starts a private MCP child and returns the host lifecycle bridge; the bridge asks CFW to validate/apply controls and asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
 
+The bridge retains a bounded receipt for the last System-1 query in its
+host-only audit projection. The semantic answer is not copied into model
+context.
+
 The private `digital-psychology-control-mcp` is started by `HostControlBridge` and is not a Codex model-visible MCP server. The legacy `digital-psychology-mcp` entry point fails closed unless explicitly enabled; `digital-psychology-admin-mcp` is for a trusted operator namespace. Keep the control process on the host side of the tool boundary.
 
 The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
