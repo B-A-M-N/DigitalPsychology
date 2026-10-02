@@ -126,6 +126,12 @@ to the controlled model. `RuntimeHost.open_session(...)` and
 `RuntimeSession.process_action(...)` remain available for in-process
 deployments and compatibility.
 
+For CSW integration without CFW, the trusted host can obtain bindings from
+CSW's `cognitive_statework.host_binding.resolve_bindings(...)` and supply
+those structural contract pins to DP's `CSWRuntimeAdapter`. CSW performs
+registry, scope, and composition checks; DP only ranks the eligible snapshot
+and submits requests back through CSW's authority.
+
 For multi-criterion goals, the host sends the complete `GoalSetSnapshot`
 (bounded to 256 criteria). DP leases attention to at most three criteria at a
 time. Its service bound is `ceil(runnable_count / 3) * 3` actions, so the
