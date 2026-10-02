@@ -41,7 +41,8 @@ class RuntimeHost:
                      cfw: CFWComponentPort | None = None,
                      csw: CSWWorkflowPort | None = None,
                      outcome_evidence_authority: Any,
-                     objective: str = "") -> RuntimeSession:
+                     objective: str = "",
+                     policy_context: dict[str, Any] | None = None) -> RuntimeSession:
         with self._lock:
             if self.service is None or self.state_store is None:
                 raise RuntimeError(
@@ -51,14 +52,15 @@ class RuntimeHost:
                 identity=identity, objective_criteria=objective_criteria,
                 cfw=cfw, csw=csw,
                 outcome_evidence_authority=outcome_evidence_authority,
-                objective=objective)
+                objective=objective, policy_context=policy_context)
 
     def _open_session_locked(self, *, identity: RuntimeIdentity,
                              objective_criteria: Sequence[str],
                              cfw: CFWComponentPort,
                              csw: CSWWorkflowPort,
                              outcome_evidence_authority: Any,
-                             objective: str) -> RuntimeSession:
+                             objective: str,
+                             policy_context: dict[str, Any] | None = None) -> RuntimeSession:
         existing = self._sessions.get(identity.scope)
         if existing is not None:
             cfw_port = cfw if cfw is not None else NullCFWComponentPort()
@@ -85,6 +87,7 @@ class RuntimeHost:
             outcome_evidence_authority=outcome_evidence_authority,
             state_store=self.state_store,
             system_one_frame_factory=self.system_one_frame_factory,
+            policy_context=policy_context,
         )
         self._sessions[identity.scope] = session
         if len(self._sessions) > self.session_cache_limit:

@@ -106,12 +106,16 @@ class ControlDecisionEngine:
         judgment = None
         system_one_frame = None
         system_one_result = None
+        policy_context = {
+            **dict(descriptor.host_capabilities.get("policy_context") or {}),
+            **identity.to_dict(),
+        }
         if self.system_one_frame_factory is not None:
             frame = self.system_one_frame_factory(
                 identity, descriptor.objective,
                 attention.lease.criterion_ids if attention.lease else (),
                 record.state, request.observation, request.csw_snapshot,
-                request.cfw_signals)
+                request.cfw_signals, policy_context)
             if frame is not None and not isinstance(frame, SystemOneFrame):
                 raise TypeError("System-1 frame factory must return a validated frame")
             if frame is not None:
@@ -159,10 +163,7 @@ class ControlDecisionEngine:
             intervention_assessments=tuple(assessments),
             available_frameworks=descriptor.available_frameworks,
             approach_epoch=request.observation.approach_epoch,
-            policy_context={
-                **dict(descriptor.host_capabilities.get("policy_context") or {}),
-                **identity.to_dict(),
-            },
+            policy_context=policy_context,
         )
         decision = self._parse_decision(
             self.decision_service.decide_behavior(input_value, judgment=judgment))

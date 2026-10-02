@@ -12,7 +12,10 @@ from typing import Any
 try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # transport stays optional for library-only consumers
-    MCPServer = None
+    try:
+        from mcp.server.fastmcp import FastMCP as MCPServer
+    except ImportError:
+        MCPServer = None
 
 from ..control.service import ControlPlaneService
 from ..feedback_loop import trusted_state_root

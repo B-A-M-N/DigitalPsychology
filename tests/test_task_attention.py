@@ -114,6 +114,78 @@ def test_all_256_required_criteria_receive_attention_within_fairness_bound():
     assert max(seen.values()) <= fairness_bound_actions(len(goal_set.runnable_items))
 
 
+def test_material_progress_allows_two_bounded_attention_extensions_then_rotates():
+    initial = GoalSetSnapshot(1, tuple(
+        GoalItemSnapshot(f"criterion-{index:02d}") for index in range(20)))
+    first = schedule_attention(initial, BehaviorState(), action_index=1)
+    assert first.lease is not None
+    focus = first.lease.criterion_ids
+    state = BehaviorState(
+        revision=1, focus_criteria=focus, attention_lease=first.lease,
+        attention_last_seen=first.last_seen,
+    )
+
+    progressed_once = GoalSetSnapshot(2, tuple(
+        GoalItemSnapshot(
+            f"criterion-{index:02d}",
+            material_progress_revision=(1 if f"criterion-{index:02d}" in focus else 0),
+        ) for index in range(20)))
+    extension_one = schedule_attention(progressed_once, state, action_index=4)
+    assert extension_one.lease is not None
+    assert extension_one.lease.criterion_ids == focus
+    assert extension_one.lease.reason == "material_progress_extension"
+    assert set(extension_one.lease.continuous_attention_leases.values()) == {1}
+
+    state = BehaviorState(
+        revision=2, focus_criteria=focus, attention_lease=extension_one.lease,
+        attention_last_seen=extension_one.last_seen,
+    )
+    progressed_twice = GoalSetSnapshot(3, tuple(
+        GoalItemSnapshot(
+            f"criterion-{index:02d}",
+            material_progress_revision=(2 if f"criterion-{index:02d}" in focus else 0),
+        ) for index in range(20)))
+    extension_two = schedule_attention(progressed_twice, state, action_index=7)
+    assert extension_two.lease is not None
+    assert extension_two.lease.criterion_ids == focus
+    assert set(extension_two.lease.continuous_attention_leases.values()) == {2}
+
+    state = BehaviorState(
+        revision=3, focus_criteria=focus, attention_lease=extension_two.lease,
+        attention_last_seen=extension_two.last_seen,
+    )
+    progressed_thrice = GoalSetSnapshot(4, tuple(
+        GoalItemSnapshot(
+            f"criterion-{index:02d}",
+            material_progress_revision=(3 if f"criterion-{index:02d}" in focus else 0),
+        ) for index in range(20)))
+    rotated = schedule_attention(progressed_thrice, state, action_index=10)
+    assert rotated.lease is not None
+    assert rotated.lease.criterion_ids != focus
+
+
+def test_micro_progress_does_not_extend_attention_and_small_task_forces_rotation():
+    small = GoalSetSnapshot(1, tuple(
+        GoalItemSnapshot(f"criterion-{index}") for index in range(1, 5)))
+    first = schedule_attention(small, BehaviorState(), action_index=1)
+    assert first.lease is not None
+    focus = first.lease.criterion_ids
+    state = BehaviorState(
+        revision=1, focus_criteria=focus, attention_lease=first.lease,
+        attention_last_seen=first.last_seen,
+    )
+    tiny_changes = GoalSetSnapshot(2, tuple(
+        GoalItemSnapshot(
+            f"criterion-{index}",
+            actions_since_progress=0,
+            last_progress_action=3 if f"criterion-{index}" in focus else None,
+            material_progress_revision=0,
+        ) for index in range(1, 5)))
+    rotated = schedule_attention(tiny_changes, state, action_index=4)
+    assert rotated.lease is not None
+    assert rotated.lease.criterion_ids != focus
+
+
 def test_fairness_bound_tracks_the_current_runnable_set():
     from lib.attention import fairness_bound_actions
 

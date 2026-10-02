@@ -60,6 +60,7 @@ class GoalItemSnapshot:
     actions_since_progress: int = 0
     equivalent_retry_count: int = 0
     last_progress_action: int | None = None
+    material_progress_revision: int = 0
 
     def __post_init__(self) -> None:
         _text(self.criterion_id, "criterion_id", limit=128)
@@ -83,6 +84,8 @@ class GoalItemSnapshot:
                 type(self.last_progress_action) is not int
                 or self.last_progress_action < 0):
             raise ValueError("last progress action must be non-negative or null")
+        _nonnegative_int(self.material_progress_revision,
+                         "material progress revision")
 
     def to_dict(self) -> dict[str, Any]:
         return {"criterion_id": self.criterion_id, "required": self.required,
@@ -90,7 +93,8 @@ class GoalItemSnapshot:
                 "status": self.status,
                 "actions_since_progress": self.actions_since_progress,
                 "equivalent_retry_count": self.equivalent_retry_count,
-                "last_progress_action": self.last_progress_action}
+                "last_progress_action": self.last_progress_action,
+                "material_progress_revision": self.material_progress_revision}
 
 
 @dataclass(frozen=True)
@@ -170,6 +174,8 @@ class AttentionLease:
     start_action: int
     max_actions: int = 3
     reason: str = "priority_and_starvation"
+    material_progress_revisions: Mapping[str, int] = field(default_factory=dict)
+    continuous_attention_leases: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text(self.lease_id, "attention lease ID", limit=128)
@@ -183,19 +189,88 @@ class AttentionLease:
         if type(self.max_actions) is not int or not 1 <= self.max_actions <= 8:
             raise ValueError("attention lease duration must be between one and eight actions")
         _text(self.reason, "attention lease reason", limit=128)
+        focus = set(self.criterion_ids)
+        for name in ("material_progress_revisions", "continuous_attention_leases"):
+            values = getattr(self, name)
+            if not isinstance(values, Mapping) or len(values) > 3:
+                raise ValueError(f"{name} must be a bounded focus mapping")
+            parsed: dict[str, int] = {}
+            for key, value in values.items():
+                if key not in focus:
+                    raise ValueError(f"{name} key escapes the attention lease")
+                _nonnegative_int(value, name)
+                if name == "continuous_attention_leases" and value > 2:
+                    raise ValueError("continuous attention lease count exceeds two")
+                parsed[key] = value
+            object.__setattr__(self, name, MappingProxyType(parsed))
 
     def to_dict(self) -> dict[str, Any]:
         return {"lease_id": self.lease_id, "criterion_ids": list(self.criterion_ids),
                 "issued_revision": self.issued_revision,
                 "goal_set_revision": self.goal_set_revision,
                 "start_action": self.start_action,
-                "max_actions": self.max_actions, "reason": self.reason}
+                "max_actions": self.max_actions, "reason": self.reason,
+                "material_progress_revisions": dict(self.material_progress_revisions),
+                "continuous_attention_leases": dict(self.continuous_attention_leases)}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "AttentionLease":
         data = dict(value)
         data["criterion_ids"] = tuple(data.get("criterion_ids", ()))
+        data["material_progress_revisions"] = dict(
+            data.get("material_progress_revisions") or {})
+        data["continuous_attention_leases"] = dict(
+            data.get("continuous_attention_leases") or {})
         return cls(**data)
+
+
+@dataclass(frozen=True)
+class ModeLease:
+    """Bounded hysteresis for the current cognitive mode.
+
+    ``minimum_actions`` damps soft mode changes.  ``exit_condition`` names the
+    mode-specific evidence that can end the lease early; hard host/safety
+    interrupts are evaluated separately by the controller.
+    """
+
+    mode: str
+    entered_action: int
+    minimum_actions: int = 2
+    max_actions: int | None = 6
+    cause: str = "mode_transition"
+    exit_condition: str = "minimum_duration"
+    baseline_approach_epoch: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in BEHAVIOR_MODES:
+            raise ValueError("mode lease requires a supported cognitive mode")
+        _nonnegative_int(self.entered_action, "mode lease entered_action")
+        if type(self.minimum_actions) is not int or not 1 <= self.minimum_actions <= 8:
+            raise ValueError("mode lease minimum_actions must be between one and eight")
+        if self.max_actions is not None and (
+                type(self.max_actions) is not int
+                or not self.minimum_actions <= self.max_actions <= 32):
+            raise ValueError("mode lease max_actions must be null or a bounded value")
+        _text(self.cause, "mode lease cause", limit=128)
+        if self.exit_condition not in {
+                "minimum_duration", "progress_or_new_approach", "verification_result",
+                "fresh_evidence", "plan_committed", "diagnostic_evidence"}:
+            raise ValueError("unsupported mode lease exit condition")
+        if self.baseline_approach_epoch is not None and (
+                not isinstance(self.baseline_approach_epoch, str)
+                or len(self.baseline_approach_epoch) > 256):
+            raise ValueError("baseline approach epoch must be bounded text or null")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"mode": self.mode, "entered_action": self.entered_action,
+                "minimum_actions": self.minimum_actions,
+                "max_actions": self.max_actions, "cause": self.cause,
+                "exit_condition": self.exit_condition,
+                "baseline_approach_epoch": self.baseline_approach_epoch}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ModeLease":
+        return cls(**dict(value))
 
 
 @dataclass(frozen=True)
@@ -474,6 +549,7 @@ class BehaviorState:
     active_stateworks: tuple[str, ...] = ()
     focus_criteria: tuple[str, ...] = ()
     attention_lease: AttentionLease | None = None
+    mode_lease: ModeLease | None = None
     attention_last_seen: Mapping[str, int] = field(default_factory=dict)
     verification_intensity: str = "normal"
     exploration_budget: str = "normal"
@@ -510,6 +586,12 @@ class BehaviorState:
             object.__setattr__(self, "attention_lease", lease)
         if lease is not None and lease.criterion_ids != self.focus_criteria:
             raise ValueError("focus criteria must match the active attention lease")
+        mode_lease = self.mode_lease
+        if mode_lease is not None and not isinstance(mode_lease, ModeLease):
+            mode_lease = ModeLease.from_mapping(mode_lease)
+            object.__setattr__(self, "mode_lease", mode_lease)
+        if mode_lease is not None and mode_lease.mode != self.cognitive_mode:
+            raise ValueError("mode lease must describe the current cognitive mode")
         if (not isinstance(self.attention_last_seen, Mapping)
                 or len(self.attention_last_seen) > 256):
             raise ValueError("attention history must be bounded to 256 criteria")
@@ -546,6 +628,8 @@ class BehaviorState:
                 "focus_criteria": list(self.focus_criteria),
                 "attention_lease": (self.attention_lease.to_dict()
                                     if self.attention_lease is not None else None),
+                "mode_lease": (self.mode_lease.to_dict()
+                               if self.mode_lease is not None else None),
                 "attention_last_seen": dict(self.attention_last_seen),
                 "verification_intensity": self.verification_intensity,
                 "exploration_budget": self.exploration_budget,
@@ -573,6 +657,10 @@ class BehaviorState:
                 data["attention_lease"]
                 if isinstance(data["attention_lease"], AttentionLease)
                 else AttentionLease.from_mapping(data["attention_lease"]))
+        if data.get("mode_lease") is not None:
+            data["mode_lease"] = (
+                data["mode_lease"] if isinstance(data["mode_lease"], ModeLease)
+                else ModeLease.from_mapping(data["mode_lease"]))
         data["attention_last_seen"] = dict(data.get("attention_last_seen") or {})
         return cls(**data)
 
@@ -745,7 +833,7 @@ class BehavioralDecision:
 __all__ = [
     "BEHAVIOR_MODES", "INTERVENTION_ATTRIBUTIONS", "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
     "BehavioralDecision", "CSWBehaviorSnapshot", "FrameworkSignal",
-    "AttentionLease", "GoalItemSnapshot", "GoalSetSnapshot",
+    "AttentionLease", "ModeLease", "GoalItemSnapshot", "GoalSetSnapshot",
     "InterventionOutcome", "InterventionTarget", "StateWorkOption",
     "TaskSetOutcome",
 ]

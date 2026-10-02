@@ -10,8 +10,11 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+except ImportError:  # the in-process host path does not require the MCP extra
+    ClientSession = StdioServerParameters = stdio_client = None
 
 from ..control_protocol import PROTOCOL_VERSION
 
@@ -58,6 +61,9 @@ class MCPControlClient:
         async with self._lock:
             if self._session is not None:
                 return
+            if ClientSession is None or StdioServerParameters is None or stdio_client is None:
+                raise MCPControlUnavailable(
+                    "MCP transport dependencies are unavailable; use an in-process client")
             stack = AsyncExitStack()
             try:
                 read_stream, write_stream = await stack.enter_async_context(

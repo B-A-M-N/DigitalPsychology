@@ -109,10 +109,14 @@ async def run_stdio_server_async(server: Any) -> None:
         async with stdio_server(
                 stdin=_RawLineInput(wire_stdin),
                 stdout=_RawTextOutput(wire_stdout)) as (read_stream, write_stream):
-            await server._lowlevel_server.run(
+            lowlevel = (getattr(server, "_lowlevel_server", None)
+                        or getattr(server, "_mcp_server", None))
+            if lowlevel is None:
+                raise RuntimeError("MCP server does not expose its low-level runner")
+            await lowlevel.run(
                 read_stream,
                 write_stream,
-                server._lowlevel_server.create_initialization_options(),
+                lowlevel.create_initialization_options(),
             )
     finally:
         os.dup2(wire_stdin, 0)

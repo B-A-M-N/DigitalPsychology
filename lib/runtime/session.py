@@ -49,7 +49,8 @@ class RuntimeSession:
                  outcome_evidence_authority: Any,
                  state_store: BehaviorStateStore,
                  system_one_frame_factory: SystemOneFrameFactory | None = None,
-                 objective: str = "") -> None:
+                 objective: str = "",
+                 policy_context: Mapping[str, Any] | None = None) -> None:
         self.identity = identity
         self.scope = identity.scope
         self.objective_criteria = tuple(objective_criteria)
@@ -61,6 +62,9 @@ class RuntimeSession:
         if not isinstance(objective, str) or len(objective) > 1024:
             raise ValueError("runtime objective must be bounded text")
         self.objective = objective
+        self.policy_context = dict(policy_context or {})
+        if len(self.policy_context) > 32:
+            raise ValueError("runtime policy context exceeds its field bound")
         self.controller = controller
         self.cfw = cfw
         self.csw = csw
@@ -111,7 +115,8 @@ class RuntimeSession:
                 frame = self.system_one_frame_factory(
                     self.identity, self.objective,
                     (attention.lease.criterion_ids if attention and attention.lease else ()),
-                    record.state, observation, snapshot, signals)
+                    record.state, observation, snapshot, signals,
+                    self.policy_context)
                 if frame is not None and not isinstance(frame, SystemOneFrame):
                     raise TypeError("System-1 frame factory must return a validated frame")
                 if frame is not None:

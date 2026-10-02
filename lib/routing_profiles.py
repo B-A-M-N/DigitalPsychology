@@ -324,6 +324,17 @@ def build_routing_experiment_receipt(plan: Mapping[str, Any], trials: Iterable[M
             normalized = normalize_route_outcome(trial.get("outcome"))
             if prior.get("outcome") != normalized or prior.get("cohort") != cohort:
                 raise RoutingProfileError("one trajectory has conflicting route outcomes")
+            for metric in ("policy_outcome_correct_progress",
+                           "policy_outcome_regression",
+                           "policy_outcome_repeated_failure"):
+                incoming = trial.get(metric)
+                existing = prior.get(metric)
+                if (incoming is not None and existing is not None
+                        and incoming is not existing):
+                    raise RoutingProfileError(
+                        f"trajectory {trajectory_id!r} has conflicting {metric} evidence")
+                if incoming is not None:
+                    prior[metric] = incoming
             prior.setdefault("event_ids", []).extend(trial.get("event_ids") or [])
             continue
         if trial.get("experiment_plan_hash") != plan.get("plan_hash"):
@@ -392,6 +403,41 @@ def build_routing_experiment_receipt(plan: Mapping[str, Any], trials: Iterable[M
         and len(holdout) >= holdout_minimum
         and effect >= minimum_effect and effect_low >= 0.0 and not regressions
     ) else "fail"
+    candidate_policy_evidence = None
+    has_behavior_policy = isinstance(
+        (plan.get("candidate_adjustment") or {}).get("behavior_policy"), Mapping)
+    if has_behavior_policy:
+        metrics_are_explicit = (
+            all(type(item.get("policy_outcome_correct_progress")) is bool
+                and type(item.get("policy_outcome_repeated_failure")) is bool
+                for item in treatment)
+            and all(type(item.get("policy_outcome_regression")) is bool
+                    for item in holdout))
+        if metrics_are_explicit:
+            correct_count = sum(
+                bool(item["policy_outcome_correct_progress"]) for item in treatment)
+            repeated_count = sum(
+                bool(item["policy_outcome_repeated_failure"]) for item in treatment)
+            regression_count = sum(
+                bool(item["policy_outcome_regression"]) for item in holdout)
+            correct_rate = correct_count / len(treatment)
+            repeated_rate = repeated_count / len(treatment)
+            regression_rate = regression_count / len(holdout)
+            candidate_policy_evidence = {
+                "correct_progress_rate": round(correct_rate, 6),
+                "regression_rate": round(regression_rate, 6),
+                "repeated_failure_rate": round(repeated_rate, 6),
+                "confidence_interval": [round(value, 6) for value in
+                                        _wilson(correct_rate, len(treatment))],
+                "regression_confidence_interval": [round(value, 6) for value in
+                                                   _wilson(regression_rate, len(holdout))],
+                "repeated_failure_confidence_interval": [round(value, 6) for value in
+                                                         _wilson(repeated_rate, len(treatment))],
+                "sample_count": len(treatment),
+                "holdout_count": len(holdout),
+            }
+        else:
+            decision = "fail"
     source_hash = hashlib.sha256(_canonical(trials).encode("utf-8")).hexdigest()
     receipt: dict[str, Any] = {
         "receipt_id": f"routing-rcpt-{hashlib.sha256((str(plan.get('experiment_id')) + source_hash).encode()).hexdigest()[:20]}",
@@ -419,6 +465,8 @@ def build_routing_experiment_receipt(plan: Mapping[str, Any], trials: Iterable[M
                                   t.get("evaluator_version"), t.get("outcome")] for t in holdout],
         "control_bad_rate": round(control_rate, 6),
         "treatment_bad_rate": round(treatment_rate, 6),
+        **({"candidate_policy_evidence": candidate_policy_evidence}
+           if candidate_policy_evidence is not None else {}),
         "effect": round(effect, 6),
         "confidence_interval": [round(effect_low, 6), round(effect_high, 6)],
         "minimum_samples": minimum_samples,
@@ -624,6 +672,39 @@ def validate_profile(profile: Mapping[str, Any], *, require_deployable: bool = F
         if receipt.get("receipt_hash") != hashlib.sha256(
                 _canonical(expected_receipt_hash).encode("utf-8")).hexdigest():
             raise RoutingProfileError("routing profile validation receipt hash mismatch")
+        has_behavior_policy = any(
+            isinstance(item, Mapping) and isinstance(item.get("behavior_policy"), Mapping)
+            for item in (profile.get("routing_adjustments") or ()))
+        if has_behavior_policy:
+            policy_evidence = receipt.get("candidate_policy_evidence")
+            if not isinstance(policy_evidence, Mapping):
+                raise RoutingProfileError(
+                    "behavior policy promotion requires explicit correct-progress, regression, "
+                    "repeat-failure rates, and confidence intervals")
+            treatment_count = len(receipt.get("treatment_trajectory_ids") or ())
+            holdout_count = len(receipt.get("holdout_trajectory_ids") or ())
+            if (policy_evidence.get("sample_count") != treatment_count
+                    or policy_evidence.get("holdout_count") != holdout_count
+                    or treatment_count < 1 or holdout_count < 1):
+                raise RoutingProfileError(
+                    "behavior policy evidence counts must match treatment and holdout trajectories")
+            for rate_name in ("correct_progress_rate", "regression_rate",
+                              "repeated_failure_rate"):
+                rate = policy_evidence.get(rate_name)
+                if (type(rate) not in (int, float)
+                        or not 0.0 <= float(rate) <= 1.0):
+                    raise RoutingProfileError(
+                        f"behavior policy receipt has invalid {rate_name}")
+            for interval_name in ("confidence_interval",
+                                  "regression_confidence_interval",
+                                  "repeated_failure_confidence_interval"):
+                interval = policy_evidence.get(interval_name)
+                if (not isinstance(interval, (tuple, list)) or len(interval) != 2
+                        or any(type(bound) not in (int, float)
+                               or not 0.0 <= float(bound) <= 1.0 for bound in interval)
+                        or interval[0] > interval[1]):
+                    raise RoutingProfileError(
+                        f"behavior policy receipt has invalid {interval_name}")
         candidate = json.loads(json.dumps(dict(profile)))
         candidate["status"] = "candidate"
         candidate.pop("profile_hash", None)
@@ -1077,6 +1158,19 @@ def derive_profiles(events: Iterable[Any], task_context: Mapping[str, Mapping[st
             "interaction_ids": [],
             "event_origins": [],
         })
+        for metric in ("policy_outcome_correct_progress",
+                       "policy_outcome_regression",
+                       "policy_outcome_repeated_failure"):
+            reported = payload.get(metric)
+            if reported is None:
+                continue
+            if type(reported) is not bool:
+                raise RoutingProfileError(f"{metric} must be explicit boolean evaluator evidence")
+            previous = trial.get(metric)
+            if previous is not None and previous is not reported:
+                raise RoutingProfileError(
+                    f"trajectory {trajectory_id!r} has conflicting {metric} evidence")
+            trial[metric] = reported
         if trial["outcome"] is None:
             trial["outcome"] = outcome
         elif outcome != trial["outcome"]:

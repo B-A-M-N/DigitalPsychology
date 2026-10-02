@@ -11,7 +11,13 @@ from lib.behavior_state import (CSWBehaviorSnapshot, GoalItemSnapshot,
                                 GoalSetSnapshot, StateWorkOption)
 from lib.control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
                                   ControlTickRequest)
-from lib.host import HostControlBridge, MCPControlClient, MCPControlUnavailable
+from lib.host import (HostControlBridge, InProcessControlClient, MCPControlClient,
+                      MCPControlUnavailable)
+from lib.control.service import ControlPlaneService
+from lib.runtime.store import BehaviorStateStore
+from lib.service import DigitalPsychologyService
+from lib.system_one_backends import DisabledSystemOneBackend
+from lib.system_one_service import SystemOneService
 from lib.runtime import (ActionCandidate, CFWRuntimeAdapter, RuntimeIdentity,
                          RuntimeObservation)
 
@@ -288,6 +294,41 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
             assert "base host context" in context
         finally:
             await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_in_process_client_runs_the_same_host_bridge_transaction(tmp_path):
+    async def run():
+        identity = _identity("in-process-control-task")
+        goals = _goal_set()
+        decision_service = DigitalPsychologyService(
+            event_db=tmp_path / "in-process-events.sqlite3",
+            system_one_service=SystemOneService(
+                DisabledSystemOneBackend(), mode="disabled"))
+        control = ControlPlaneService(
+            decision_service=decision_service,
+            state_store=BehaviorStateStore(tmp_path / "in-process-behavior.sqlite3"))
+        client = InProcessControlClient(control)
+        cfw = _CFWPort()
+        csw = _CSWPort()
+        bridge = _bridge(tmp_path, identity=identity, goal_set=goals,
+                         cfw_port=cfw, csw_port=csw, client=client)
+        try:
+            opened = await bridge.open()
+            result = await bridge.after_action(RuntimeObservation(
+                action_index=1, equivalent_retry_count=2,
+                criterion_status={"criterion-visual": "unmet"},
+            ), goal_set=goals)
+
+            assert opened["status"] == "ready"
+            assert result["status"] == "ready"
+            assert result["behavior_state"]["cognitive_mode"] == "RECOVER"
+            assert csw.active == ("repair",)
+            assert cfw.lifecycle_revision == 1
+        finally:
+            await bridge.close()
+            control.close()
 
     asyncio.run(run())
 

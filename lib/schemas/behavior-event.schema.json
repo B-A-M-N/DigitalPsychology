@@ -381,6 +381,15 @@
         "candidate_adjustment_applied": {
           "type": "boolean"
         },
+        "policy_outcome_correct_progress": {
+          "type": ["boolean", "null"]
+        },
+        "policy_outcome_regression": {
+          "type": ["boolean", "null"]
+        },
+        "policy_outcome_repeated_failure": {
+          "type": ["boolean", "null"]
+        },
         "intervention_assigned": {
           "type": "boolean"
         },

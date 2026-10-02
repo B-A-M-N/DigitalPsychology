@@ -35,6 +35,7 @@ class ActionCandidate:
     approach_epoch: str = ""
     target_kind: str = "workspace"
     target_ref_digest: str | None = None
+    relation_certainty: str = "explicit"
 
     def __post_init__(self) -> None:
         for name, value, limit in (
@@ -52,11 +53,24 @@ class ActionCandidate:
         if any(type(value) is not bool for value in
                (self.mutating, self.reversible, self.external)):
             raise ValueError("candidate effect flags must be booleans")
+        if self.relation_certainty not in {"explicit", "inferred", "unknown"}:
+            raise ValueError("candidate relation_certainty must be explicit, inferred, or unknown")
         criteria = tuple(self.affected_criterion_ids)
-        if (not 1 <= len(criteria) <= 8 or len(criteria) != len(set(criteria))
+        if (len(criteria) > 8 or len(criteria) != len(set(criteria))
                 or any(not isinstance(item, str) or not item or len(item) > 128
                        for item in criteria)):
             raise ValueError("candidate criteria must be unique bounded IDs")
+        action_class = self.action_class.lower().replace("-", "_")
+        permits_unbound_support = (
+            action_class in {"diagnostic", "support", "read", "observation", "observational"}
+            or action_class.startswith(("diagnostic_", "support_", "read_", "observe_")))
+        if not criteria and (
+                not permits_unbound_support or self.relation_certainty != "unknown"):
+            raise ValueError(
+                "criterion-free candidates require diagnostic/support/read class "
+                "and unknown relation certainty")
+        if criteria and self.relation_certainty == "unknown":
+            raise ValueError("unknown relation certainty cannot claim affected criteria")
         target_refs = tuple(self.target_ref_digests)
         if (len(target_refs) > 16 or len(target_refs) != len(set(target_refs))
                 or any(not isinstance(value, str) or len(value) != 64
@@ -91,7 +105,8 @@ class ActionCandidate:
                 "external": self.external,
                 "approach_epoch": self.approach_epoch,
                 "target_kind": self.target_kind,
-                "target_ref_digest": self.target_ref_digest}
+                "target_ref_digest": self.target_ref_digest,
+                "relation_certainty": self.relation_certainty}
 
 
 @dataclass(frozen=True)
@@ -152,6 +167,8 @@ class RuntimeObservation:
     progress_made: bool = False
     regression_observed: bool = False
     artifact_changed: bool = False
+    actions_since_artifact_change: int | None = None
+    verification_actions_since_artifact_change: int | None = None
     actions_since_goal_progress: int = 0
     equivalent_retry_count: int = 0
     context_pressure: float = 0.0
@@ -173,6 +190,11 @@ class RuntimeObservation:
         if (self.actions_since_goal_progress < 0 or self.equivalent_retry_count < 0
                 or not 0.0 <= float(self.context_pressure) <= 1.0):
             raise ValueError("runtime observation counters are out of bounds")
+        for name in ("actions_since_artifact_change",
+                     "verification_actions_since_artifact_change"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a non-negative integer or null")
         if self.goal_set is not None and not isinstance(self.goal_set, GoalSetSnapshot):
             raise ValueError("goal_set must be a host-validated GoalSetSnapshot")
         if (self.candidate_action is not None
@@ -283,7 +305,8 @@ class CSWWorkflowPort(Protocol):
 
 SystemOneFrameFactory = Callable[[RuntimeIdentity, str, Sequence[str], BehaviorState,
                                   RuntimeObservation, CSWBehaviorSnapshot,
-                                  Sequence[FrameworkSignal]], SystemOneFrame]
+                                  Sequence[FrameworkSignal],
+                                  Mapping[str, Any]], SystemOneFrame]
 
 
 class BehavioralDecisionService(Protocol):

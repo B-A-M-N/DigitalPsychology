@@ -736,6 +736,34 @@
             "treatment_bad_rate": {
               "type": "number"
             },
+            "candidate_policy_evidence": {
+              "type": "object",
+              "required": [
+                "correct_progress_rate", "regression_rate", "repeated_failure_rate",
+                "confidence_interval", "regression_confidence_interval",
+                "repeated_failure_confidence_interval", "sample_count", "holdout_count"
+              ],
+              "properties": {
+                "correct_progress_rate": {"type": "number", "minimum": 0, "maximum": 1},
+                "regression_rate": {"type": "number", "minimum": 0, "maximum": 1},
+                "repeated_failure_rate": {"type": "number", "minimum": 0, "maximum": 1},
+                "confidence_interval": {
+                  "type": "array", "minItems": 2, "maxItems": 2,
+                  "items": {"type": "number", "minimum": 0, "maximum": 1}
+                },
+                "regression_confidence_interval": {
+                  "type": "array", "minItems": 2, "maxItems": 2,
+                  "items": {"type": "number", "minimum": 0, "maximum": 1}
+                },
+                "repeated_failure_confidence_interval": {
+                  "type": "array", "minItems": 2, "maxItems": 2,
+                  "items": {"type": "number", "minimum": 0, "maximum": 1}
+                },
+                "sample_count": {"type": "integer", "minimum": 1},
+                "holdout_count": {"type": "integer", "minimum": 1}
+              },
+              "additionalProperties": false
+            },
             "effect": {
               "type": "number"
             },

@@ -262,6 +262,9 @@ class ControlTickRequest:
                 "progress_made": self.observation.progress_made,
                 "regression_observed": self.observation.regression_observed,
                 "artifact_changed": self.observation.artifact_changed,
+                "actions_since_artifact_change": self.observation.actions_since_artifact_change,
+                "verification_actions_since_artifact_change": (
+                    self.observation.verification_actions_since_artifact_change),
                 "actions_since_goal_progress": self.observation.actions_since_goal_progress,
                 "equivalent_retry_count": self.observation.equivalent_retry_count,
                 "context_pressure": self.observation.context_pressure,

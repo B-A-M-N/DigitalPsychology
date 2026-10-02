@@ -35,13 +35,14 @@ def build_behavior_projection(state: BehaviorState,
                               goal_set: GoalSetSnapshot | None,
                               cfw_connected: bool,
                               csw_connected: bool,
-                              outcome_evidence_connected: bool
+                              outcome_evidence_connected: bool,
+                              host_has_stable_objective_context: bool = False
                               ) -> BehaviorProjection:
     counts = goal_set.required_counts if goal_set is not None else {
         "total": 0, "verified": 0, "remaining_required": 0,
     }
     lines = ["===== CURRENT BEHAVIOR GUIDANCE ====="]
-    if objective:
+    if objective and not host_has_stable_objective_context:
         lines.append(f"User objective: {objective.strip()}")
     lines.append(
         f"Required work: {counts['verified']} of {counts['total']} criteria verified; "
@@ -81,6 +82,7 @@ def build_behavior_projection(state: BehaviorState,
         "goal_set_counts": dict(counts),
         "attention_lease": (state.attention_lease.to_dict()
                             if state.attention_lease else None),
+        "mode_lease": (state.mode_lease.to_dict() if state.mode_lease else None),
         "attention_last_seen": dict(state.attention_last_seen),
         "active_interventions": [item.to_dict() for item in state.active_interventions],
         "csw_selection_revision": snapshot.revision,
@@ -124,17 +126,41 @@ def replace_model_projection(context: str, projection: ModelProjection) -> str:
     return f"{context.rstrip()}\n\n{guidance}" if context.strip() else guidance
 
 
+def model_projection_is_current(context: str, projection: ModelProjection) -> bool:
+    """Return whether the context already has this exact single guidance slot."""
+    opening = "===== CURRENT BEHAVIOR GUIDANCE ====="
+    closing = "===== END CURRENT BEHAVIOR GUIDANCE ====="
+    if context.count(opening) != 1 or context.count(closing) != 1:
+        return False
+    start = context.index(opening)
+    end = context.find(closing, start)
+    return end >= 0 and context[start:end].rstrip("\n") == projection.text
+
+
+def cached_replace_model_projection(context: str, projection: ModelProjection,
+                                   last_digest: str | None
+                                   ) -> tuple[str, str]:
+    """Reuse an unchanged host projection and return its cached digest."""
+    if (last_digest == projection.semantic_digest
+            and model_projection_is_current(context, projection)):
+        return context, last_digest
+    return replace_model_projection(context, projection), projection.semantic_digest
+
+
 def project_behavior_context(state: BehaviorState, snapshot: CSWBehaviorSnapshot, *,
                              objective: str, goal_set: GoalSetSnapshot | None,
                              cfw_connected: bool, csw_connected: bool,
-                             outcome_evidence_connected: bool) -> str:
+                             outcome_evidence_connected: bool,
+                             host_has_stable_objective_context: bool = False) -> str:
     """Compatibility helper returning only the model-visible projection."""
     return build_behavior_projection(
         state, snapshot, objective=objective, goal_set=goal_set,
         cfw_connected=cfw_connected, csw_connected=csw_connected,
-        outcome_evidence_connected=outcome_evidence_connected).model.text
+        outcome_evidence_connected=outcome_evidence_connected,
+        host_has_stable_objective_context=host_has_stable_objective_context).model.text
 
 
 __all__ = ["AuditProjection", "BehaviorProjection", "ModelProjection",
            "build_behavior_projection", "project_behavior_context",
-           "replace_model_projection"]
+           "replace_model_projection", "model_projection_is_current",
+           "cached_replace_model_projection"]

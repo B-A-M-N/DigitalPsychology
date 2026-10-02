@@ -1,29 +1,25 @@
 """DigitalPsychology application services, independent of MCP transport."""
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
 import os
-import stat
-import time
-import uuid
-from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .feedback_loop import Event, EventFactory, EventError, SQLiteSink, trusted_state_root
+from .feedback_loop import SQLiteSink, trusted_state_root
 from .fast_loop import BehavioralController, FastLoopInput
 from .control.policy_selector import BehaviorPolicyPrior
 from .outcomes import (InterventionEvaluationFrame, InterventionEvaluator,
                        InterventionEventContext, OutcomeEvidenceAuthority)
 from .behavior_state import BehaviorIntervention, BehaviorDirective, InterventionOutcome
-from .routing_profiles import (BehavioralRoutingProfile, RoutingProfileError,
-                               SharingDecisionAuthority, applicable_adjustments,
-                               validate_profile)
-from .slow_loop import BoundedLearningController
+from .routing_profiles import SharingDecisionAuthority
 from .system_one_contracts import SystemOneFrame, SystemOneIdentity
 from .system_one_service import SystemOneService
+from .security.attestation import EventAttestationAuthority
+from .telemetry.ingestion import BehaviorEventIngestor
+from .policy_priors.prior_store import BehaviorPolicyPriorStore
+from .interventions.event_service import InterventionEventService
+from .experiments.service import RegisteredExperimentService
 
 
 def _canonical(value: Any) -> str:
@@ -48,25 +44,12 @@ class DigitalPsychologyService:
         self.event_db = event_db or Path(
             os.environ.get("DIGITALPSYCHOLOGY_EVENT_DB", root / "events.sqlite3"))
         self.profile_path = profile_path
-        self._policy_prior_cache_key: tuple[int, int, int, int, int] | None = None
-        self._policy_prior_cache: tuple[BehaviorPolicyPrior, ...] = ()
-        self._trusted_producers = {str(k): dict(v) for k, v in (trusted_producers or {}).items()}
-        # Legacy single-host key remains supported only when no producer map
-        # exists. Configured producers use distinct per-key secrets.
-        self._attestation_secret = os.environ.get("DIGITALPSYCHOLOGY_INGESTION_SECRET", "").encode()
-        self._promotion_secret = os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode()
         self._sharing_authority = sharing_authority
         self._system_one_service = system_one_service
         self._behavioral_controller = behavioral_controller or BehavioralController()
         self._intervention_evaluator = InterventionEvaluator()
-        if (max_pending_events_per_origin < 1 or max_ingest_seconds_per_origin <= 0
-                or backpressure_recovery_seconds <= 0
-                or not 10 <= int(busy_timeout_ms) <= 5000 or int(per_origin_write_limit) < 1):
-            raise ValueError("per-origin ingestion bounds must be positive")
-        self.max_pending_events_per_origin = int(max_pending_events_per_origin)
-        self.max_ingest_seconds_per_origin = float(max_ingest_seconds_per_origin)
-        self.backpressure_recovery_seconds = float(backpressure_recovery_seconds)
-        self._pending_origins: dict[tuple[str, str], list[float]] = {}
+        if not 10 <= int(busy_timeout_ms) <= 5000 or int(per_origin_write_limit) < 1:
+            raise ValueError("per-origin persistence bounds must be positive")
         self._sink = SQLiteSink(
             self.event_db, busy_timeout_ms=busy_timeout_ms,
             per_origin_daily_write_limit=per_origin_write_limit)
@@ -74,6 +57,20 @@ class DigitalPsychologyService:
             namespace_id TEXT NOT NULL, application_instance_id TEXT NOT NULL,
             event_id TEXT NOT NULL, PRIMARY KEY(namespace_id, application_instance_id, event_id))""")
         self._sink._conn.commit()
+        attestation = EventAttestationAuthority(
+            trusted_producers=trusted_producers,
+            legacy_secret=os.environ.get("DIGITALPSYCHOLOGY_INGESTION_SECRET", "").encode())
+        self._event_ingestor = BehaviorEventIngestor(
+            sink=self._sink, attestation=attestation,
+            max_pending_events_per_origin=max_pending_events_per_origin,
+            max_ingest_seconds_per_origin=max_ingest_seconds_per_origin,
+            backpressure_recovery_seconds=backpressure_recovery_seconds)
+        self._policy_priors = BehaviorPolicyPriorStore(
+            profile_path=self.profile_path, sharing_authority=self._sharing_authority)
+        self._intervention_events = InterventionEventService(self._sink)
+        self._experiments = RegisteredExperimentService(
+            sink=self._sink, profile_path=self.profile_path,
+            promotion_secret=os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode())
 
     def close(self) -> None:
         self._sink.close()
@@ -132,37 +129,8 @@ class DigitalPsychologyService:
     def control_behavior_policy_priors(
             self, policy_context: Mapping[str, Any]
             ) -> tuple[BehaviorPolicyPrior, ...]:
-        """Read only exact-scope priors carried by active validated profiles.
-
-        Missing, stale, malformed, or not-yet-promoted profiles produce no
-        prior, leaving the deterministic fast-loop controller in force.
-        """
-        if not policy_context:
-            return ()
-        path = self.profile_path or (trusted_state_root() / "active-routing-profile.json")
-        try:
-            info = path.lstat()
-            cache_key = (info.st_ino, info.st_size, info.st_mtime_ns,
-                         info.st_mode, info.st_uid)
-        except OSError:
-            return ()
-        if cache_key == self._policy_prior_cache_key:
-            return tuple(item for item in self._policy_prior_cache
-                         if item.matches(policy_context))
-        try:
-            profiles, _profile_hash = self._load_profiles()
-        except (RoutingProfileError, OSError, TypeError, ValueError):
-            self._policy_prior_cache_key = cache_key
-            self._policy_prior_cache = ()
-            return ()
-        priors = []
-        for profile in profiles:
-            priors.extend(BehaviorPolicyPrior.from_promoted_profile(
-                profile, sharing_authority=self._sharing_authority))
-        self._policy_prior_cache_key = cache_key
-        self._policy_prior_cache = tuple(priors[:64])
-        return tuple(item for item in self._policy_prior_cache
-                     if item.matches(policy_context))
+        """Read exact-scope priors from active validated profiles."""
+        return self._policy_priors.policy_priors(policy_context)
 
     def assess_intervention_outcome(
             self, intervention: BehaviorIntervention,
@@ -182,10 +150,8 @@ class DigitalPsychologyService:
             applied_directive_ids: tuple[str, ...], *,
             event_context: InterventionEventContext) -> str:
         """Persist a host receipt after the runtime actually applies directives."""
-        event = self.prepare_intervention_application(
-            intervention, directives, applied_directive_ids,
-            event_context=event_context)
-        return self.dispatch_runtime_event(event)
+        return self._intervention_events.record_application(
+            intervention, directives, applied_directive_ids, event_context=event_context)
 
     def prepare_intervention_application(
             self, intervention: BehaviorIntervention,
@@ -193,474 +159,100 @@ class DigitalPsychologyService:
             applied_directive_ids: tuple[str, ...], *,
             event_context: InterventionEventContext) -> dict[str, Any]:
         """Build the authenticated receipt for atomic insertion in the host outbox."""
-        required = {item.directive_id for item in directives
-                    if item.intervention_id == intervention.intervention_id}
-        applied = set(applied_directive_ids)
-        if not required or required != applied or len(applied) != len(applied_directive_ids):
-            raise ValueError("applied intervention receipt does not cover its exact directives")
-        payload = {
-            "behavior_intervention_id": intervention.intervention_id,
-            "behavior_intervention_cause": intervention.cause,
-            "behavior_intervention_expected_effect": intervention.expected_effect,
-            "behavior_intervention_status": "applied",
-            "behavior_intervention_attribution": "insufficient",
-            "behavior_intervention_target_changes": [
-                target.to_dict() for target in intervention.targets],
-            "behavior_intervention_target_criteria": list(intervention.target_criteria),
-            "behavior_intervention_start_revision": intervention.start_revision,
-            "behavior_intervention_baseline_action_index": intervention.baseline_action_index,
-            "behavior_intervention_evaluation_horizon_actions":
-                intervention.evaluation_horizon_actions,
-            "behavior_intervention_competing_ids":
-                list(intervention.concurrent_intervention_ids),
-            "behavior_intervention_directive_ids": sorted(applied),
-            "behavior_condition_id": intervention.condition_id,
-            "behavior_condition_basis_digest": intervention.condition_basis_digest,
-        }
-        return self._build_intervention_event(
-            event_context, category="decision", event_type="behavior_intervention_applied",
-            scope=intervention.scope, evidence_refs=(), payload=payload).to_dict()
+        return self._intervention_events.prepare_application(
+            intervention, directives, applied_directive_ids, event_context=event_context)
 
     def record_intervention_outcome(
             self, outcome: InterventionOutcome, *,
             event_context: InterventionEventContext) -> str:
         """Durably join independent outcome evidence to the applied intervention."""
-        event = self.prepare_intervention_outcome(outcome, event_context=event_context)
-        return self.dispatch_runtime_event(event)
+        return self._intervention_events.record_outcome(
+            outcome, event_context=event_context)
 
     def prepare_intervention_outcome(
             self, outcome: InterventionOutcome, *,
             event_context: InterventionEventContext) -> dict[str, Any]:
         """Build an assessed outcome for atomic insertion in the host outbox."""
-        payload = {
-            "behavior_intervention_id": outcome.intervention_id,
-            "behavior_intervention_cause": outcome.cause,
-            "behavior_intervention_status": outcome.outcome,
-            "behavior_intervention_attribution": outcome.attribution,
-            "behavior_intervention_criterion_progress":
-                list(outcome.criterion_ids_progressed),
-            "behavior_intervention_target_criteria": list(outcome.target_criteria),
-            "behavior_intervention_task_set_outcome": (
-                outcome.task_set_outcome.to_dict()
-                if outcome.task_set_outcome is not None else None),
-            "behavior_intervention_goal_progress": outcome.goal_progress,
-            "behavior_intervention_comparison_id": outcome.comparison_id,
-            "behavior_intervention_artifact_changed": outcome.artifact_changed,
-            "behavior_intervention_repeated_approach": outcome.repeated_approach,
-            "behavior_intervention_verification_quality": outcome.verification_quality,
-            "behavior_condition_id": outcome.condition_id,
-            "behavior_condition_basis_digest": outcome.condition_basis_digest,
-        }
-        return self._build_intervention_event(
-            event_context, category="validation", event_type="behavior_intervention_assessed",
-            scope=outcome.scope, evidence_refs=outcome.evidence_refs,
-            payload=payload).to_dict()
+        return self._intervention_events.prepare_outcome(
+            outcome, event_context=event_context)
 
     def dispatch_runtime_event(self, value: Mapping[str, Any]) -> str:
         """Idempotently deliver a trusted host event from the runtime outbox."""
-        if not isinstance(value, Mapping):
-            raise ValueError("runtime outbox event must be an object")
-        event = EventFactory.from_dict(dict(value))
-        allowed = {
-            ("decision", "behavior_intervention_applied",
-             "digitalpsychology_runtime", "digitalpsychology_runtime"),
-            ("validation", "behavior_intervention_assessed",
-             "digitalpsychology_runtime", "host_outcome_evaluator"),
-        }
-        identity = (event.category, event.event_type, event.actor_id,
-                    event.authority_source)
-        if identity not in allowed:
-            raise ValueError("runtime outbox event is outside the trusted DP host contract")
-        self._sink.emit_authenticated(event, authenticated=True)
-        return event.event_id
+        return self._intervention_events.dispatch(value)
 
     def _record_intervention_event(
             self, event_context: InterventionEventContext, *, category: str,
             event_type: str, scope: str, evidence_refs: tuple[str, ...],
             payload: Mapping[str, Any]) -> str:
-        return self.dispatch_runtime_event(self._build_intervention_event(
-            event_context, category=category, event_type=event_type,
-            scope=scope, evidence_refs=evidence_refs, payload=payload).to_dict())
+        return self._intervention_events.record_event(
+            event_context, category=category, event_type=event_type, scope=scope,
+            evidence_refs=evidence_refs, payload=payload)
 
     @staticmethod
     def _build_intervention_event(
             event_context: InterventionEventContext, *, category: str,
             event_type: str, scope: str, evidence_refs: tuple[str, ...],
-            payload: Mapping[str, Any]) -> Event:
-        event_id = f"dp-intv-{uuid.uuid4().hex}"
-        event = Event(
-            event_id=event_id,
-            timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            namespace_id=event_context.namespace_id,
-            application_id=event_context.application_id,
-            application_instance_id=event_context.application_instance_id,
-            agent_instance_id=event_context.agent_instance_id,
-            session_id=event_context.session_id,
-            task_id=event_context.task_id,
-            attempt_id=event_context.attempt_id,
-            segment_id=event_context.segment_id,
-            agent_id=event_context.agent_id,
-            behavioral_subject=event_context.behavioral_subject,
-            category=category,
-            event_type=event_type,
-            actor_id="digitalpsychology_runtime",
-            authority_source="host_outcome_evaluator" if category == "validation"
-                             else "digitalpsychology_runtime",
-            scope=scope,
-            goal_contract_hash=event_context.goal_contract_hash,
-            evidence_refs=list(evidence_refs),
-            payload=dict(payload),
-        )
-        return event
+            payload: Mapping[str, Any]):
+        return InterventionEventService._build_event(
+            event_context, category=category, event_type=event_type, scope=scope,
+            evidence_refs=evidence_refs, payload=payload)
 
     def _producer_key(self, key_id: str) -> bytes:
-        raw = os.environ.get(f"DIGITALPSYCHOLOGY_INGESTION_KEY_{key_id}", "")
-        if not raw or not self._trusted_producers:
-            raise ValueError("behavior event producer key is unavailable")
-        return raw.encode()
+        return self._event_ingestor.attestation._producer_key(key_id)
 
     def _attest_event(self, data: Mapping[str, Any],
                       attestation: Optional[Mapping[str, Any]]) -> bool:
-        privileged = (data.get("category") in {"validation", "state_transition", "completion"}
-                      or data.get("actor_id") in {"operator", "repository_owner", "service_owner"})
-        producer_key = "|".join((str(data.get("namespace_id") or ""),
-                                 str(data.get("application_instance_id") or ""),
-                                 str(data.get("agent_instance_id") or "")))
-        producer = self._trusted_producers.get(producer_key)
-        if producer is not None:
-            if not isinstance(attestation, Mapping):
-                raise ValueError("configured producer requires host attestation")
-            key_id = str(attestation.get("key_id") or "")
-            if not key_id or key_id != str(producer.get("key_id") or ""):
-                raise ValueError("behavior event producer key identifier is unauthorized")
-            if attestation.get("issuer") != producer.get("issuer"):
-                raise ValueError("behavior event attestation issuer is invalid")
-            if data.get("actor_id") not in set(producer.get("allowed_actors", ())):
-                raise ValueError("behavior event actor is not producer-authorized")
-            if data.get("category") not in set(producer.get("allowed_categories", ())):
-                raise ValueError("behavior event category is not producer-authorized")
-            if data.get("application_id") != producer.get("application_id"):
-                raise ValueError("behavior event application is not producer-authorized")
-            body = {k: v for k, v in data.items() if k != "host_attestation"}
-            expected = hmac.new(self._producer_key(key_id), _canonical(body).encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(str(attestation.get("signature") or ""), expected):
-                raise ValueError("behavior event host attestation is invalid")
-            return True
-        if self._trusted_producers:
-            raise ValueError("behavior event producer is not configured")
-        if not self._attestation_secret:
-            if privileged:
-                raise ValueError("privileged behavior events require host attestation")
-            return False
-        if not isinstance(attestation, Mapping):
-            raise ValueError("behavior event host attestation is required")
-        body = {k: v for k, v in data.items() if k != "host_attestation"}
-        expected = hmac.new(self._attestation_secret, _canonical(body).encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(str(attestation.get("signature") or ""), expected):
-            raise ValueError("behavior event host attestation is invalid")
-        return True
+        return self._event_ingestor.attestation.attest(data, attestation)
 
     def ingest_behavior_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
-        try:
-            if not isinstance(event, Mapping):
-                raise ValueError("behavior event transport must be an object")
-            if "event" in event or "attestation" in event:
-                if set(event) != {"event", "attestation"}:
-                    raise ValueError("authenticated behavior event envelope has unknown fields")
-                raw_event = event.get("event")
-                attestation = event.get("attestation")
-                if not isinstance(raw_event, Mapping):
-                    raise ValueError("authenticated behavior event requires an event object")
-                data = dict(raw_event)
-            else:
-                # Compatibility adapter for the 2.3 transport that embedded
-                # attestation beside semantic event fields.
-                data = dict(event)
-                attestation = data.pop("host_attestation", None)
-            authenticated = self._attest_event(
-                data, attestation if isinstance(attestation, Mapping) else None)
-            parsed = EventFactory.from_dict(data)
-            origin = (parsed.namespace_id, parsed.application_instance_id)
-            now = time.monotonic()
-            recent = [stamp for stamp in self._pending_origins.get(origin, ())
-                      if now - stamp < self.backpressure_recovery_seconds]
-            if recent:
-                self._pending_origins[origin] = recent
-            else:
-                self._pending_origins.pop(origin, None)
-            if len(recent) >= self.max_pending_events_per_origin:
-                raise ValueError("per-origin behavioral ingestion backpressure is active")
-            started = time.monotonic()
-            self._sink.emit_authenticated(parsed, authenticated=authenticated)
-            elapsed = time.monotonic() - started
-            if elapsed > self.max_ingest_seconds_per_origin:
-                self._pending_origins.setdefault(origin, []).append(time.monotonic())
-        except (EventError, ValueError) as exc:
-            raise ValueError(f"behavior event rejected: {exc}") from exc
-        data = parsed.to_dict()
-        return {
-            "accepted": True,
-            "idempotent_key": {
-                "namespace_id": data["namespace_id"],
-                "application_instance_id": data["application_instance_id"],
-                "event_id": data["event_id"],
-            },
-            "schema_version": data["schema_version"],
-        }
+        return self._event_ingestor.ingest(event)
 
-    def _eligible_route_keys(self, routes: list[Any]) -> set[tuple[str, str]]:
-        result: set[tuple[str, str]] = set()
-        for route in routes:
-            if isinstance(route, str):
-                result.add(("*", route))
-            elif isinstance(route, Mapping):
-                route_type = str(route.get("route_type") or "*")
-                name = str(route.get("route") or "")
-                if name:
-                    result.add((route_type, name))
-        return result
+    @staticmethod
+    def _eligible_route_keys(routes: list[Any]) -> set[tuple[str, str]]:
+        return BehaviorPolicyPriorStore.eligible_route_keys(routes)
 
     def _load_profiles(self) -> tuple[list[dict[str, Any]], str]:
-        path = self.profile_path
-        if path is None:
-            path = trusted_state_root() / "active-routing-profile.json"
-        if not path.exists():
-            return [], ""
-        if path.is_symlink():
-            raise RoutingProfileError("routing profile path must not be a symlink")
-        info = path.stat()
-        if info.st_uid != os.getuid() or info.st_mode & 0o022:
-            raise RoutingProfileError(
-                "routing profile artifact must be owned by the service user and not writable by others")
-        parent = path.parent
-        while True:
-            parent_info = parent.lstat()
-            shared_sticky_dir = (stat.S_ISDIR(parent_info.st_mode)
-                                 and bool(parent_info.st_mode & stat.S_ISVTX))
-            if stat.S_ISLNK(parent_info.st_mode) or (
-                    parent_info.st_mode & 0o022 and not shared_sticky_dir):
-                raise RoutingProfileError(
-                    "routing profile parent directory is not a protected trust boundary")
-            if parent == parent.parent:
-                break
-            parent = parent.parent
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, Mapping) and isinstance(data.get("profile"), Mapping):
-            profiles = [dict(data["profile"])]
-            revision = data.get("revision")
-            if profiles[0].get("lifecycle_revision") != revision:
-                raise RoutingProfileError("active routing profile revision mismatch")
-            current = profiles[0]
-            lifecycle_status = current.get("lifecycle_status") or current.get("status")
-            current_unavailable = (current.get("status") in {"stale", "rolled_back"}
-                                   or lifecycle_status in {"stale", "rolled_back"})
-            if not current_unavailable:
-                try:
-                    validate_profile(current, require_deployable=True,
-                                    sharing_authority=self._sharing_authority)
-                except RoutingProfileError:
-                    current_unavailable = True
-            if current_unavailable:
-                known_good = data.get("known_good_profile")
-                if (not isinstance(known_good, Mapping)
-                        or known_good.get("profile_hash") == current.get("profile_hash")
-                        or known_good.get("status") not in {"active", "validated"}
-                        or known_good.get("lifecycle_status") not in {"active", "validated"}):
-                    return [], ""
-                validate_profile(dict(known_good), require_deployable=True,
-                                           sharing_authority=self._sharing_authority)
-                profiles = [dict(known_good)]
-        elif isinstance(data, Mapping) and isinstance(data.get("profiles"), list):
-            profiles = [dict(item) for item in data["profiles"]
-                        if item.get("status") not in {"stale", "rolled_back"}
-                        and item.get("lifecycle_status") not in {"stale", "rolled_back"}]
-        elif isinstance(data, Mapping):
-            profiles = [dict(data)]
-        else:
-            raise RoutingProfileError("routing profile artifact must be an object")
-        for profile in profiles:
-            validate_profile(profile, require_deployable=True,
-                             sharing_authority=self._sharing_authority)
-        pack_hash = hashlib.sha256(_canonical(profiles).encode("utf-8")).hexdigest()
-        return profiles, pack_hash
+        return self._policy_priors.load_profiles()
 
     def behavioral_advice(self, *, context: Mapping[str, Any],
                           eligible_routes: list[Any],
                           static_policy: Mapping[str, Any]) -> dict[str, Any]:
         """Return bounded advice only for host-declared eligible routes."""
-        try:
-            profiles, profile_hash = self._load_profiles()
-        except (RoutingProfileError, OSError, TypeError, ValueError) as exc:
-            return {"status": "unavailable", "reason": str(exc),
-                    "adjustments": [], "dp_revision": None}
-        allowed = self._eligible_route_keys(eligible_routes)
-        adjustments: list[dict[str, Any]] = []
-        sources: list[str] = []
-        for raw in profiles:
-            try:
-                profile = BehavioralRoutingProfile.from_dict(
-                    raw, require_deployable=True,
-                    sharing_authority=self._sharing_authority)
-                matches = applicable_adjustments(
-                    profile, context, sharing_authority=self._sharing_authority)
-            except RoutingProfileError:
-                continue
-            for adjustment in matches:
-                key = (str(adjustment.get("route_type") or "*"),
-                       str(adjustment.get("route") or ""))
-                if adjustment.get("disposition") not in {"prefer", "suppress"}:
-                    continue
-                if key not in allowed and ("*", key[1]) not in allowed:
-                    continue
-                # Executive behavior priors remain inside DP. CFW only sees
-                # bounded route advice for choices it already owns.
-                route_adjustment = {key: value for key, value in adjustment.items()
-                                    if key != "behavior_policy"}
-                adjustments.append({**route_adjustment,
-                                    "profile_id": raw.get("profile_id"),
-                                    "profile_hash": raw.get("profile_hash")})
-                sources.append(str(raw.get("profile_id") or raw.get("profile_hash")))
-        body = {
-            "status": "ok",
-            "static_policy_hash": static_policy.get("policy_hash", static_policy.get("static_policy_hash")),
-            "eligible_choice_hash": static_policy.get("eligible_choice_hash"),
-            "context_identity": static_policy.get("context_identity"),
-            "profile_pack_hash": profile_hash,
-            "adjustments": adjustments,
-            "sources": sorted(set(sources)),
-            "expires_at": min((str(profile.get("expires_at")) for profile in profiles
-                                if profile.get("expires_at")), default=None),
-            "dp_revision": self._profile_revision(),
-        }
-        body["semantic_hash"] = hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
-        body["advice_id"] = f"advice-{body['semantic_hash'][:20]}"
-        return body
+        return self._policy_priors.behavioral_advice(
+            context=context, eligible_routes=eligible_routes, static_policy=static_policy)
 
     def _run_slow_loop(self, events: list[Any], task_context: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         """Internal authenticated-cycle primitive; never exposed as an MCP tool."""
-        from .routing_lifecycle import RoutingLifecycleStore
-        profile_path = self.profile_path or (trusted_state_root() / "active-routing-profile.json")
-        lifecycle = RoutingLifecycleStore(profile_path.parent / "routing-lifecycle.json")
-        parsed_events = [EventFactory.from_dict(dict(event)) if isinstance(event, Mapping) else event
-                         for event in events]
-        report = BoundedLearningController(lifecycle=lifecycle).run(parsed_events, task_context)
-        return {
-            "status": report.status,
-            "promoted": report.promoted,
-            "candidate_count": len(report.candidates),
-            "rejected": report.rejected,
-            "deployment_exposures": report.deployment_exposures,
-            "observations_completed": report.observations_completed,
-            "intervention_effectiveness": report.intervention_effectiveness,
-            "behavior_policy_priors": report.behavior_policy_priors,
-            "regressions": report.regressions,
-            "rejection_reasons": report.rejection_reasons,
-            "events": report.events,
-        }
+        return self._experiments.run_slow_loop(events, task_context)
 
     def _load_persisted_events(self, event_ids: list[Any], *,
                               namespace_id: str,
                               application_instance_id: str) -> list[Any]:
         """Load authenticated events by complete, immutable origin."""
-        if not isinstance(namespace_id, str) or not namespace_id:
-            raise ValueError("experiment event origin requires namespace_id")
-        if not isinstance(application_instance_id, str) or not application_instance_id:
-            raise ValueError("experiment event origin requires application_instance_id")
-        loaded = []
-        for event_id in event_ids:
-            row = self._sink._conn.execute(
-                "SELECT e.payload FROM events e JOIN authenticated_events a "
-                "ON a.namespace_id=e.namespace_id AND a.application_instance_id=e.application_instance_id AND a.event_id=e.event_id "
-                "WHERE e.namespace_id = ? AND e.application_instance_id = ? AND e.event_id = ?",
-                (str(namespace_id), str(application_instance_id), str(event_id)),
-            ).fetchone()
-            if row is None:
-                raise ValueError(
-                    "experiment references an event not present in authenticated store: "
-                    f"{namespace_id}|{application_instance_id}|{event_id!r}")
-            loaded.append(EventFactory.from_dict(json.loads(row[0])))
-        return loaded
+        return self._experiments.load_persisted_events(
+            event_ids, namespace_id=namespace_id,
+            application_instance_id=application_instance_id)
 
     @staticmethod
     def _load_experiment_record(registry: Any, *, experiment_id: str,
                                 namespace_id: str, application_instance_id: str) -> dict[str, Any]:
         """Select one immutable registration from exact origin."""
-        values = (list(registry.values()) if isinstance(registry, Mapping)
-                  else registry if isinstance(registry, list) else [])
-        matches = [item for item in values if isinstance(item, Mapping)
-                   and item.get("experiment_id") == experiment_id
-                   and item.get("namespace_id") == namespace_id
-                   and item.get("application_instance_id") == application_instance_id]
-        if len(matches) != 1:
-            raise ValueError("experiment registration must be unique for its exact origin")
-        record = dict(matches[0])
-        registration_revision = record.get("registration_revision")
-        if not isinstance(registration_revision, str) or not registration_revision:
-            raise ValueError("experiment registration requires an immutable revision")
-        body = dict(record)
-        supplied = body.pop("registration_hash", None)
-        expected = hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
-        if supplied != expected:
-            raise ValueError("experiment registration hash is invalid")
-        return record
+        return RegisteredExperimentService.load_experiment_record(
+            registry, experiment_id=experiment_id, namespace_id=namespace_id,
+            application_instance_id=application_instance_id)
 
     def run_registered_slow_loop(self, experiment_id: str,
                                  authorization: Mapping[str, Any]) -> dict[str, Any]:
         """Run a protected experiment record; promotion requires host authorization."""
-        root = trusted_state_root()
-        registry_path = root / "experiments.json"
-        if not registry_path.exists():
-            raise ValueError("experiment registry is unavailable")
-        try:
-            registry = json.loads(registry_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError("experiment registry is unreadable") from exc
-        namespace_id = str(authorization.get("namespace_id") or "")
-        application_instance_id = str(authorization.get("application_instance_id") or "")
-        if not namespace_id or not application_instance_id:
-            raise ValueError("experiment authorization requires its exact origin")
-        record = self._load_experiment_record(
-            registry, experiment_id=experiment_id,
-            namespace_id=namespace_id,
-            application_instance_id=application_instance_id)
-        if authorization.get("registration_revision") != record.get("registration_revision")                 or authorization.get("registration_hash") != record.get("registration_hash"):
-            raise ValueError("experiment promotion authorization is not bound to the immutable registration")
-        expected = str(record.get("promotion_authorization_id") or "")
-        if not expected or authorization.get("authorization_id") != expected:
-            raise ValueError("experiment promotion authorization is required")
-        if not self._promotion_secret:
-            raise ValueError("experiment promotion requires a separate promotion secret")
-        signature = str(authorization.get("signature") or "")
-        body = {key: value for key, value in authorization.items() if key != "signature"}
-        expected_signature = hmac.new(self._promotion_secret, _canonical(body).encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected_signature):
-            raise ValueError("experiment promotion authorization is invalid")
-        event_ids = record.get("event_ids")
-        task_context = record.get("task_context")
-        if not isinstance(event_ids, list) or not isinstance(task_context, Mapping):
-            raise ValueError("experiment record lacks authenticated event IDs or context")
-        events = self._load_persisted_events(
-            event_ids, namespace_id=str(record.get("namespace_id") or ""),
-            application_instance_id=str(record.get("application_instance_id") or ""))
-        return self._run_slow_loop(events, task_context)
+        return self._experiments.run_registered(
+            experiment_id, authorization, slow_loop=self._run_slow_loop)
 
     def purge_expired_events(self, *, retention_days: int) -> dict[str, Any]:
         """Host-only retention operation; deliberately not an MCP tool."""
         return self._sink.purge_expired(retention_days=retention_days)
 
     def validate_routing_profile(self, profile: Mapping[str, Any]) -> dict[str, Any]:
-        validate_profile(profile, require_deployable=True,
-                         sharing_authority=self._sharing_authority)
-        return {"valid": True, "profile_id": profile["profile_id"],
-                "profile_hash": profile["profile_hash"], "scope_mode": profile["scope_mode"]}
+        return self._policy_priors.validate_profile(profile)
 
     def _profile_revision(self) -> int | None:
-        path = self.profile_path
-        if path is None:
-            root = trusted_state_root()
-            path = root / "active-routing-profile.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return int(data.get("revision")) if data.get("revision") is not None else None
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return None
+        return self._policy_priors.profile_revision()

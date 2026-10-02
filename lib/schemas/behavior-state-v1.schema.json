@@ -32,8 +32,24 @@
         "goal_set_revision": {"type": "integer", "minimum": 0},
         "start_action": {"type": "integer", "minimum": 0},
         "max_actions": {"type": "integer", "minimum": 1, "maximum": 8},
-        "reason": {"type": "string", "minLength": 1, "maxLength": 128}
+        "reason": {"type": "string", "minLength": 1, "maxLength": 128},
+        "material_progress_revisions": {
+          "type": "object", "maxProperties": 3,
+          "propertyNames": {"type": "string", "minLength": 1, "maxLength": 128},
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "continuous_attention_leases": {
+          "type": "object", "maxProperties": 3,
+          "propertyNames": {"type": "string", "minLength": 1, "maxLength": 128},
+          "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 2}
+        }
       }
+    },
+    "mode_lease": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/modeLease"}
+      ]
     },
     "attention_last_seen": {
       "type": "object", "maxProperties": 256,
@@ -56,6 +72,20 @@
     }
   },
   "$defs": {
+    "modeLease": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "entered_action", "minimum_actions", "max_actions",
+                   "cause", "exit_condition", "baseline_approach_epoch"],
+      "properties": {
+        "mode": {"enum": ["DELIVER", "DIAGNOSE", "VERIFY", "RECOVER", "REPLAN", "BLOCKED", "REINSPECT", "READY_TO_COMPLETE"]},
+        "entered_action": {"type": "integer", "minimum": 0},
+        "minimum_actions": {"type": "integer", "minimum": 1, "maximum": 8},
+        "max_actions": {"type": ["integer", "null"], "minimum": 1, "maximum": 32},
+        "cause": {"type": "string", "minLength": 1, "maxLength": 128},
+        "exit_condition": {"enum": ["minimum_duration", "progress_or_new_approach", "verification_result", "fresh_evidence", "plan_committed", "diagnostic_evidence"]},
+        "baseline_approach_epoch": {"type": ["string", "null"], "maxLength": 256}
+      }
+    },
     "interventionTarget": {
       "type": "object", "additionalProperties": false,
       "required": ["target", "previous_value", "applied_value"],
@@ -142,7 +172,8 @@
         "status": {"enum": ["READY", "ACTIVE", "VERIFIED", "BLOCKED", "DEPENDENCY_BLOCKED", "DEFERRED_BY_OPERATOR"]},
         "actions_since_progress": {"type": "integer", "minimum": 0},
         "equivalent_retry_count": {"type": "integer", "minimum": 0},
-        "last_progress_action": {"type": ["integer", "null"], "minimum": 0}
+        "last_progress_action": {"type": ["integer", "null"], "minimum": 0},
+        "material_progress_revision": {"type": "integer", "minimum": 0}
       }
     },
     "taskSetOutcome": {

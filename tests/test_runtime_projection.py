@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from lib.behavior_state import BehaviorState, CSWBehaviorSnapshot
 from lib.runtime.projection import (ModelProjection, build_behavior_projection,
+                                    cached_replace_model_projection,
+                                    model_projection_is_current,
                                     replace_model_projection)
 
 
@@ -40,3 +42,20 @@ def test_internal_revision_without_semantic_change_is_a_projection_noop():
 
     context = replace_model_projection("Host context", first.model)
     assert replace_model_projection(context, second.model) is context
+
+
+def test_stable_host_objective_can_be_omitted_and_bridge_reuses_current_slot():
+    projection = build_behavior_projection(
+        BehaviorState(revision=1), CSWBehaviorSnapshot(revision=1),
+        objective="Implement the requested view", goal_set=None,
+        cfw_connected=True, csw_connected=True, outcome_evidence_connected=True,
+        host_has_stable_objective_context=True,
+    )
+    assert "User objective" not in projection.model.text
+    context = replace_model_projection("Stable host task objective", projection.model)
+    assert model_projection_is_current(context, projection.model)
+
+    cached, digest = cached_replace_model_projection(
+        context, projection.model, projection.model.semantic_digest)
+    assert cached is context
+    assert digest == projection.model.semantic_digest

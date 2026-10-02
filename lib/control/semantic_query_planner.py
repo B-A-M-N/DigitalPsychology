@@ -11,6 +11,7 @@ from typing import Sequence
 
 from ..behavior_state import FrameworkSignal
 from ..runtime.contracts import RuntimeObservation
+from .policy_ambiguity import PolicyAmbiguity
 
 
 @dataclass(frozen=True)
@@ -21,7 +22,8 @@ class SemanticQueryPlan:
 
     def __post_init__(self) -> None:
         if self.question_id is not None and self.question_id not in {
-                "action_relation", "progress_relation", "retry_relation", "goal_drift"}:
+                "action_relation", "progress_relation", "retry_relation", "goal_drift",
+                "route_preference"}:
             raise ValueError("semantic query plan names an unsupported question")
         if not isinstance(self.reason, str) or not self.reason or len(self.reason) > 256:
             raise ValueError("semantic query reason must be bounded non-empty text")
@@ -40,22 +42,27 @@ class SemanticQueryPlanner:
     """Select at most one calibrated semantic question for an ambiguous event."""
 
     def __init__(self, *, minimum_value_of_information: float = 0.65,
-                 support_action_threshold: int = 3) -> None:
-        if (not isinstance(minimum_value_of_information, (int, float))
+                 support_action_threshold: int = 3,
+                 maximum_ambiguity_gap: float = 0.25) -> None:
+        if (type(minimum_value_of_information) not in (int, float)
                 or not 0.5 <= float(minimum_value_of_information) <= 1.0):
             raise ValueError("minimum semantic value of information must be in [0.5, 1]")
         if type(support_action_threshold) is not int or not 1 <= support_action_threshold <= 64:
             raise ValueError("support action threshold must be between 1 and 64")
+        if (type(maximum_ambiguity_gap) not in (int, float)
+                or not 0.0 <= float(maximum_ambiguity_gap) <= 1.0):
+            raise ValueError("maximum ambiguity gap must be between zero and one")
         self.minimum_value_of_information = float(minimum_value_of_information)
         self.support_action_threshold = support_action_threshold
+        self.maximum_ambiguity_gap = float(maximum_ambiguity_gap)
 
     def plan(self, observation: RuntimeObservation, *,
-             cfw_signals: Sequence[FrameworkSignal] = ()) -> SemanticQueryPlan:
+             cfw_signals: Sequence[FrameworkSignal] = (),
+             policy_ambiguity: PolicyAmbiguity | None = None) -> SemanticQueryPlan:
         signals = tuple(signal for signal in cfw_signals if signal.active)
         if any(signal.source.lower() == "ward" and signal.severity == "critical"
                for signal in signals):
             return self._skip("hard CFW authority already resolves this boundary")
-
         codes = tuple((signal.source + "." + signal.code).lower() for signal in signals)
         retry_signal = any(any(token in code for token in (
             "retry", "repeat", "same_approach", "approach_failed", "equivalent"))
@@ -77,11 +84,26 @@ class SemanticQueryPlanner:
             progress_gap = max(progress_gap, *(item.actions_since_progress
                                                for item in relevant_items), 0)
 
+        candidate = observation.candidate_action
+        if candidate is not None and retry_count >= 2:
+            return self._skip("repeated approach is already established by host counters")
+        if (observation.action_completed
+                and (observation.progress_made or observation.regression_observed)):
+            return self._skip("host outcome evidence already resolves progress or regression")
+
+        if policy_ambiguity is None:
+            return self._skip("no candidate ambiguity was supplied")
+        if policy_ambiguity.score_gap > self.maximum_ambiguity_gap:
+            return self._skip("candidate margin is too large for a semantic result to change policy")
+
         question: str | None = None
         reason = "host evidence does not identify a semantic ambiguity"
         voi = 0.0
-        candidate = observation.candidate_action
-        if candidate is not None:
+        if "statework_fit" in policy_ambiguity.unresolved_dimensions:
+            question = "route_preference"
+            reason = "two CSW-eligible StateWorks are plausible for the current behavior mode"
+            voi = 0.70
+        elif candidate is not None:
             if retry_count >= 2:
                 return self._skip("repeated approach is already established by host counters")
             if retry_count == 1 or retry_signal:
@@ -92,9 +114,10 @@ class SemanticQueryPlanner:
                 question = "action_relation"
                 reason = "CFW reports possible goal drift in a consequential candidate"
                 voi = 0.78
-            elif candidate.external or (candidate.mutating and not candidate.reversible):
+            elif (candidate.relation_certainty == "unknown" or candidate.external
+                  or (candidate.mutating and not candidate.reversible)):
                 question = "action_relation"
-                reason = "irreversible or external candidate has uncertain goal relation"
+                reason = "candidate goal relation is unknown or consequential"
                 voi = 0.72
         elif observation.action_completed:
             if observation.progress_made or observation.regression_observed:
@@ -117,7 +140,10 @@ class SemanticQueryPlanner:
         else:
             return self._skip("non-action boundary has no unresolved semantic decision")
 
-        if question is None or voi < self.minimum_value_of_information:
+        question_dimension = "statework_fit" if question == "route_preference" else question
+        if (question is None
+                or question_dimension not in policy_ambiguity.unresolved_dimensions
+                or voi < self.minimum_value_of_information):
             return self._skip(reason)
         return SemanticQueryPlan(question, reason, voi)
 
@@ -126,4 +152,4 @@ class SemanticQueryPlanner:
         return SemanticQueryPlan(None, reason[:256], 0.0)
 
 
-__all__ = ["SemanticQueryPlan", "SemanticQueryPlanner"]
+__all__ = ["PolicyAmbiguity", "SemanticQueryPlan", "SemanticQueryPlanner"]

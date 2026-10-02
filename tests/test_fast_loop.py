@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 from jsonschema import Draft202012Validator
@@ -9,7 +10,8 @@ from referencing import Registry, Resource
 
 from lib.attention import schedule_attention
 from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
-                                GoalItemSnapshot, GoalSetSnapshot, StateWorkOption)
+                                GoalItemSnapshot, GoalSetSnapshot, ModeLease,
+                                StateWorkOption)
 from lib.fast_loop import BehavioralController, FastLoopInput
 from lib.mcp_server import DigitalPsychologyService
 
@@ -47,6 +49,38 @@ def test_repeated_equivalent_work_creates_bounded_recovery_and_legal_statework_p
     }
     assert any(target.target == "statework:repair-flow"
                for target in decision.state.active_interventions[0].targets)
+
+
+def test_mode_lease_blocks_weak_mode_oscillation_but_hard_contradiction_interrupts():
+    controller = BehavioralController()
+    initial = BehaviorState(
+        cognitive_mode="VERIFY",
+        mode_lease=ModeLease(
+            mode="VERIFY", entered_action=0, minimum_actions=2, max_actions=6,
+            cause="artifact_changed", exit_condition="verification_result"),
+    )
+
+    weak = controller.decide(FastLoopInput(
+        scope="tenant/app/agent/session/task/attempt",
+        state=initial, csw_snapshot=CSWBehaviorSnapshot(revision=1),
+        objective_criteria=("criterion-1",), actions_since_goal_progress=3,
+        active_trigger_codes=("goal_drift",), host_action_index=1,
+    ))
+
+    assert weak.state.cognitive_mode == "VERIFY"
+    assert weak.state.mode_lease == initial.mode_lease
+    assert not any(item.operation == "set_mode" for item in weak.directives)
+
+    interrupted = controller.decide(FastLoopInput(
+        scope="tenant/app/agent/session/task/attempt",
+        state=weak.state, csw_snapshot=CSWBehaviorSnapshot(revision=2),
+        objective_criteria=("criterion-1",),
+        active_trigger_codes=("operator_contradiction",), host_action_index=1,
+    ))
+
+    assert interrupted.state.cognitive_mode == "REINSPECT"
+    assert interrupted.state.mode_lease is not None
+    assert interrupted.state.mode_lease.mode == "REINSPECT"
 
 
 def test_unverified_progress_flag_cannot_assign_intervention_credit():
@@ -316,3 +350,32 @@ def test_closing_intervention_cannot_restore_focus_over_host_attention_lease():
                         if item.target == "focus_criteria"]
     assert not focus_directives
     assert cleared.state.focus_criteria == ("criterion-visual",)
+
+
+def test_1000_intervention_soak_keeps_history_and_hot_path_bounded():
+    controller = BehavioralController(intervention_expiry_actions=1)
+    state = BehaviorState()
+    elapsed = []
+    saw_outcome = False
+    for index in range(1000):
+        started = time.perf_counter()
+        decision = controller.decide(FastLoopInput(
+            scope="tenant/app/agent/session/task/attempt",
+            state=state,
+            csw_snapshot=CSWBehaviorSnapshot(revision=index),
+            objective_criteria=("criterion-1",),
+            equivalent_retry_count=2 if index % 2 == 0 else 0,
+            action_completed=True,
+            host_action_index=index,
+        ))
+        elapsed.append(time.perf_counter() - started)
+        state = decision.state
+        saw_outcome = saw_outcome or bool(state.intervention_history)
+        assert len(state.active_interventions) <= 16
+        assert len(state.intervention_history) <= 32
+        assert len(state.attention_last_seen) <= 256
+
+    elapsed.sort()
+    assert saw_outcome
+    assert elapsed[-1] < 1.0
+    assert elapsed[949] < 0.2

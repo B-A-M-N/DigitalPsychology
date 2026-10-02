@@ -4,7 +4,7 @@ import hashlib
 
 from lib.control.service import ControlPlaneService
 from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
-                                GoalItemSnapshot, GoalSetSnapshot)
+                                GoalItemSnapshot, GoalSetSnapshot, StateWorkOption)
 from lib.control_protocol import ControlSessionDescriptor, ControlTickRequest
 from lib.control.system_one import create_system_one_frame_factory
 from lib.runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
@@ -152,6 +152,76 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
     assert restored_request.observation.candidate_action == candidate
 
 
+def test_system_one_frame_uses_host_deliverable_and_truthful_optional_counters():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-task-kind", task_id="task-task-kind",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0",
+        agent_id="codex", behavioral_subject="task-task-kind")
+    service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
+    try:
+        frame = create_system_one_frame_factory(service)(
+            identity, "Deploy the service", ("criterion-1",), BehaviorState(),
+            RuntimeObservation(
+                action_index=2, evidence_refs=("host-evidence-2",),
+                actions_since_artifact_change=5,
+                verification_actions_since_artifact_change=2),
+            CSWBehaviorSnapshot(revision=0), (),
+            {"task_kind": "deployment"},
+        )
+    finally:
+        service.close()
+
+    assert frame.state.task["deliverable_kind"] == "infrastructure"
+    assert frame.state.situation["actions_since_artifact_change"] == 5
+    assert frame.state.situation["verification_actions_since_artifact_change"] == 2
+
+
+def test_unbound_diagnostic_candidate_remains_unknown_and_semantic_criteria_prioritize_starvation():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-unbound-action", task_id="task-unbound-action",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0",
+        agent_id="codex", behavioral_subject="task-unbound-action")
+    goals = GoalSetSnapshot(4, tuple(
+        GoalItemSnapshot(
+            f"criterion-{index:02d}",
+            status="BLOCKED" if index == 20 else "READY",
+        ) for index in range(1, 21)))
+    candidate = ActionCandidate(
+        action_id="diagnostic-read", action_class="read",
+        tool_name="read_file", operation="inspect",
+        proposed_purpose="Inspect the current failure evidence",
+        affected_criterion_ids=(), relation_certainty="unknown",
+        mutating=False, reversible=True)
+    seen = {f"criterion-{index:02d}": 4 for index in range(1, 19)}
+    seen.update({"criterion-19": 0, "criterion-20": 0})
+    service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
+    try:
+        frame = create_system_one_frame_factory(service)(
+            identity, "Repair the service", ("criterion-01", "criterion-02", "criterion-03"),
+            BehaviorState(attention_last_seen=seen),
+            RuntimeObservation(action_index=10, action_completed=False,
+                              goal_set=goals, candidate_action=candidate),
+            CSWBehaviorSnapshot(revision=0), (),
+            {"deliverable_kind": "code_change"},
+        )
+    finally:
+        service.close()
+
+    assert frame.state.task["deliverable_kind"] == "code_behavior"
+    assert frame.state.candidate.affected_criterion_ids == ()
+    assert frame.state.candidate.relation_certainty == "unknown"
+    semantic_ids = {item.criterion_id for item in frame.state.criteria}
+    assert "criterion-19" in semantic_ids
+    assert "criterion-20" in semantic_ids
+    assert "criterion-08" not in semantic_ids
+
+
 def test_frame_factory_does_not_substitute_an_unplanned_enabled_question():
     identity = RuntimeIdentity(
         namespace_id="tenant-a", application_id="codex",
@@ -181,6 +251,46 @@ def test_frame_factory_does_not_substitute_an_unplanned_enabled_question():
         service.close()
 
     assert frame is None
+
+
+def test_laya_statework_fit_contains_only_bounded_csw_eligible_choices():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-statework-fit", task_id="task-statework-fit",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0",
+        agent_id="codex", behavioral_subject="task-statework-fit")
+    csw = CSWBehaviorSnapshot(
+        revision=3,
+        eligible_stateworks=(
+            StateWorkOption("diagnose-flow", domain="coding",
+                            behavior_tags=("diagnose",),
+                            purpose="Inspect evidence and isolate the failure."),
+            StateWorkOption("repair-flow", domain="coding",
+                            behavior_tags=("diagnose",),
+                            purpose="Apply a bounded repair after diagnosis."),
+            StateWorkOption("active-flow", domain="coding",
+                            behavior_tags=("diagnose",),
+                            purpose="Already active and cannot be selected again."),
+        ),
+        active_stateworks=("active-flow",),
+    )
+    service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
+    try:
+        frame = create_system_one_frame_factory(service)(
+            identity, "Repair the requested behavior", ("criterion-1",),
+            BehaviorState(cognitive_mode="DIAGNOSE"),
+            RuntimeObservation(action_index=1), csw, ())
+    finally:
+        service.close()
+
+    assert frame.question_ids == ("route_preference",)
+    choices = dict(frame.questions[0].criteria)
+    assert set(choices) == {"diagnose-flow", "repair-flow"}
+    assert "Inspect evidence" in choices["diagnose-flow"]
+    assert "Already active" not in " ".join(choices.values())
+    assert set(frame.state.legal_routes) == set(choices)
 
 
 def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_path):

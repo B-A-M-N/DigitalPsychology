@@ -1173,6 +1173,29 @@ class SQLiteSink:
                 time.sleep(delay * (0.5 + random.SystemRandom().random()))
                 attempt += 1
 
+    def load_authenticated_events(self, event_ids: Iterable[Any], *,
+                                  namespace_id: str,
+                                  application_instance_id: str) -> List["Event"]:
+        """Load events only when their complete immutable origin is authenticated."""
+        if not isinstance(namespace_id, str) or not namespace_id:
+            raise ValueError("experiment event origin requires namespace_id")
+        if not isinstance(application_instance_id, str) or not application_instance_id:
+            raise ValueError("experiment event origin requires application_instance_id")
+        loaded = []
+        for event_id in event_ids:
+            row = self._conn.execute(
+                "SELECT e.payload FROM events e JOIN authenticated_events a "
+                "ON a.namespace_id=e.namespace_id AND a.application_instance_id=e.application_instance_id AND a.event_id=e.event_id "
+                "WHERE e.namespace_id = ? AND e.application_instance_id = ? AND e.event_id = ?",
+                (namespace_id, application_instance_id, str(event_id)),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    "experiment references an event not present in authenticated store: "
+                    f"{namespace_id}|{application_instance_id}|{event_id!r}")
+            loaded.append(EventFactory.from_dict(json.loads(row[0])))
+        return loaded
+
     def close(self) -> None:
         self._conn.close()
 

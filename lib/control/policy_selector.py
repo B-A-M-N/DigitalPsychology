@@ -10,12 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
-from math import sqrt
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 from ..behavior_state import (BEHAVIOR_MODES, FRAMEWORK_MODES, BehaviorState,
-                              CSWBehaviorSnapshot, GoalSetSnapshot)
+                              AttentionLease, CSWBehaviorSnapshot, GoalSetSnapshot)
+from ..attention import projected_starvation_risk
 from ..routing_profiles import RoutingProfileError, condition_matches, validate_profile
 
 
@@ -32,6 +32,75 @@ _CONTROL_NAMES = tuple(_CONTROL_VALUES)
 _MAX_CANDIDATES = 8
 _MAX_PRIORS = 64
 _VALIDATED_PRIOR_SEAL = object()
+
+
+@dataclass(frozen=True)
+class CandidateEvidence:
+    """Evidence about a policy, keeping missing measurements explicitly unknown."""
+
+    correct_progress_estimate: float | None = None
+    regression_estimate: float | None = None
+    repeated_failure_estimate: float | None = None
+    sample_count: int = 0
+    holdout_count: int = 0
+    evidence_class: str = "unknown"
+    confidence_interval: tuple[float, float] | None = None
+    regression_confidence_interval: tuple[float, float] | None = None
+    repeated_failure_confidence_interval: tuple[float, float] | None = None
+
+    def __post_init__(self) -> None:
+        if self.evidence_class not in {
+                "deterministic_rule", "validated_experiment", "semantic_support", "unknown"}:
+            raise ValueError("unsupported candidate evidence class")
+        for name in ("correct_progress_estimate", "regression_estimate",
+                     "repeated_failure_estimate"):
+            value = getattr(self, name)
+            if value is not None and (type(value) not in (int, float)
+                                      or not 0.0 <= float(value) <= 1.0):
+                raise ValueError(f"{name} must be a probability estimate or unknown")
+        for name in ("confidence_interval", "regression_confidence_interval",
+                     "repeated_failure_confidence_interval"):
+            value = getattr(self, name)
+            if value is not None:
+                interval = tuple(value)
+                if (len(interval) != 2
+                        or any(type(item) not in (int, float)
+                               or not 0.0 <= float(item) <= 1.0 for item in interval)
+                        or interval[0] > interval[1]):
+                    raise ValueError(f"{name} must be an ordered probability interval")
+                object.__setattr__(self, name, (float(interval[0]), float(interval[1])))
+        if (type(self.sample_count) is not int or self.sample_count < 0
+                or type(self.holdout_count) is not int or self.holdout_count < 0):
+            raise ValueError("candidate evidence counts must be non-negative integers")
+        if self.evidence_class == "validated_experiment":
+            if (self.correct_progress_estimate is None or self.regression_estimate is None
+                    or self.repeated_failure_estimate is None or self.sample_count < 1
+                    or self.holdout_count < 1 or self.confidence_interval is None
+                    or self.regression_confidence_interval is None
+                    or self.repeated_failure_confidence_interval is None):
+                raise ValueError("validated experiment evidence must carry explicit rates and intervals")
+        elif any(value is not None for value in (
+                self.correct_progress_estimate, self.regression_estimate,
+                self.repeated_failure_estimate)):
+            raise ValueError("non-experimental evidence cannot claim empirical rates")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "correct_progress_estimate": self.correct_progress_estimate,
+            "regression_estimate": self.regression_estimate,
+            "repeated_failure_estimate": self.repeated_failure_estimate,
+            "sample_count": self.sample_count,
+            "holdout_count": self.holdout_count,
+            "evidence_class": self.evidence_class,
+            "confidence_interval": (list(self.confidence_interval)
+                                    if self.confidence_interval is not None else None),
+            "regression_confidence_interval": (
+                list(self.regression_confidence_interval)
+                if self.regression_confidence_interval is not None else None),
+            "repeated_failure_confidence_interval": (
+                list(self.repeated_failure_confidence_interval)
+                if self.repeated_failure_confidence_interval is not None else None),
+        }
 
 
 def _canonical(value: Any) -> str:
@@ -200,13 +269,17 @@ class BehaviorPolicyPrior:
     subject: Mapping[str, Any]
     condition: Mapping[str, Any]
     sharing_scope: str
-    correct_progress_probability: float
-    regression_probability: float
-    repeated_failure_probability: float | None
-    sample_count: int
-    holdout_count: int
+    evidence: CandidateEvidence
     version: str = POLICY_PRIOR_VERSION
     _seal: object = field(default=None, repr=False, compare=False)
+
+    @property
+    def sample_count(self) -> int:
+        return self.evidence.sample_count
+
+    @property
+    def holdout_count(self) -> int:
+        return self.evidence.holdout_count
 
     def __post_init__(self) -> None:
         if self._seal is not _VALIDATED_PRIOR_SEAL:
@@ -217,17 +290,10 @@ class BehaviorPolicyPrior:
                             ("receipt_id", self.receipt_id), ("experiment_id", self.experiment_id)):
             if not isinstance(value, str) or not value or len(value) > 256:
                 raise ValueError(f"behavior policy prior {name} must be bounded text")
-        for name, value in (("correct-progress probability", self.correct_progress_probability),
-                            ("regression probability", self.regression_probability)):
-            if not 0.0 <= float(value) <= 1.0:
-                raise ValueError(f"behavior policy prior {name} is outside [0, 1]")
-        if (self.repeated_failure_probability is not None
-                and not 0.0 <= float(self.repeated_failure_probability) <= 1.0):
-            raise ValueError("repeated failure probability is outside [0, 1]")
-        if type(self.sample_count) is not int or self.sample_count < 1:
-            raise ValueError("behavior policy prior requires treatment samples")
-        if type(self.holdout_count) is not int or self.holdout_count < 1:
-            raise ValueError("behavior policy prior requires holdout samples")
+        if not isinstance(self.evidence, CandidateEvidence):
+            raise ValueError("behavior policy prior requires validated candidate evidence")
+        if self.evidence.evidence_class != "validated_experiment":
+            raise ValueError("behavior policy prior requires validated experiment evidence")
         object.__setattr__(self, "context", MappingProxyType(dict(self.context)))
         object.__setattr__(self, "subject", MappingProxyType(dict(self.subject)))
         object.__setattr__(self, "condition", MappingProxyType(dict(self.condition)))
@@ -257,18 +323,27 @@ class BehaviorPolicyPrior:
         if (treatment_count < 1 or holdout_count < 1
                 or float(receipt.get("confidence_interval", [0])[0]) < 0):
             return ()
-        regressions = sum(
-            isinstance(row, (tuple, list)) and len(row) == 2
-            and str(row[1]).upper() == "FAIL" for row in holdout_rows)
-        treatment_bad_rate = receipt.get("treatment_bad_rate")
-        if not isinstance(treatment_bad_rate, (int, float)) or not 0 <= treatment_bad_rate <= 1:
+        policy_evidence = receipt.get("candidate_policy_evidence")
+        if not isinstance(policy_evidence, Mapping):
             return ()
-        progress_rate = 1.0 - float(treatment_bad_rate)
-        # Jeffreys smoothing keeps small validated cohorts from becoming
-        # absolute certainty while retaining the receipt's measured rate.
-        progress_probability = (progress_rate * treatment_count + 0.5) / (treatment_count + 1.0)
-        repeat_probability = receipt.get("repeated_failure_probability")
-        if repeat_probability is not None and not 0.0 <= float(repeat_probability) <= 1.0:
+        try:
+            evidence = CandidateEvidence(
+                correct_progress_estimate=float(policy_evidence["correct_progress_rate"]),
+                regression_estimate=float(policy_evidence["regression_rate"]),
+                repeated_failure_estimate=float(policy_evidence["repeated_failure_rate"]),
+                sample_count=int(policy_evidence["sample_count"]),
+                holdout_count=int(policy_evidence["holdout_count"]),
+                evidence_class="validated_experiment",
+                confidence_interval=tuple(policy_evidence["confidence_interval"]),
+                regression_confidence_interval=tuple(
+                    policy_evidence["regression_confidence_interval"]),
+                repeated_failure_confidence_interval=tuple(
+                    policy_evidence["repeated_failure_confidence_interval"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return ()
+        if (evidence.sample_count != treatment_count
+                or evidence.holdout_count != holdout_count):
             return ()
 
         priors = []
@@ -295,11 +370,7 @@ class BehaviorPolicyPrior:
                     subject=dict(profile.get("subject") or {}),
                     condition=dict(adjustment.get("condition") or {}),
                     sharing_scope=str(profile.get("sharing_scope") or "agent_private"),
-                    correct_progress_probability=progress_probability,
-                    regression_probability=regressions / holdout_count,
-                    repeated_failure_probability=(
-                        float(repeat_probability) if repeat_probability is not None else None),
-                    sample_count=treatment_count, holdout_count=holdout_count,
+                    evidence=evidence,
                     _seal=_VALIDATED_PRIOR_SEAL,
                 )
             except (KeyError, TypeError, ValueError):
@@ -350,11 +421,7 @@ class BehaviorPolicyPrior:
             "subject": dict(self.subject),
             "condition": dict(self.condition),
             "sharing_scope": self.sharing_scope,
-            "correct_progress_probability": self.correct_progress_probability,
-            "regression_probability": self.regression_probability,
-            "repeated_failure_probability": self.repeated_failure_probability,
-            "sample_count": self.sample_count,
-            "holdout_count": self.holdout_count,
+            "evidence": self.evidence.to_dict(),
         }
 
 
@@ -417,35 +484,131 @@ class BehaviorConstraintResolver:
 
 
 @dataclass(frozen=True)
+class SemanticCandidateEvidence:
+    """Advisory semantic support for one already-legal candidate."""
+
+    candidate_id: str
+    goal_alignment_support: float | None = None
+    retry_risk: float | None = None
+    drift_risk: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_id, str) or not self.candidate_id:
+            raise ValueError("semantic candidate evidence requires a candidate ID")
+        for name in ("goal_alignment_support", "retry_risk", "drift_risk"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, (int, float))
+                                      or not 0.0 <= float(value) <= 1.0):
+                raise ValueError(f"semantic {name} must be between zero and one")
+
+    @property
+    def support_score(self) -> float | None:
+        values = []
+        if self.goal_alignment_support is not None:
+            values.append(float(self.goal_alignment_support))
+        if self.retry_risk is not None:
+            values.append(1.0 - float(self.retry_risk))
+        if self.drift_risk is not None:
+            values.append(1.0 - float(self.drift_risk))
+        return sum(values) / len(values) if values else None
+
+
+@dataclass(frozen=True)
 class CandidateScore:
     candidate_id: str
-    correct_progress_probability: float
-    regression_probability: float
-    repeated_failure_probability: float
-    starvation_probability: float
+    evidence: CandidateEvidence
+    decision_support: float
+    semantic_support: float | None
+    starvation_risk: float | None
     estimated_cost: float
-    evidence_source: str
+
+    @property
+    def evidence_source(self) -> str:
+        return self.evidence.evidence_class
+
+    @property
+    def evidence_class(self) -> str:
+        return self.evidence.evidence_class
+
+    @property
+    def correct_progress_lower_bound(self) -> float | None:
+        return (self.evidence.confidence_interval[0]
+                if self.evidence.confidence_interval is not None else None)
+
+    @property
+    def regression_upper_bound(self) -> float | None:
+        return (self.evidence.regression_confidence_interval[1]
+                if self.evidence.regression_confidence_interval is not None else None)
 
 
 @dataclass(frozen=True)
 class PolicySelection:
-    candidate: BehaviorCandidate
-    score: CandidateScore
+    candidate: BehaviorCandidate | None
+    score: CandidateScore | None
+    disposition: str = "selected"
     rejected: Mapping[str, str] = field(default_factory=dict)
+    ambiguity_margin: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.disposition not in {
+                "selected", "abstain_insufficient_evidence", "abstain_ambiguous"}:
+            raise ValueError("unsupported policy selection disposition")
+        if (self.disposition == "selected") != (self.candidate is not None
+                                                   and self.score is not None):
+            raise ValueError("selected policy disposition must carry one candidate and score")
+        if self.disposition != "selected" and (self.candidate is not None or self.score is not None):
+            raise ValueError("abstained policy selection cannot fabricate a candidate or score")
+        if not 0.0 <= float(self.ambiguity_margin) <= 1.0:
+            raise ValueError("policy ambiguity margin must be between zero and one")
+
+    @property
+    def abstained(self) -> bool:
+        return self.disposition != "selected"
+
+    @property
+    def abstention_reason(self) -> str | None:
+        return None if self.disposition == "selected" else self.disposition
 
 
 class BehaviorPolicySelector:
-    """Lexicographic policy selection with deterministic fallback tie breaks."""
+    """Select legal policies conservatively and abstain on weak learned evidence.
 
-    def __init__(self, resolver: BehaviorConstraintResolver | None = None) -> None:
+    Deterministic controller rules remain the fallback when there is no matched
+    promoted evidence. A learned policy must clear a conservative confidence
+    bound before it can displace the current policy.
+    """
+
+    def __init__(self, resolver: BehaviorConstraintResolver | None = None, *,
+                 minimum_supported_progress_probability: float = 0.60,
+                 maximum_supported_regression_probability: float = 0.20,
+                 minimum_candidate_margin: float = 0.10) -> None:
+        for name, value in (
+                ("minimum supported progress probability",
+                 minimum_supported_progress_probability),
+                ("maximum supported regression probability",
+                 maximum_supported_regression_probability),
+                ("minimum candidate margin", minimum_candidate_margin)):
+            if not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be between zero and one")
         self.resolver = resolver or BehaviorConstraintResolver()
+        self.minimum_supported_progress_probability = float(
+            minimum_supported_progress_probability)
+        self.maximum_supported_regression_probability = float(
+            maximum_supported_regression_probability)
+        self.minimum_candidate_margin = float(minimum_candidate_margin)
 
     def select(self, candidates: Iterable[BehaviorCandidate], *,
                constraints: BehaviorPolicyConstraints,
                csw_snapshot: CSWBehaviorSnapshot,
                goal_set: GoalSetSnapshot | None,
                policy_context: Mapping[str, Any],
-               priors: Iterable[BehaviorPolicyPrior] = ()) -> PolicySelection:
+               priors: Iterable[BehaviorPolicyPrior] = (),
+               semantic_evidence: Mapping[str, SemanticCandidateEvidence] | None = None,
+               rule_support: Mapping[str, float] | None = None,
+               attention_lease: AttentionLease | None = None,
+               attention_last_seen: Mapping[str, int] | None = None,
+               current_action_index: int | None = None,
+               ) -> PolicySelection:
         values = tuple(candidates)
         prior_values = tuple(priors)
         if not 1 <= len(values) <= _MAX_CANDIDATES:
@@ -457,7 +620,24 @@ class BehaviorPolicySelector:
         matching = [item for item in prior_values if item.matches(policy_context)]
         legal: list[tuple[BehaviorCandidate, CandidateScore]] = []
         rejected: dict[str, str] = {}
-        runnable = tuple(goal_set.runnable_items) if goal_set is not None else ()
+        semantic_by_id = dict(semantic_evidence or {})
+        rule_support_by_id = dict(rule_support or {})
+        attention_history = dict(attention_last_seen or {})
+        if (attention_lease is None) != (current_action_index is None):
+            raise ValueError("starvation scoring requires both a lease and action index")
+        if current_action_index is not None and (
+                type(current_action_index) is not int or current_action_index < 0):
+            raise ValueError("starvation scoring action index is invalid")
+        if goal_set is None and attention_lease is not None:
+            raise ValueError("starvation scoring requires a host goal set")
+        if (len(semantic_by_id) > _MAX_CANDIDATES
+                or any(key != item.candidate_id
+                       for key, item in semantic_by_id.items())
+                or len(rule_support_by_id) > _MAX_CANDIDATES
+                or any(not isinstance(value, (int, float))
+                       or not 0.0 <= float(value) <= 1.0
+                       for value in rule_support_by_id.values())):
+            raise ValueError("semantic evidence must be keyed by bounded candidate IDs")
         for candidate in values:
             reason = self.resolver.reject_reason(candidate, constraints, csw_snapshot)
             if reason:
@@ -470,43 +650,126 @@ class BehaviorPolicySelector:
             prior = max(applicable, key=lambda item: (
                 len(item.subject) + len(item.context), item.sample_count,
                 item.profile_id), default=None)
-            correct_probability = (prior.correct_progress_probability if prior else 0.5)
-            regression_probability = (prior.regression_probability if prior else 0.5)
-            repeated_probability = (
-                prior.repeated_failure_probability
-                if prior and prior.repeated_failure_probability is not None
-                else 0.5)
-            focus = set(candidate.focus_criteria)
-            starvation_probability = (
-                sum(1 for item in runnable if item.criterion_id not in focus) / len(runnable)
-                if runnable else 0.0)
+            semantic = semantic_by_id.get(candidate.candidate_id)
+            evidence = (prior.evidence if prior is not None else
+                        CandidateEvidence(
+                            evidence_class=("deterministic_rule"
+                                            if "deterministic_rule" in candidate.reason_codes
+                                            else "semantic_support" if semantic is not None
+                                            else "unknown")))
+            progress_lower_bound = evidence.confidence_interval[0] \
+                if evidence.confidence_interval is not None else None
+            regression_upper_bound = evidence.regression_confidence_interval[1] \
+                if evidence.regression_confidence_interval is not None else None
+            learned_supported = bool(
+                evidence.evidence_class == "validated_experiment"
+                and progress_lower_bound is not None
+                and regression_upper_bound is not None
+                and progress_lower_bound >= self.minimum_supported_progress_probability
+                and regression_upper_bound <= self.maximum_supported_regression_probability)
+            semantic_support = semantic.support_score if semantic is not None else None
+            if learned_supported:
+                repeat_upper = (evidence.repeated_failure_confidence_interval[1]
+                                if evidence.repeated_failure_confidence_interval else 0.5)
+                empirical_quality = max(0.0, progress_lower_bound
+                                        - 0.5 * regression_upper_bound
+                                        - 0.25 * repeat_upper)
+                decision_support = 0.60 + 0.40 * empirical_quality
+            elif candidate.candidate_id in rule_support_by_id:
+                decision_support = float(rule_support_by_id[candidate.candidate_id])
+                if semantic_support is not None:
+                    # Advisory Laya evidence can raise a candidate's support
+                    # without weakening a stronger deterministic floor.
+                    decision_support = max(
+                        decision_support, 0.35 + 0.40 * semantic_support)
+            elif "deterministic_rule" in candidate.reason_codes:
+                decision_support = 0.82
+            elif semantic_support is not None:
+                # Semantic evidence is advisory and cannot become a hard gate.
+                decision_support = 0.35 + 0.40 * semantic_support
+            elif "continue_current" in candidate.reason_codes:
+                decision_support = 0.40
+            else:
+                decision_support = 0.25
             estimated_cost = self._estimated_cost(candidate)
-            source = (f"validated_receipt:{prior.receipt_id}" if prior
-                      else "deterministic_controller_fallback")
+            starvation_risk = (
+                projected_starvation_risk(
+                    goal_set,
+                    candidate_focus=candidate.focus_criteria,
+                    last_seen=attention_history,
+                    action_index=current_action_index,
+                    lease_actions=attention_lease.max_actions,
+                )
+                if attention_lease is not None and current_action_index is not None
+                else None)
             legal.append((candidate, CandidateScore(
                 candidate_id=candidate.candidate_id,
-                correct_progress_probability=correct_probability,
-                regression_probability=regression_probability,
-                repeated_failure_probability=repeated_probability,
-                starvation_probability=starvation_probability,
+                evidence=evidence,
+                decision_support=decision_support,
+                semantic_support=semantic_support,
+                starvation_risk=starvation_risk,
                 estimated_cost=estimated_cost,
-                evidence_source=source)))
+            )))
         if not legal:
             raise ValueError("all behavior candidates violate host, CFW, CSW, or goal constraints")
 
-        def rule_rank(candidate: BehaviorCandidate) -> int:
-            return 1 if "deterministic_rule" in candidate.reason_codes else 0
-
-        selected, score = max(legal, key=lambda pair: (
-            pair[1].correct_progress_probability,
-            -pair[1].regression_probability,
-            -pair[1].repeated_failure_probability,
-            -pair[1].starvation_probability,
+        ranked = sorted(legal, key=lambda pair: (
+            pair[1].decision_support,
+            pair[1].correct_progress_lower_bound
+            if pair[1].correct_progress_lower_bound is not None else -1.0,
+            -(pair[1].regression_upper_bound
+              if pair[1].regression_upper_bound is not None else 1.0),
             -pair[1].estimated_cost,
-            rule_rank(pair[0]),
             pair[0].candidate_id,
-        ))
-        return PolicySelection(selected, score, MappingProxyType(rejected))
+        ), reverse=True)
+        best = ranked[0]
+        runner_up = ranked[1] if len(ranked) > 1 else None
+        margin = (best[1].decision_support - runner_up[1].decision_support
+                  if runner_up is not None else 1.0)
+        if constraints.required_mode is None and runner_up is not None:
+            has_continuation = any(
+                "continue_current" in item[0].reason_codes for item in ranked)
+            has_information_fallback = any(
+                "abstention_fallback" in item[0].reason_codes for item in ranked)
+            has_decision_evidence = any(
+                item[1].evidence.evidence_class in {
+                    "deterministic_rule", "validated_experiment", "semantic_support"}
+                or item[1].semantic_support is not None
+                for item in ranked)
+            if (has_continuation and has_information_fallback
+                    and not has_decision_evidence):
+                return PolicySelection(
+                    None, None, "abstain_insufficient_evidence",
+                    MappingProxyType(rejected), margin)
+            matched_but_unsupported = any(
+                item[1].evidence.evidence_class == "validated_experiment"
+                and not (item[1].correct_progress_lower_bound is not None
+                         and item[1].regression_upper_bound is not None
+                         and item[1].correct_progress_lower_bound
+                         >= self.minimum_supported_progress_probability
+                         and item[1].regression_upper_bound
+                         <= self.maximum_supported_regression_probability)
+                for item in ranked)
+            best_is_supported_experiment = (
+                best[1].evidence.evidence_class == "validated_experiment"
+                and best[1].correct_progress_lower_bound is not None
+                and best[1].regression_upper_bound is not None
+                and best[1].correct_progress_lower_bound
+                >= self.minimum_supported_progress_probability
+                and best[1].regression_upper_bound
+                <= self.maximum_supported_regression_probability)
+            if (matched_but_unsupported and not best_is_supported_experiment
+                    and has_continuation):
+                return PolicySelection(
+                    None, None, "abstain_insufficient_evidence",
+                    MappingProxyType(rejected), margin)
+            if (margin < self.minimum_candidate_margin
+                    and best[1].evidence.evidence_class not in {
+                        "deterministic_rule", "validated_experiment"}):
+                return PolicySelection(
+                    None, None, "abstain_ambiguous", MappingProxyType(rejected), margin)
+        return PolicySelection(best[0], best[1], "selected",
+                               MappingProxyType(rejected), margin)
 
     @staticmethod
     def _estimated_cost(candidate: BehaviorCandidate) -> float:
@@ -522,6 +785,7 @@ class BehaviorPolicySelector:
 
 __all__ = [
     "BehaviorCandidate", "BehaviorConstraintResolver", "BehaviorPolicyConstraints",
-    "BehaviorPolicyPrior", "BehaviorPolicySelector", "CandidateScore",
-    "PolicySelection", "candidate_id_for",
+    "BehaviorPolicyPrior", "BehaviorPolicySelector", "CandidateEvidence",
+    "CandidateScore", "PolicySelection", "SemanticCandidateEvidence",
+    "candidate_id_for",
 ]
