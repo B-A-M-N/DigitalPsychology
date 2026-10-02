@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 from .feedback_loop import Event, EventFactory, EventError, SQLiteSink, trusted_state_root
 from .fast_loop import BehavioralController, FastLoopInput
+from .control.policy_selector import BehaviorPolicyPrior
 from .outcomes import (InterventionEvaluationFrame, InterventionEvaluator,
                        InterventionEventContext, OutcomeEvidenceAuthority)
 from .behavior_state import BehaviorIntervention, BehaviorDirective, InterventionOutcome
@@ -47,6 +48,8 @@ class DigitalPsychologyService:
         self.event_db = event_db or Path(
             os.environ.get("DIGITALPSYCHOLOGY_EVENT_DB", root / "events.sqlite3"))
         self.profile_path = profile_path
+        self._policy_prior_cache_key: tuple[int, int, int, int, int] | None = None
+        self._policy_prior_cache: tuple[BehaviorPolicyPrior, ...] = ()
         self._trusted_producers = {str(k): dict(v) for k, v in (trusted_producers or {}).items()}
         # Legacy single-host key remains supported only when no producer map
         # exists. Configured producers use distinct per-key secrets.
@@ -121,8 +124,45 @@ class DigitalPsychologyService:
         # requested question set advisory-ready.
         if hasattr(judgment, "status"):
             judgment = judgment.judgment if judgment.status == "ok" else None
-        decision = self._behavioral_controller.decide(context, judgment=judgment)
+        priors = self.control_behavior_policy_priors(context.policy_context)
+        decision = self._behavioral_controller.decide(
+            context, judgment=judgment, policy_priors=priors)
         return decision.to_dict()
+
+    def control_behavior_policy_priors(
+            self, policy_context: Mapping[str, Any]
+            ) -> tuple[BehaviorPolicyPrior, ...]:
+        """Read only exact-scope priors carried by active validated profiles.
+
+        Missing, stale, malformed, or not-yet-promoted profiles produce no
+        prior, leaving the deterministic fast-loop controller in force.
+        """
+        if not policy_context:
+            return ()
+        path = self.profile_path or (trusted_state_root() / "active-routing-profile.json")
+        try:
+            info = path.lstat()
+            cache_key = (info.st_ino, info.st_size, info.st_mtime_ns,
+                         info.st_mode, info.st_uid)
+        except OSError:
+            return ()
+        if cache_key == self._policy_prior_cache_key:
+            return tuple(item for item in self._policy_prior_cache
+                         if item.matches(policy_context))
+        try:
+            profiles, _profile_hash = self._load_profiles()
+        except (RoutingProfileError, OSError, TypeError, ValueError):
+            self._policy_prior_cache_key = cache_key
+            self._policy_prior_cache = ()
+            return ()
+        priors = []
+        for profile in profiles:
+            priors.extend(BehaviorPolicyPrior.from_promoted_profile(
+                profile, sharing_authority=self._sharing_authority))
+        self._policy_prior_cache_key = cache_key
+        self._policy_prior_cache = tuple(priors[:64])
+        return tuple(item for item in self._policy_prior_cache
+                     if item.matches(policy_context))
 
     def assess_intervention_outcome(
             self, intervention: BehaviorIntervention,
@@ -472,7 +512,12 @@ class DigitalPsychologyService:
                     continue
                 if key not in allowed and ("*", key[1]) not in allowed:
                     continue
-                adjustments.append({**adjustment, "profile_id": raw.get("profile_id"),
+                # Executive behavior priors remain inside DP. CFW only sees
+                # bounded route advice for choices it already owns.
+                route_adjustment = {key: value for key, value in adjustment.items()
+                                    if key != "behavior_policy"}
+                adjustments.append({**route_adjustment,
+                                    "profile_id": raw.get("profile_id"),
                                     "profile_hash": raw.get("profile_hash")})
                 sources.append(str(raw.get("profile_id") or raw.get("profile_hash")))
         body = {
@@ -507,6 +552,7 @@ class DigitalPsychologyService:
             "deployment_exposures": report.deployment_exposures,
             "observations_completed": report.observations_completed,
             "intervention_effectiveness": report.intervention_effectiveness,
+            "behavior_policy_priors": report.behavior_policy_priors,
             "regressions": report.regressions,
             "rejection_reasons": report.rejection_reasons,
             "events": report.events,

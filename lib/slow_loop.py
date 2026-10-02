@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from .routing_lifecycle import RoutingLifecycleStore
+from .control.policy_selector import BehaviorPolicyPrior
 from .routing_profiles import (BehavioralRoutingProfile, RoutingProfileError,
                                SharingDecisionAuthority, build_routing_pack,
                                derive_profiles, promote_profile, validate_profile)
@@ -27,6 +28,7 @@ class SlowLoopReport:
     intervention_effectiveness: list[dict[str, Any]] = field(default_factory=list)
     intervention_credit_assignments: list[dict[str, Any]] = field(default_factory=list)
     intervention_strategy_observations: list[dict[str, Any]] = field(default_factory=list)
+    behavior_policy_priors: list[dict[str, Any]] = field(default_factory=list)
     regressions: list[dict[str, Any]] = field(default_factory=list)
     rejection_reasons: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -64,6 +66,7 @@ class BoundedLearningController:
         regressions: list[dict[str, Any]] = []
         rejection_reasons: list[dict[str, Any]] = []
         feedback_events: list[dict[str, Any]] = []
+        behavior_policy_priors: list[dict[str, Any]] = []
         feedback_events.extend({"type": "independent_intervention_outcome", **item}
                                for item in credit_assignments)
         feedback_events.extend({"type": "intervention_strategy_observation", **item}
@@ -108,6 +111,10 @@ class BoundedLearningController:
                 # Publish deployment without counting it as a trajectory.
                 active = self.lifecycle.deploy(active, reason="validated experiment receipt")
                 promoted.append(str(active["profile_hash"]))
+                behavior_policy_priors.extend(
+                    prior.to_dict()
+                    for prior in BehaviorPolicyPrior.from_promoted_profile(
+                        active, sharing_authority=self.sharing_authority))
                 feedback_events.append({
                     "type": "deployment_published",
                     "profile_id": profile_id,
@@ -139,6 +146,7 @@ class BoundedLearningController:
             intervention_effectiveness=effectiveness, regressions=regressions,
             intervention_credit_assignments=credit_assignments,
             intervention_strategy_observations=strategy_observations,
+            behavior_policy_priors=behavior_policy_priors,
             rejection_reasons=rejection_reasons, events=feedback_events)
 
 

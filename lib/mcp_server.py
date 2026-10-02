@@ -6,6 +6,8 @@ The controlled agent must not receive this operator interface or the private
 """
 from __future__ import annotations
 
+import os
+
 from .service import DigitalPsychologyService, _canonical
 from .transport.admin_mcp import create_admin_server
 
@@ -16,6 +18,14 @@ def create_server(service: DigitalPsychologyService | None = None):
 
 
 def main() -> None:
+    if os.environ.get("DIGITALPSYCHOLOGY_ENABLE_LEGACY_MCP") != "1":
+        raise SystemExit(
+            "digital-psychology-mcp is disabled by default; use "
+            "digital-psychology-admin-mcp in an operator-only namespace or "
+            "let HostControlBridge launch the private control MCP. Set "
+            "DIGITALPSYCHOLOGY_ENABLE_LEGACY_MCP=1 only for an intentional "
+            "legacy admin-MCP deployment."
+        )
     service = DigitalPsychologyService()
     server = create_admin_server(service)
     try:

@@ -26,7 +26,7 @@ Implemented capabilities include:
 - **A bounded slow-loop controller** that derives candidates, validates receipts, promotes bounded profiles, observes lifecycle transitions, and records rejection reasons.
 - **Authoritative lifecycle state** with explicit rollback/rejection transitions, durable deployment revisions, and known-good previous profiles.
 - **Versioned advice-exchange contracts** so the host can record trusted context, eligible choices, requested adjustments, and the final effective routing decision.
-- **A deterministic fast-loop controller** that emits typed `BehavioralDecision`, `BehaviorDirective`, and `BehaviorState` values from bounded CFW/CSW/runtime inputs.
+- **A bounded fast-loop policy selector** that filters candidate behavior against host, CFW, CSW, and goal constraints, then compares validated receipt evidence with the deterministic controller's recommendation. Without an exact-scope promoted prior, the deterministic rule remains the fallback.
 - **Condition-scoped intervention history** bound to target criteria, goal-set revision, workflow state, host evidence, and approach epoch. A failed intervention cannot suppress recovery after the host reports a new hypothesis or materially changed state.
 - **Derived attention fairness** with a round-robin bound based on the current runnable criterion count and bounded lease size. The 258-action ceiling applies only to a full 256-item task set.
 - **An independent intervention outcome evaluator** that accepts only scoped, post-intervention host/CSW/validator evidence and an exact applied-directive receipt. It distinguishes supported progress, regression, confounding, missing evidence, and expired windows; agent success claims are not evidence.
@@ -58,7 +58,8 @@ protocol messages on stdin. Keep stdout reserved for MCP traffic. It exposes
 DP's telemetry, advice, profile-validation, and slow-loop administration
 tools. Register it only in a trusted operator namespace, never in the
 controlled agent's model-visible tool list. The old
-`digital-psychology-mcp` command remains a compatibility alias. The private
+`digital-psychology-mcp` command fails closed unless
+`DIGITALPSYCHOLOGY_ENABLE_LEGACY_MCP=1` is explicitly set. The private
 `digital-psychology-control-mcp` process is launched by `HostControlBridge`
 over a separate host-only connection.
 
@@ -148,17 +149,41 @@ service with `SystemOneService.from_environment()`:
 DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER=laya-native
 DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE=shadow
 DIGITALPSYCHOLOGY_LAYA_MODEL_PATH=/local/path/to/pinned-checkpoint
-DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION=<immutable-upstream-revision>
-DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256=<model-content-digest>
+DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION=1a793eb568e6718f15941d08f85432581df534e3
+DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256=cda55a3e793f4c4268a25066ceb1568aa302fd210d96656e3032756fd722b642
 DIGITALPSYCHOLOGY_LAYA_DEVICE=cpu
 DIGITALPSYCHOLOGY_LAYA_TIMEOUT_MS=30000
 ```
 
-The checkpoint must be downloaded separately and supplied by local path; the
-optional package extra installs the Laya runtime library only. The timeout is
-pinned by the host policy and defaults to 30 seconds for local CPU inference.
-Hosts can choose a shorter deadline for faster devices; a timeout causes one
-provider failure and deterministic fallback.
+The private `control_mcp` entrypoint constructs `SystemOneService` from these
+environment variables automatically. `MCPControlClient` launches that process
+as a separate host-owned child; set the variables in the host process
+environment and use the Python interpreter where `digital-psychology[laya]`
+is installed. Set `DIGITALPSYCHOLOGY_CONTROL_MCP_PYTHON` to that interpreter
+when the host's own Python environment differs. Host MCP calls have a bounded
+60-second deadline to accommodate CPU inference; each Laya inference remains
+bounded to 30 seconds.
+
+The ready-to-run checkpoint is `convaiinnovations/laya-typed-decisions` at
+revision `1a793eb568e6718f15941d08f85432581df534e3`. Download that immutable
+snapshot after installing the optional runtime:
+
+```bash
+python3 -m pip install -e '.[laya]'
+python3 scripts/download_laya_model.py
+```
+
+Set `DIGITALPSYCHOLOGY_LAYA_MODEL_PATH` to the downloaded snapshot directory. The SHA-256 pin
+above covers the checkpoint, encoder configuration, and tokenizer files used
+by the adapter; the checkpoint file itself has SHA-256
+`4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e`. The
+Laya package extra installs the runtime library, while the command downloads
+the model weights and their pinned metadata. Advisory mode requires an active
+calibration bundle; without one, use `shadow` so Laya runs but cannot override
+deterministic DP decisions. Private host control records the typed judgment in
+the durable prepared-tick basis, including in shadow mode; agent-visible tools
+do not expose it. The timeout defaults to 30 seconds for local CPU inference;
+a timeout causes one provider failure and deterministic fallback.
 
 ### Generic loopback HTTP provider
 

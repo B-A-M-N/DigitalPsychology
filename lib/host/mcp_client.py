@@ -5,6 +5,7 @@ import asyncio
 from contextlib import AsyncExitStack
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
@@ -28,10 +29,12 @@ class MCPControlClient:
                  args: Sequence[str] | None = None,
                  env: Mapping[str, str] | None = None,
                  cwd: str | Path | None = None,
-                 timeout_seconds: float = 30.0) -> None:
+                 timeout_seconds: float = 60.0) -> None:
         if not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= 300:
             raise ValueError("MCP control timeout must be between 0 and 300 seconds")
-        self.command = command or sys.executable
+        self.command = (command or
+                        os.environ.get("DIGITALPSYCHOLOGY_CONTROL_MCP_PYTHON") or
+                        sys.executable)
         if args is None:
             if importlib.util.find_spec("digital_psychology") is not None:
                 args = ("-m", "digital_psychology.transport.control_mcp")

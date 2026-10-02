@@ -269,6 +269,21 @@ def test_configured_producers_require_matching_key_and_authorization(tmp_path, m
     assert service.ingest_behavior_event(replay)["accepted"]
     service.close()
 
+def test_legacy_mcp_entrypoint_fails_closed_by_default() -> None:
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env.pop("DIGITALPSYCHOLOGY_ENABLE_LEGACY_MCP", None)
+    result = subprocess.run(
+        [sys.executable, "-c", "from lib.mcp_server import main; main()"],
+        cwd=Path(__file__).resolve().parents[1], env=env,
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "disabled by default" in result.stderr
+
 
 def test_authenticated_marker_is_written_in_same_transaction(tmp_path, monkeypatch):
     from lib.mcp_server import DigitalPsychologyService

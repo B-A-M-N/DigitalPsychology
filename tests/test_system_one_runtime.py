@@ -190,8 +190,10 @@ def test_optional_laya_dependency_is_lazy_and_default_service_does_not_load_it(t
     project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
     assert all(not dependency.lower().startswith("laya")
                for dependency in project["project"]["dependencies"])
-    assert project["project"]["optional-dependencies"]["laya"] == ["laya==0.3.22"]
-    assert project["project"]["optional-dependencies"]["system-one"] == ["laya==0.3.22"]
+    assert project["project"]["optional-dependencies"]["laya"] == [
+        "laya==0.3.22", "huggingface_hub>=0.20"]
+    assert project["project"]["optional-dependencies"]["system-one"] == [
+        "laya==0.3.22", "huggingface_hub>=0.20"]
     assert "laya" not in sys.modules
     service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
     try:

@@ -39,6 +39,22 @@ revision, directives, CSW-eligible StateWork preferences, and independently
 assessed intervention outcomes. DP persists its behavior revision separately
 from the CSW selection and workflow revisions.
 
+The fast loop compares at most two configurations per tick: continuation of
+the current configuration and the one bounded change proposed by the existing
+deterministic rules. Host/operator requirements, mandatory WARD, available CFW
+components, CSW eligibility, and goal-contract state filter candidates before
+scoring. A promoted behavior policy can affect the choice only when its exact
+candidate, subject, context, condition, sharing authorization, and passing
+independent experiment receipt match. If no such prior applies, the existing
+deterministic recommendation is used. Laya may improve semantic observations;
+it does not select or authorize behavior policies.
+
+On the private MCP path, each configured System-1 result is captured in the
+durable prepared-tick basis with its status, model identity, and typed answers.
+This records shadow predictions for later independent review while ensuring
+uncalibrated answers cannot affect the decision. The controlled agent does not
+receive this host-only audit basis.
+
 The DP state revision, applied-directive receipts, and pending intervention
 events commit together in the local SQLite state store. Event delivery uses
 stable IDs and is acknowledged only after the event sink accepts the same

@@ -31,6 +31,16 @@ class SystemOneResult:
     def calibrated(self) -> bool:
         return bool(self.calibrated_question_ids)
 
+    def to_dict(self) -> dict[str, object]:
+        """Serialize a bounded provider observation for the trusted host audit."""
+        return {
+            "status": self.status,
+            "calibrated_question_ids": list(self.calibrated_question_ids),
+            "cache_hit": self.cache_hit,
+            "reason": self.reason,
+            "judgment": self.judgment.to_dict() if self.judgment is not None else None,
+        }
+
 
 class CircuitBreaker:
     """Provider-health breaker. Per-request contract errors never open it."""

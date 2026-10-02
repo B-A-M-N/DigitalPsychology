@@ -39,6 +39,8 @@ class _ProvidedOutcomeFacts(OutcomeEvidenceAuthority):
 @dataclass(frozen=True)
 class DecisionPreparation:
     decision: BehavioralDecision
+    system_one_frame: Mapping[str, Any] | None
+    system_one_result: Mapping[str, Any] | None
     attention_last_seen: Mapping[str, int]
     goal_set: GoalSetSnapshot
     fairness_bound_actions: int
@@ -83,6 +85,8 @@ class ControlDecisionEngine:
             raise ValueError("control ticks require a completed host action boundary")
 
         judgment = None
+        system_one_frame = None
+        system_one_result = None
         if self.system_one_frame_factory is not None:
             frame = self.system_one_frame_factory(
                 identity, descriptor.objective,
@@ -93,10 +97,15 @@ class ControlDecisionEngine:
                 raise TypeError("System-1 frame factory must return a validated frame")
             if frame.identity.to_dict() != self._system_one_identity(identity).to_dict():
                 raise ValueError("System-1 frame identity escapes the control session")
+            system_one_frame = frame.canonical_payload()
             judgment_result = self.decision_service.judge(frame)
             if hasattr(judgment_result, "judgment"):
                 # Only calibrated/advisory output may influence executive
-                # selection. Shadow judgments are retained by System-1 logs.
+                # selection. The typed result is retained in the trusted host
+                # transaction basis even when it remains in shadow mode.
+                serialize = getattr(judgment_result, "to_dict", None)
+                if callable(serialize):
+                    system_one_result = serialize()
                 judgment = (judgment_result.judgment
                             if getattr(judgment_result, "status", None) == "ok"
                             else None)
@@ -129,6 +138,10 @@ class ControlDecisionEngine:
             intervention_assessments=tuple(assessments),
             available_frameworks=descriptor.available_frameworks,
             approach_epoch=request.observation.approach_epoch,
+            policy_context={
+                **dict(descriptor.host_capabilities.get("policy_context") or {}),
+                **identity.to_dict(),
+            },
         )
         decision = self._parse_decision(
             self.decision_service.decide_behavior(input_value, judgment=judgment))
@@ -140,7 +153,8 @@ class ControlDecisionEngine:
             raise RuntimeError("DP controller did not apply the host attention lease")
         self._validate_directives(descriptor, request.csw_snapshot, decision)
         return DecisionPreparation(
-            decision, attention.last_seen, goal_set,
+            decision, system_one_frame, system_one_result,
+            attention.last_seen, goal_set,
             fairness_bound_actions=attention.fairness_bound_actions,
             starvation_prevented=attention.starvation_prevented,
         )

@@ -116,6 +116,12 @@ class ControlPlaneService:
             "attention_fairness_bound_actions": preparation.fairness_bound_actions,
             "attention_starvation_prevented": list(preparation.starvation_prevented),
         }
+        if preparation.system_one_frame is not None:
+            basis["system_one"] = {
+                "frame": dict(preparation.system_one_frame),
+                "result": (dict(preparation.system_one_result)
+                           if preparation.system_one_result is not None else None),
+            }
         basis_digest = _digest(basis)
         saved = self.state_store.prepare_control_tick(
             scope, tick_id=request.tick_id, request_digest=digest,

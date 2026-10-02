@@ -19,6 +19,10 @@ from .behavior_state import (
     InterventionTarget, StateWorkOption,
 )
 from .condition_identity import identify_condition
+from .control.policy_selector import (
+    BehaviorCandidate, BehaviorPolicyConstraints, BehaviorPolicyPrior,
+    BehaviorPolicySelector,
+)
 
 
 class _Answer(Protocol):
@@ -86,6 +90,7 @@ class FastLoopInput:
     evidence_refs: tuple[str, ...] = ()
     intervention_assessments: tuple[InterventionOutcome, ...] = ()
     approach_epoch: str = ""
+    policy_context: Mapping[str, Any] = field(default_factory=dict)
     available_frameworks: tuple[str, ...] = (
         "owl", "anchor", "fuse", "ward", "flow", "sispis", "dox")
 
@@ -149,6 +154,18 @@ class FastLoopInput:
             raise ValueError("intervention assessments must match the decision scope")
         if not isinstance(self.approach_epoch, str) or len(self.approach_epoch) > 256:
             raise ValueError("approach epoch must be bounded text")
+        policy_context = dict(self.policy_context or {})
+        if len(policy_context) > 32:
+            raise ValueError("policy context exceeds its field bound")
+        try:
+            encoded_policy_context = json.dumps(
+                policy_context, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("policy context must contain JSON values") from exc
+        if len(encoded_policy_context.encode("utf-8")) > 8192:
+            raise ValueError("policy context exceeds its byte bound")
+        object.__setattr__(self, "policy_context", policy_context)
 
 
 class BehavioralController:
@@ -169,6 +186,7 @@ class BehavioralController:
         self.retry_threshold = retry_threshold
         self.semantic_threshold = semantic_threshold
         self.intervention_expiry_actions = intervention_expiry_actions
+        self.policy_selector = BehaviorPolicySelector()
 
     @staticmethod
     def _semantic(judgment: Optional[_Judgment]) -> SemanticAssessment:
@@ -300,7 +318,8 @@ class BehavioralController:
         return tuple(item[1] for item in scored[:4])
 
     def decide(self, context: FastLoopInput, *,
-               judgment: Optional[_Judgment] = None) -> BehavioralDecision:
+               judgment: Optional[_Judgment] = None,
+               policy_priors: tuple[BehaviorPolicyPrior, ...] = ()) -> BehavioralDecision:
         """Return a DP decision. The caller must CAS and constrain its application."""
         original = context.state
         semantic = self._semantic(judgment)
@@ -626,6 +645,71 @@ class BehavioralController:
                 attention_cause,
                 "Give runnable required criteria a bounded, starvation-aware attention window."))
 
+        # The deterministic controller proposes at most one policy change. The
+        # selector compares it with continuation and only lets a validated,
+        # independently evaluated receipt change that fallback choice.
+        proposed = [item for item in proposed
+                    if not item[0].startswith("framework:")
+                    or item[0].split(":", 1)[1].lower() in context.available_frameworks]
+        proposed = [item for item in proposed
+                    if not (item[0] == "framework:ward" and item[1] != "mandatory")]
+        current_preference = self._rank_stateworks(
+            working.cognitive_mode, context.csw_snapshot.eligible_stateworks,
+            context.csw_snapshot.active_stateworks)[:1]
+        continuation = BehaviorCandidate.from_state(
+            working, focus_criteria=next_focus,
+            statework_preferences=current_preference,
+            reason_codes=("continue_current",), cause="continue_current",
+            expected_effect="Continue the current bounded behavior configuration.")
+        candidates_by_id = {continuation.candidate_id: continuation}
+        recommended = None
+        if proposed:
+            candidate_state = working
+            for target, value, _cause, _effect in proposed:
+                candidate_state = self._set_target(candidate_state, target, value)
+            recommended = BehaviorCandidate.from_state(
+                candidate_state, focus_criteria=next_focus,
+                statework_preferences=self._rank_stateworks(
+                    candidate_state.cognitive_mode,
+                    context.csw_snapshot.eligible_stateworks,
+                    context.csw_snapshot.active_stateworks)[:1],
+                reason_codes=("deterministic_rule", *sorted(triggers)),
+                cause=proposed[0][2], expected_effect=proposed[0][3])
+            candidates_by_id[recommended.candidate_id] = recommended
+
+        required_mode = None
+        if contradiction:
+            required_mode = "REINSPECT"
+        elif task_complete:
+            required_mode = "READY_TO_COMPLETE"
+        elif failed_intervention:
+            required_mode = "REPLAN" if runnable_count > 0 else "BLOCKED"
+        elif context.goal_set is not None and runnable_count == 0:
+            required_mode = "BLOCKED"
+        selection = self.policy_selector.select(
+            candidates_by_id.values(),
+            constraints=BehaviorPolicyConstraints(
+                current_state=working,
+                available_frameworks=context.available_frameworks,
+                goal_set=context.goal_set,
+                required_mode=required_mode),
+            csw_snapshot=context.csw_snapshot,
+            goal_set=context.goal_set,
+            policy_context=context.policy_context,
+            priors=policy_priors)
+        selected_candidate = selection.candidate
+        if (recommended is not None
+                and selected_candidate.candidate_id != recommended.candidate_id):
+            # Drop the unselected policy changes while keeping the host-owned
+            # attention lease update. Directive generation below remains the
+            # single path for intervention identity and rollback targets.
+            proposed = [item for item in proposed if item[0] == "focus_criteria"]
+            reason = ("validated behavior evidence favors continuing the current policy"
+                      if selection.score.evidence_source.startswith("validated_receipt:")
+                      else "continue current policy; deterministic recommendation was constrained")
+        elif recommended is not None:
+            reason = reason + f" (selected {selected_candidate.candidate_id})"
+
         existing_condition_ids = ({item.condition_id for item in interventions
                                    if applies_to_attention(item.target_criteria)}
                                   | {current_condition_ids[cause]
@@ -694,10 +778,7 @@ class BehavioralController:
             framework_modes={**dict(working.framework_modes), "ward": "mandatory"},
         )
 
-        ranked = self._rank_stateworks(
-            working.cognitive_mode, context.csw_snapshot.eligible_stateworks,
-            context.csw_snapshot.active_stateworks)
-        preference = ranked[:1]
+        preference = selected_candidate.statework_preferences[:1]
         if preference and not any(
                 any(target.target == f"statework:{preference[0]}" for target in item.targets)
                 for item in working.active_interventions):

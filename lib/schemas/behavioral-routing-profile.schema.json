@@ -368,6 +368,125 @@
           "condition": {
             "type": "object"
           },
+          "behavior_policy": {
+            "type": "object",
+            "required": [
+              "candidate_id",
+              "cognitive_mode",
+              "framework_modes",
+              "controls"
+            ],
+            "properties": {
+              "candidate_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "cognitive_mode": {
+                "enum": [
+                  "DELIVER",
+                  "DIAGNOSE",
+                  "VERIFY",
+                  "RECOVER",
+                  "REPLAN",
+                  "BLOCKED",
+                  "REINSPECT",
+                  "READY_TO_COMPLETE"
+                ]
+              },
+              "framework_modes": {
+                "type": "object",
+                "maxProperties": 16,
+                "propertyNames": {
+                  "enum": ["owl", "anchor", "dox", "fuse", "flow", "ward", "sispis"]
+                },
+                "additionalProperties": {
+                  "enum": [
+                    "off",
+                    "passive",
+                    "normal",
+                    "elevated",
+                    "mandatory",
+                    "constrained",
+                    "reopen",
+                    "recovery",
+                    "reset"
+                  ]
+                }
+              },
+              "controls": {
+                "type": "object",
+                "required": [
+                  "verification_intensity",
+                  "exploration_budget",
+                  "retry_policy",
+                  "recovery_level",
+                  "context_strategy",
+                  "response_strategy"
+                ],
+                "properties": {
+                  "verification_intensity": {
+                    "enum": ["passive", "normal", "high", "strict"]
+                  },
+                  "exploration_budget": {
+                    "enum": ["disabled", "low", "normal", "bounded"]
+                  },
+                  "retry_policy": {
+                    "enum": ["normal", "materially_different_only", "no_retry"]
+                  },
+                  "recovery_level": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3
+                  },
+                  "context_strategy": {
+                    "enum": ["standard", "compact", "criterion_focused"]
+                  },
+                  "response_strategy": {
+                    "enum": ["direct", "detailed", "structured"]
+                  }
+                },
+                "additionalProperties": false
+              },
+              "focus_scope": {
+                "const": "current_attention"
+              },
+              "focus_criteria": {
+                "const": "$current_attention"
+              },
+              "statework_preferences": {
+                "type": "array",
+                "maxItems": 4,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                }
+              },
+              "reason_codes": {
+                "type": "array",
+                "maxItems": 16,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                }
+              },
+              "cause": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "expected_effect": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            },
+            "additionalProperties": false
+          },
           "evidence_refs": {
             "type": "array",
             "items": {
