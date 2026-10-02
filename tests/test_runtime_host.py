@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import json
+from dataclasses import replace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,6 +15,7 @@ from lib.mcp_server import DigitalPsychologyService
 from lib.outcomes import HostOutcomeFact
 from lib.runtime import (BehaviorStateStore, CFWRuntimeAdapter, RuntimeHost,
                          RuntimeIdentity, RuntimeObservation)
+from lib.runtime.adapters import NullCFWComponentPort, NullCSWWorkflowPort
 from lib.protocol_artifact import QUESTION_REGISTRY
 from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionSpec,
                                       SemanticState, SystemOneFrame,
@@ -273,6 +275,53 @@ def test_runtime_host_applies_cfw_controls_and_credits_host_verified_progress(tm
     assert all(candidates in {(), ("repair",)}
                for candidates in csw.requested_candidates)
     assert cfw_port.active_statework_contexts[-1] == ()
+
+
+def test_runtime_host_supports_every_optional_system_combination(tmp_path):
+    for index, (with_cfw, with_csw) in enumerate((
+            (False, False), (True, False), (False, True), (True, True))):
+        service = DigitalPsychologyService(event_db=tmp_path / f"events-{index}.sqlite3")
+        identity = replace(_identity(), task_id=f"task-combo-{index}")
+        raw_cfw = _CFWPort() if with_cfw else None
+        cfw = CFWRuntimeAdapter(raw_cfw) if raw_cfw is not None else None
+        csw = _CSWPort() if with_csw else None
+        evidence = _EvidenceAuthority({})
+        try:
+            host = RuntimeHost(
+                service=service, state_path=tmp_path / f"state-{index}.sqlite3")
+            session = host.open_session(
+                identity=identity, objective="Render the requested page",
+                objective_criteria=("criterion-visual",), cfw=cfw, csw=csw,
+                outcome_evidence_authority=evidence)
+
+            result = session.process_action(RuntimeObservation(
+                action_index=1, equivalent_retry_count=2,
+                criterion_status={"criterion-visual": "unmet"}))
+            context = session.before_model_call(tool_capable=True)
+
+            assert result.state.revision == 1
+            assert isinstance(session.cfw, NullCFWComponentPort) is (not with_cfw)
+            assert isinstance(session.csw, NullCSWWorkflowPort) is (not with_csw)
+            assert result.state.active_stateworks == result.csw_snapshot.active_stateworks
+            if with_csw:
+                assert result.csw_snapshot.active_stateworks == ("repair",)
+            else:
+                assert result.csw_snapshot.active_stateworks == ()
+                assert '"csw":"unavailable"' in context
+            if with_cfw:
+                assert raw_cfw.controls
+                assert '"cfw":"connected"' in context
+            else:
+                assert not any(item.operation == "set_framework"
+                               for item in result.decision.directives)
+                assert '"cfw":"unavailable"' in context
+
+            assert host.open_session(
+                identity=identity, objective="Render the requested page",
+                objective_criteria=("criterion-visual",), cfw=cfw, csw=csw,
+                outcome_evidence_authority=evidence) is session
+        finally:
+            service.close()
 
 
 def test_runtime_host_keeps_twelve_item_task_set_complete_and_rotates_attention(tmp_path):

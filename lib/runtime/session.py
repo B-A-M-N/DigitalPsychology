@@ -17,6 +17,7 @@ from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
 from .contracts import (BehavioralDecisionService, CFWComponentPort,
                         CSWWorkflowPort, RuntimeIdentity, RuntimeObservation,
                         SystemOneFrameFactory)
+from .adapters.standalone import NullCFWComponentPort, NullCSWWorkflowPort
 from .store import BehaviorStateStore, RuntimeStateRecord
 
 
@@ -77,6 +78,7 @@ class RuntimeSession:
         with self._lock:
             self._dispatch_outbox()
             record = self.state_store.load(self.scope)
+            self._ensure_adapter_state_is_reconcilable(record.state)
             if observation.action_index <= record.action_index:
                 raise ValueError("host action index must advance the runtime session")
             unknown = set(observation.criterion_status) - set(self.objective_criteria)
@@ -332,6 +334,7 @@ class RuntimeSession:
                           action_hint: Mapping[str, Any] | None = None) -> str:
         """Ask the CFW component port to inject the committed DP projection."""
         record = self.state_store.load(self.scope)
+        self._ensure_adapter_state_is_reconcilable(record.state)
         snapshot = self._csw_snapshot()
         projection = self.project_behavior_context(record.state, snapshot)
         self.cfw.synchronize_behavior_state(record.state.to_dict())
@@ -342,12 +345,30 @@ class RuntimeSession:
     def before_tool_planning(self, *,
                              action_hint: Mapping[str, Any] | None = None) -> str:
         record = self.state_store.load(self.scope)
+        self._ensure_adapter_state_is_reconcilable(record.state)
         snapshot = self._csw_snapshot()
         projection = self.project_behavior_context(record.state, snapshot)
         self.cfw.synchronize_behavior_state(record.state.to_dict())
         return self.cfw.before_tool_planning(
             projection, action_hint=action_hint,
             active_statework_ids=snapshot.active_stateworks)
+
+    def _ensure_adapter_state_is_reconcilable(self, state: BehaviorState) -> None:
+        statework_lease = any(
+            target.target.startswith("statework:")
+            for intervention in state.active_interventions
+            for target in intervention.targets)
+        component_lease = any(
+            target.target.startswith("framework:")
+            for intervention in state.active_interventions
+            for target in intervention.targets)
+        if isinstance(self.csw, NullCSWWorkflowPort) and (
+                state.active_stateworks or statework_lease):
+            raise RuntimeError(
+                "CSW is required to reconcile previously active StateWork state")
+        if isinstance(self.cfw, NullCFWComponentPort) and component_lease:
+            raise RuntimeError(
+                "CFW is required to reconcile a previously active component intervention")
 
     def _csw_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None
                       ) -> CSWBehaviorSnapshot:
@@ -379,6 +400,15 @@ class RuntimeSession:
                               item.criterion_id))[:1]
         payload = {
             "revision": state.revision,
+            "bound_authorities": {
+                "cfw": ("unavailable" if isinstance(self.cfw, NullCFWComponentPort)
+                        else "connected"),
+                "csw": ("unavailable" if isinstance(self.csw, NullCSWWorkflowPort)
+                        else "connected"),
+                "outcome_evidence": ("unavailable"
+                                     if self.outcome_evidence_authority is None
+                                     else "connected"),
+            },
             "objective": self.objective,
             "task_set_summary": (goal_set.required_counts if goal_set is not None else {
                 "total": 0, "verified": 0, "ready": 0, "blocked": 0,
@@ -390,7 +420,11 @@ class RuntimeSession:
             "next_ready": [item.criterion_id for item in next_ready],
             "oldest_starved": (oldest_starved[0].criterion_id if oldest_starved else None),
             "cognitive_mode": state.cognitive_mode,
-            "framework_modes": dict(state.framework_modes),
+            "framework_modes": ({} if isinstance(self.cfw, NullCFWComponentPort)
+                                else dict(state.framework_modes)),
+            "unapplied_framework_modes": (
+                dict(state.framework_modes)
+                if isinstance(self.cfw, NullCFWComponentPort) else {}),
             "controls": {
                 "verification_intensity": state.verification_intensity,
                 "exploration_budget": state.exploration_budget,
@@ -417,7 +451,8 @@ class RuntimeSession:
             } for item in state.active_interventions],
         }
         return ("===== DIGITAL PSYCHOLOGY BEHAVIOR STATE =====\n"
-                "Host-selected behavioral guidance; CFW/WARD/CSW authority gates remain active.\n"
+                "Host-selected behavioral guidance. Bound authorities and available "
+                "components are listed in the state projection.\n"
                 + json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
     def _goal_set(self, observation: RuntimeObservation) -> GoalSetSnapshot | None:

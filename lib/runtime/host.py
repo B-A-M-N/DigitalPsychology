@@ -10,6 +10,7 @@ from ..feedback_loop import trusted_state_root
 from .contracts import (BehavioralDecisionService, CFWComponentPort,
                         CSWWorkflowPort, RuntimeIdentity,
                         SystemOneFrameFactory)
+from .adapters.standalone import NullCFWComponentPort, NullCSWWorkflowPort
 from .session import RuntimeSession
 from .store import BehaviorStateStore
 
@@ -32,8 +33,8 @@ class RuntimeHost:
 
     def open_session(self, *, identity: RuntimeIdentity,
                      objective_criteria: Sequence[str],
-                     cfw: CFWComponentPort,
-                     csw: CSWWorkflowPort,
+                     cfw: CFWComponentPort | None = None,
+                     csw: CSWWorkflowPort | None = None,
                      outcome_evidence_authority: Any,
                      objective: str = "") -> RuntimeSession:
         with self._lock:
@@ -51,17 +52,22 @@ class RuntimeHost:
                              objective: str) -> RuntimeSession:
         existing = self._sessions.get(identity.scope)
         if existing is not None:
-            if (existing.identity != identity or existing.cfw is not cfw
-                    or existing.csw is not csw
+            same_cfw = (existing.cfw is cfw if cfw is not None else
+                        isinstance(existing.cfw, NullCFWComponentPort))
+            same_csw = (existing.csw is csw if csw is not None else
+                        isinstance(existing.csw, NullCSWWorkflowPort))
+            if (existing.identity != identity or not same_cfw or not same_csw
                     or existing.outcome_evidence_authority is not outcome_evidence_authority
                     or existing.objective_criteria != tuple(objective_criteria)
                     or existing.objective != objective):
                 raise ValueError("runtime scope is already bound to different host adapters")
             self._sessions.move_to_end(identity.scope)
             return existing
+        cfw_port = cfw if cfw is not None else NullCFWComponentPort()
+        csw_port = csw if csw is not None else NullCSWWorkflowPort()
         session = RuntimeSession(
             identity=identity, objective_criteria=objective_criteria,
-            objective=objective, controller=self.service, cfw=cfw, csw=csw,
+            objective=objective, controller=self.service, cfw=cfw_port, csw=csw_port,
             outcome_evidence_authority=outcome_evidence_authority,
             state_store=self.state_store,
             system_one_frame_factory=self.system_one_frame_factory,
