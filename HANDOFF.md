@@ -139,7 +139,37 @@ The first full run scored 0.00 across all 70 trials for exactly this reason
 while showing 5-68s of real latency; that run was discarded, not reported.
 `tests/test_cohort_harness.py` now pins both protocol facts.
 
-### First real cohort run (2026-10-02, 70 trials)
+### Cohort adapter defects found by running real agents
+
+Three separate protocol mismatches made the agent look far worse than it was.
+Each was found by inspecting per-family results rather than the aggregate,
+because the aggregate only showed a uniform zero.
+
+1. **Nested answer object.** The evaluators call `json.loads(response["answer"])`,
+   so `answer` must be a JSON string. Emitting an object scored every correct
+   trial as a failure.
+2. **Missing completion flag.** `execute_benchmark` ends a trial only when
+   `response["complete"] is True`. Without it every trial exhausted its
+   model-call budget and was recorded as a resource-limit failure. The first
+   70-trial run scored 0.00 across all cells while showing 5-68s of real latency.
+3. **Discarded workspace and wrong field names.** The harness passes
+   `task["workspace"]`, but the adapter dropped it, so a task requiring the
+   agent to write `fixed.py` could never pass. Separately, the adapter asked for
+   field names several evaluators never read, so correct answers parsed to
+   `{}` and scored zero.
+
+The general lesson: a zero that is identical across every configuration is a
+harness defect, not a result. `tests/test_cohort_harness.py` now derives its
+expectations from the benchmark contract and the evaluator sources, so these
+fail in CI rather than as a silent all-zero cohort.
+
+### First real cohort run (2026-10-02, 70 trials) - SUPERSEDED
+
+The results below were produced before the workspace and field-name fixes and
+are retained only to document the adapter defects. Do not read them as
+behavioral evidence.
+
+#### First real cohort run (2026-10-02, 70 trials)
 
 Command, run from `CognitiveFrameWorks`:
 
