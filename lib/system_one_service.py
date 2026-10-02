@@ -6,8 +6,8 @@ import os
 import warnings
 from pathlib import Path
 
-from .system_one_backends import (DisabledSystemOneBackend, LayaSystemOneBackend,
-                                 StatelessLoopbackHTTPBackend, SystemOneBackend)
+from .system_one_backends import (DisabledSystemOneBackend, LayaProvider,
+                                 SemanticProvider, StatelessLoopbackHTTPBackend)
 from .system_one_calibration import CalibrationBundle
 from .system_one_contracts import SystemOneFrame, SystemOneIdentity
 from .system_one_runtime import SystemOneResult, SystemOneRuntime
@@ -17,7 +17,7 @@ from .protocol_artifact import QUESTION_REGISTRY
 class SystemOneService:
     """Internal behavioral judge; methods are intentionally outside MCP tools."""
 
-    def __init__(self, backend: SystemOneBackend, *, mode: str = "disabled",
+    def __init__(self, backend: SemanticProvider, *, mode: str = "disabled",
                  calibration_bundle: CalibrationBundle | None = None,
                  cache_size: int = 128, max_concurrent_requests: int = 4,
                  enabled_question_families: tuple[str, ...] | None = None) -> None:
@@ -58,10 +58,10 @@ class SystemOneService:
         if mode == "disabled" or provider == "disabled":
             if mode != "disabled" and provider == "disabled":
                 raise ValueError("an enabled System-1 mode requires an explicit semantic provider")
-            backend: SystemOneBackend = DisabledSystemOneBackend()
+            backend: SemanticProvider = DisabledSystemOneBackend()
             mode = "disabled"
         elif provider == "laya-native":
-            backend = LayaSystemOneBackend.from_environment()
+            backend = LayaProvider.from_environment()
         else:
             required = {
                 "endpoint": os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_ENDPOINT", ""),
@@ -89,7 +89,7 @@ class SystemOneService:
                       enabled_question_families=enabled,
                       max_concurrent_requests=int(os.environ.get(
                           "DIGITALPSYCHOLOGY_SYSTEM_ONE_MAX_CONCURRENCY", "4")))
-        if isinstance(backend, LayaSystemOneBackend):
+        if isinstance(backend, LayaProvider):
             backend.warmup()
         return service
 

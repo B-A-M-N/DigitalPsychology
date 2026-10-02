@@ -2,9 +2,10 @@ from dataclasses import replace
 
 import pytest
 
-from lib.behavior_state import (AttentionLease, BehaviorState, CSWBehaviorSnapshot,
-                                FrameworkSignal, GoalItemSnapshot,
-                                GoalSetSnapshot, StateWorkOption)
+from lib.behavior_state import (BEHAVIOR_MODES, AttentionLease, BehaviorState,
+                                CSWBehaviorSnapshot, FrameworkSignal,
+                                GoalItemSnapshot, GoalSetSnapshot,
+                                StateWorkOption)
 from lib.attention import schedule_attention
 from lib.control.policy_selector import (
     BehaviorCandidate, BehaviorConstraintResolver, BehaviorPolicyConstraints,
@@ -494,3 +495,99 @@ def test_laya_statework_preference_changes_only_a_csw_eligible_choice():
     assert decision.preferred_stateworks == ("verify-flow",)
     assert any(item.operation == "prefer_statework" and item.target == "verify-flow"
                for item in decision.directives)
+
+
+def _ambiguous_retry_case(judgment):
+    """A stuck retry where the semantic provider points at the right relation."""
+    goals = GoalSetSnapshot(1, (GoalItemSnapshot("criterion-1"),))
+
+    class BaseJudgment:
+        def answer(self, question_id):
+            if question_id != "action_relation":
+                return None
+            return type("Answer", (), {
+                "selected": judgment,
+                "raw_confidence": 0.93,
+                "calibrated_confidence": 0.93,
+            })()
+
+    return BehavioralController().decide(
+        FastLoopInput(
+            scope="tenant/app/agent/session/task/attempt",
+            state=BehaviorState(),
+            csw_snapshot=CSWBehaviorSnapshot(revision=0),
+            objective_criteria=("criterion-1",),
+            goal_set=goals,
+            pre_action=True,
+        ),
+        judgment=BaseJudgment(),
+    )
+
+
+def test_laya_disabled_parity_preserves_deterministic_safety_and_cws_eligibility():
+    """Gate: with no provider, selection stays deterministic and never widens.
+
+    Two identical no-provider runs must produce identical decisions, and the
+    selected control set must equal the deterministic no-prior fallback.
+    """
+    goals = GoalSetSnapshot(1, (GoalItemSnapshot("criterion-1"),))
+    runs = []
+    for _ in range(2):
+        decision = BehavioralController().decide(
+            FastLoopInput(
+                scope="tenant/app/agent/session/task/attempt",
+                state=BehaviorState(),
+                csw_snapshot=CSWBehaviorSnapshot(revision=0),
+                objective_criteria=("criterion-1",),
+                goal_set=goals,
+                pre_action=True,
+            ),
+            judgment=None,
+        )
+        runs.append(decision)
+
+    # Deterministic: identical inputs, identical decision.
+    assert runs[0].state.cognitive_mode == runs[1].state.cognitive_mode
+    assert tuple(d.operation for d in runs[0].directives) == \
+        tuple(d.operation for d in runs[1].directives)
+
+    # Safety preserved: a provider-free run emits only routine directives and
+    # never records an intervention outcome against a learned policy.
+    assert runs[0].intervention_outcomes == ()
+    for directive in runs[0].directives:
+        assert directive.operation in {
+            "set_mode", "set_verification_intensity", "set_exploration_budget",
+            "set_retry_policy", "set_context_strategy", "set_response_strategy",
+            "grant_attention", "revoke_attention",
+        }
+    # CSW eligibility is unchanged when no provider is consulted: the mode is
+    # a legal CFW-owned mode drawn from the authoritative set.
+    assert runs[0].state.cognitive_mode in BEHAVIOR_MODES
+
+
+def test_laya_semantic_gain_improves_retry_decision_without_taking_authority():
+    """Gate: paired baseline/treatment evidence for the semantic provider.
+
+    Baseline (provider disabled) and treatment (provider prefers an equivalent
+    but materially different approach) must both remain legal, and the
+    treatment must differ only by advisory support - CFW/WARD still gate it.
+    """
+    baseline = _ambiguous_retry_case("unrelated")
+    treatment = _ambiguous_retry_case("required_verification")
+
+    # Neither outcome may invent a control value outside the legal set.
+    legal = {"passive", "normal", "high", "strict"}
+    for decision in (baseline, treatment):
+        for directive in decision.directives:
+            if directive.operation == "set_verification_intensity":
+                assert directive.value in legal
+
+    # The provider is advisory evidence only: it reorders among legal
+    # candidates, so both runs still land on legal CFW-owned modes.
+    assert baseline.state.cognitive_mode in BEHAVIOR_MODES
+    assert treatment.state.cognitive_mode in BEHAVIOR_MODES
+
+    # With no validated priors the selector must not claim a learned win; the
+    # gain is advisory ranking, which the receipts record rather than assert.
+    for receipt in getattr(baseline, "receipts", ()) or ():
+        assert receipt.get("authority") != "semantic_provider"

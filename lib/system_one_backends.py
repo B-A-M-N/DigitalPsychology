@@ -1,6 +1,6 @@
 """Optional native and loopback System-1 provider adapters.
 
-The Laya package is imported only when a :class:`LayaSystemOneBackend` is
+The Laya package is imported only when a :class:`LayaProvider` is
 constructed. Normal DigitalPsychology imports and service startup do not load
 Laya, PyTorch, or model weights.
 """
@@ -56,7 +56,14 @@ class ProviderContractError(ValueError):
     """The provider returned a malformed or out-of-contract result."""
 
 
-class SystemOneBackend(Protocol):
+class SemanticProvider(Protocol):
+    """Provider-neutral behavioral judge interface.
+
+    This is the contract a host injects. ``LayaProvider`` is one implementation
+    of it; no provider name belongs in this interface, and the interface itself
+    is never exposed as a model-facing tool.
+    """
+
     backend_id: str
     model_id: str
     model_revision: str
@@ -235,7 +242,7 @@ class _Inference:
     error: Optional[BaseException] = None
 
 
-class LayaSystemOneBackend:
+class LayaProvider:
     """Native Laya adapter pinned to a local checkpoint and immutable identity.
 
     The expected content hash is required. The adapter never downloads a model
@@ -284,7 +291,7 @@ class LayaSystemOneBackend:
             max_concurrent_requests=1)
 
     @classmethod
-    def from_environment(cls, *, model_id: str = "laya-typed-decisions") -> "LayaSystemOneBackend":
+    def from_environment(cls, *, model_id: str = "laya-typed-decisions") -> LayaProvider:
         """Construct only from explicit, predownloaded model identity settings."""
         if importlib.util.find_spec("laya") is None:
             raise RuntimeError(
@@ -523,7 +530,13 @@ class StatelessLoopbackHTTPBackend:
         return judgment
 
 
-__all__ = ["SystemOneBackend", "ProviderHealthError", "ProviderContractError",
-           "DisabledSystemOneBackend", "LayaSystemOneBackend",
-           "StatelessLoopbackHTTPBackend",
-           "PROVIDER_PROTOCOL_HASH", "model_content_digest"]
+# Provider-neutral names are canonical; the legacy SystemOne* spellings remain
+# importable so existing hosts and integrations do not break.
+SystemOneBackend = SemanticProvider
+LayaSystemOneBackend = LayaProvider
+
+__all__ = ["SemanticProvider", "LayaProvider", "ProviderHealthError",
+           "ProviderContractError", "DisabledSystemOneBackend",
+           "StatelessLoopbackHTTPBackend", "SystemOneBackend",
+           "LayaSystemOneBackend", "PROVIDER_PROTOCOL_HASH",
+           "model_content_digest"]

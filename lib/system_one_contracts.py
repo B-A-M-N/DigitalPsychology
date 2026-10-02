@@ -670,8 +670,12 @@ class SystemOneCapability:
                 "max_concurrent_requests": self.max_concurrent_requests}
 
 
-class BehavioralJudge(Protocol):
-    """Host-injected internal provider; never registered as a model-facing tool."""
+class SemanticProvider(Protocol):
+    """Provider-neutral internal judge interface.
+
+    Implementations (for example ``LayaProvider``) satisfy this contract. It is
+    host-injected and never registered as a model-facing tool.
+    """
 
     def capability(self) -> SystemOneCapability: ...
 
@@ -682,8 +686,12 @@ class BehavioralJudge(Protocol):
     def resync(self, frame: SystemOneFrame) -> None: ...
 
 
+# Compatibility spelling retained for existing hosts.
+BehavioralJudge = SemanticProvider
+
 __all__ = ["SystemOneIdentity", "CriterionState", "ActivityFact",
            "WorkflowFact", "AttemptSemanticDescriptor", "SemanticState", "QuestionSpec",
            "QuestionProbability", "QuestionAnswer", "SystemOneFrame", "SystemOneJudgment",
-           "SystemOneCapability", "BehavioralJudge", "QUESTION_REGISTRY",
+           "SystemOneCapability", "SemanticProvider", "BehavioralJudge",
+           "QUESTION_REGISTRY",
            "QUESTION_REGISTRY_HASH", "STATE_PROJECTION_SCHEMA_HASH", "canonical_hash"]
