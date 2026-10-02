@@ -40,7 +40,7 @@ Implemented capabilities include:
 
 DP's telemetry, experiments, and deterministic controller do not require CFW or CSW packages. The cross-system `RuntimeHost` uses explicit ports to coordinate CFW and CSW. CFW and CSW also remain independently usable; the complete adaptive deployment runs CFW, CSW, and DP together, with each repository retaining its own authority.
 
-Runtime orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed through the model's tool registry. `RuntimeHost.open_control_bridge(...)` starts a private MCP child and returns the host lifecycle bridge; the bridge asks CFW to validate/apply controls and asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
+Runtime orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed through the model's tool registry. `RuntimeHost.open_control_bridge(...)` starts a private MCP child and returns the host lifecycle bridge; the bridge asks CFW to preflight the original action, evaluates a sanitized candidate through DP, then asks CFW for its final action decision and correlation ID. If either CFW gate rejects, DP receives a bounded rejection boundary and the action does not execute. The raw request stays in the host and CFW adapter. The bridge asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
 
 The bridge retains a bounded receipt for the last System-1 query in its
 host-only audit projection. The semantic answer is not copied into model
@@ -112,20 +112,19 @@ independent standalone entry points and work together without DP installed.
 ### Wiring the trusted runtime host
 
 The host supplies explicit CFW and optional CSW ports to DP. It calls
-`RuntimeHost.open_control_bridge(...)` once per scoped task, then invokes the
-bridge before action planning when it has a sanitized candidate, and after
-each completed host action. The private MCP transport makes the decision;
-local host adapters apply it through CFW's component lifecycle and CSW's
-revision-checked selection API. The bridge stays in the trusted host and is
-never passed to the controlled model. `RuntimeHost.open_session(...)` and
+`RuntimeHost.open_control_bridge(...)` once per scoped task, invokes
+`before_tool_planning(...)` before asking the model for an action, and calls
+`before_action_candidate(...)` after the host has parsed the proposed action.
+The private MCP transport evaluates only a sanitized `ActionCandidate`. In
+CFW+DP mode, pass the original CFW action request separately as
+`cfw_action_request`; the bridge sends it only to CFW for a hard preflight and
+final gate. The returned CFW action request ID correlates the eventual host
+tool result. If CFW rejects at either gate, DP receives the rejection boundary
+and the tool does not execute. After each completed host action, call
+`after_action(...)`. The bridge stays in the trusted host and is never passed
+to the controlled model. `RuntimeHost.open_session(...)` and
 `RuntimeSession.process_action(...)` remain available for in-process
 deployments and compatibility.
-
-Pass a typed `ActionCandidate` to `before_tool_planning(...)` when the host can
-describe the proposed action without its raw arguments. DP and Laya assess the
-candidate before execution; it is labeled `model_proposed` and cannot count as
-host evidence or intervention success. The pre-action transaction applies any
-approved behavior change while leaving the completed-action counter unchanged.
 
 For multi-criterion goals, the host sends the complete `GoalSetSnapshot`
 (bounded to 256 criteria). DP leases attention to at most three criteria at a
@@ -281,9 +280,10 @@ This makes the system adaptive without making it self-modifying in an uncontroll
 `digital-psychology-control-mcp` is a private stdio process launched by the
 trusted host. It is separate from the public telemetry and advice server. The
 controlled agent must not receive this server's tools. `HostControlBridge`
-sends completed action observations to DP, applies prepared CFW and CSW
-directives through local adapters, and commits only after those authorities
-confirm their revisions.
+sends pre-action candidates and completed-action observations to DP, applies
+prepared CFW and CSW directives through local adapters, and commits only after
+those authorities confirm their revisions. CFW preflight and final action
+gates run locally around each DP candidate tick.
 
 The private transport requires MCP Python SDK 2.2 or newer. Install the project
 and launch the host bridge from the same environment so the client and server
@@ -305,15 +305,21 @@ bridge = HostControlBridge(
 await bridge.open()
 ```
 
-Call `bridge.before_tool_planning(...)` with a sanitized candidate when one is
-available, and `bridge.after_action(...)` after each completed host-observed
-action or independent evidence boundary. The candidate contains only an action
-class, proposed purpose, affected criterion IDs, target kind, and optional
-hashed target reference; never pass tool arguments or secrets. DP commits
-pre-action controls before the candidate runs and assesses outcomes only from
-later host evidence. `bridge.before_model_call(...)` adds the current committed
-behavioral projection. The client launches the control MCP as a private child
-process; do not add its control tools to the model-visible MCP configuration.
+Call `bridge.before_tool_planning(...)` before the model plans. Once the host
+parses a proposed tool request, call `bridge.before_action_candidate(candidate,
+cfw_action_request=raw_request)` in CFW+DP mode. The candidate contains only an
+action class, proposed purpose, affected criterion IDs, target kind, and
+optional hashed target reference; the raw request is passed to the local CFW
+adapter and never to DP. Execute only when the bridge reports
+`action_authorized: true` and includes the CFW request ID. CFW performs its
+hard preflight before the DP tick and its final action gate afterward; DP never
+returns an allow/deny authority decision. If CFW is absent, the bridge reports
+`action_authorized: null`, and the host's local action authority remains
+responsible for execution. Call `bridge.after_action(...)` after each completed
+host-observed action. DP assesses intervention outcomes only from later host
+evidence. `bridge.before_model_call(...)` adds the current committed behavioral
+projection. The client launches the control MCP as a private child process; do
+not add its control tools to the model-visible MCP configuration.
 
 Laya remains optional. Install it only when the deployment selects the native
 Laya semantic backend:

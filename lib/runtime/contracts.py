@@ -161,6 +161,7 @@ class RuntimeObservation:
     active_trigger_codes: tuple[str, ...] = ()
     approach_epoch: str = ""
     candidate_action: ActionCandidate | None = None
+    candidate_preflight_result: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.action_index, int) or self.action_index < 0:
@@ -179,8 +180,15 @@ class RuntimeObservation:
             raise ValueError("candidate_action must be a validated ActionCandidate")
         if self.candidate_action is not None and self.action_completed:
             raise ValueError("candidate_action is valid only at a pre-action boundary")
-        # The private control protocol also carries non-action host boundaries.
-        # It binds a sanitized candidate exactly when boundary_kind is pre_action.
+        if self.candidate_preflight_result is not None and (
+                self.candidate_action is None
+                or self.candidate_preflight_result not in {
+                    "block", "require_confirmation", "require_reinspection",
+                    "require_recovery", "require_changed_hypothesis",
+                    "require_goal_reanchor"}):
+            raise ValueError("candidate preflight result is invalid or has no candidate")
+        # The private control protocol carries a candidate at the pre-action
+        # boundary and again only when CFW reports a rejection.
         if not self.action_completed and (
                 self.progress_made or self.regression_observed or self.artifact_changed
                 or self.evidence_refs):
@@ -220,6 +228,10 @@ class CFWComponentPort(Protocol):
     """Explicit CFW capability boundary used by DP session orchestration."""
 
     def available_component_ids(self) -> Sequence[str]: ...
+
+    def preflight_action(self, action: Mapping[str, Any]) -> Mapping[str, str]: ...
+
+    def authorize_action(self, action: Mapping[str, Any]) -> Mapping[str, str]: ...
 
     def collect_behavior_signals(self, observation: RuntimeObservation
                                  ) -> Sequence[FrameworkSignal]: ...

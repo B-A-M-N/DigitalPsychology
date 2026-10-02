@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class _CFWPort:
-    def __init__(self) -> None:
+    def __init__(self, *, preflight_decision="allow", final_decision="allow") -> None:
         self.signals = [{
             "source": "owl", "code": "owl.approach_failed", "active": True,
             "severity": "warning", "criterion_id": "criterion-visual",
@@ -27,6 +27,25 @@ class _CFWPort:
         }]
         self.controls: dict[str, dict] = {}
         self._state = None
+        self.preflight_decision = preflight_decision
+        self.final_decision = final_decision
+        self.action_gate_calls = []
+
+    @staticmethod
+    def _action_digest(action):
+        body = json.dumps(dict(action), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(body.encode()).hexdigest()
+
+    def preflight_action(self, action):
+        self.action_gate_calls.append("preflight")
+        return {"action_digest": self._action_digest(action),
+                "decision": self.preflight_decision}
+
+    def authorize_action(self, action):
+        self.action_gate_calls.append("authorize")
+        return {"action_digest": self._action_digest(action),
+                "action_request_id": "action-request-host-1",
+                "decision": self.final_decision}
 
     def available_component_ids(self):
         return ("owl", "anchor", "fuse", "ward", "sispis")
@@ -167,7 +186,17 @@ def _goal_set(revision=1):
         criterion_id="criterion-visual", status="READY"),))
 
 
-def _client(tmp_path):
+class _CapturingControlClient(MCPControlClient):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.prepared_requests = []
+
+    async def prepare_control_tick(self, request):
+        self.prepared_requests.append(dict(request))
+        return await super().prepare_control_tick(request)
+
+
+def _client(tmp_path, *, client_type=MCPControlClient):
     env = dict(os.environ)
     env.update({
         "DIGITALPSYCHOLOGY_STATE_ROOT": str(tmp_path / "dp-state"),
@@ -176,11 +205,11 @@ def _client(tmp_path):
         "DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE": "disabled",
         "DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER": "disabled",
     })
-    return MCPControlClient(command=sys.executable, env=env, cwd=ROOT,
-                            timeout_seconds=20)
+    return client_type(command=sys.executable, env=env, cwd=ROOT,
+                       timeout_seconds=20)
 
 
-def _bridge(tmp_path, *, identity, goal_set, cfw_port, csw_port):
+def _bridge(tmp_path, *, identity, goal_set, cfw_port, csw_port, client=None):
     return HostControlBridge(
         identity=identity,
         objective="Render the requested page",
@@ -188,7 +217,7 @@ def _bridge(tmp_path, *, identity, goal_set, cfw_port, csw_port):
         initial_goal_set=goal_set,
         cfw=CFWRuntimeAdapter(cfw_port),
         csw=csw_port,
-        client=_client(tmp_path),
+        client=client or _client(tmp_path),
     )
 
 
@@ -326,8 +355,8 @@ def test_candidate_action_is_committed_before_execution_without_advancing_action
         try:
             opened = await bridge.open()
             assert opened["status"] == "ready"
-            context = await bridge.before_tool_planning(
-                "tool plan", candidate_action=ActionCandidate(
+            result = await bridge.before_action_candidate(
+                ActionCandidate(
                     action_class="file_edit",
                     proposed_purpose="Implement the requested visual criterion",
                     affected_criterion_ids=("criterion-visual",),
@@ -335,8 +364,13 @@ def test_candidate_action_is_committed_before_execution_without_advancing_action
                     operation="edit_file", mutating=True, reversible=True,
                     external=False,
                     target_kind="repository",
-                ))
-            assert "CURRENT BEHAVIOR GUIDANCE" in context
+                ), cfw_action_request={
+                    "tool_binding_id": "apply_patch",
+                    "arguments": {"patch": "bounded-host-action"},
+                })
+            assert result["action_authorized"] is True
+            assert result["action_request_id"] == "action-request-host-1"
+            assert cfw.action_gate_calls == ["preflight", "authorize"]
             assert bridge.behavior_state.revision == 1
             assert bridge._action_index == -1
             assert cfw.lifecycle_revision == 1
@@ -348,6 +382,83 @@ def test_candidate_action_is_committed_before_execution_without_advancing_action
             assert result["status"] == "ready"
             assert bridge._action_index == 1
             assert bridge.behavior_state.revision == 2
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_cfw_preflight_rejection_is_reported_to_dp_without_advancing_action_index(tmp_path):
+    async def run():
+        cfw = _CFWPort(preflight_decision="require_confirmation")
+        goals = _goal_set()
+        client = _client(tmp_path, client_type=_CapturingControlClient)
+        bridge = _bridge(tmp_path, identity=_identity("rejected-candidate-task"),
+                         goal_set=goals, cfw_port=cfw, csw_port=_CSWPort(),
+                         client=client)
+        try:
+            await bridge.open()
+            result = await bridge.before_action_candidate(
+                ActionCandidate(
+                    action_class="external_write",
+                    proposed_purpose="Apply the requested change",
+                    affected_criterion_ids=("criterion-visual",),
+                    action_id="action-needs-confirmation", tool_name="deploy",
+                    operation="publish", mutating=True, reversible=False,
+                    external=True,
+                ),
+                cfw_action_request={
+                    "tool_binding_id": "deploy", "arguments": {"target": "prod"}},
+            )
+            assert result["status"] == "rejected"
+            assert result["stage"] == "cfw_preflight"
+            assert result["action_authorized"] is False
+            assert cfw.action_gate_calls == ["preflight"]
+            assert bridge._action_index == -1
+            assert bridge._boundary_sequence == 0
+            request = client.prepared_requests[-1]
+            assert request["boundary_kind"] == "pre_action_rejected"
+            assert request["observation"]["candidate_preflight_result"] == "require_confirmation"
+            assert request["observation"]["candidate_action"]["action_id"] == \
+                "action-needs-confirmation"
+            assert any(signal["code"] ==
+                       "candidate_rejected.require_confirmation"
+                       for signal in request["cfw_signals"])
+            assert "prod" not in json.dumps(request)
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_cfw_final_gate_rejection_is_reported_to_dp_after_pre_action_tick(tmp_path):
+    async def run():
+        cfw = _CFWPort(final_decision="require_reinspection")
+        goals = _goal_set()
+        bridge = _bridge(tmp_path, identity=_identity("final-rejection-task"),
+                         goal_set=goals, cfw_port=cfw, csw_port=_CSWPort())
+        try:
+            await bridge.open()
+            result = await bridge.before_action_candidate(
+                ActionCandidate(
+                    action_class="file_edit",
+                    proposed_purpose="Apply the requested visual fix",
+                    affected_criterion_ids=("criterion-visual",),
+                    action_id="action-stale-assumption", tool_name="apply_patch",
+                    operation="edit_file", mutating=True, reversible=True,
+                    external=False,
+                ),
+                cfw_action_request={
+                    "tool_binding_id": "apply_patch", "arguments": {"path": "view.py"}},
+            )
+            assert result["status"] == "rejected"
+            assert result["stage"] == "cfw_final_gate"
+            assert result["pre_action_control"]["status"] == "ready"
+            assert result["control"]["status"] == "ready"
+            assert result["action_authorized"] is False
+            assert cfw.action_gate_calls == ["preflight", "authorize"]
+            assert bridge._action_index == -1
+            assert bridge._boundary_sequence == 1
         finally:
             await bridge.close()
 

@@ -11,10 +11,10 @@ from .outcomes import HostOutcomeFact
 from .runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
 
 
-PROTOCOL_VERSION = "1.2.0"
+PROTOCOL_VERSION = "1.3.0"
 MAX_CONTROL_PAYLOAD_BYTES = 131_072
 CONTROL_BOUNDARY_KINDS = frozenset({
-    "task_start", "pre_model_call", "pre_action", "post_action",
+    "task_start", "pre_model_call", "pre_action", "pre_action_rejected", "post_action",
     "validator", "workflow", "operator", "pre_completion",
 })
 
@@ -195,8 +195,12 @@ class ControlTickRequest:
             raise ValueError("observation is invalid")
         if self.observation.action_completed != (kind == "post_action"):
             raise ValueError("only post_action boundaries confirm a completed host action")
-        if (kind == "pre_action") != (self.observation.candidate_action is not None):
-            raise ValueError("pre_action boundaries require exactly one action candidate")
+        candidate_boundary = kind in {"pre_action", "pre_action_rejected"}
+        if candidate_boundary != (self.observation.candidate_action is not None):
+            raise ValueError("candidate boundaries require exactly one action candidate")
+        rejected = kind == "pre_action_rejected"
+        if rejected != (self.observation.candidate_preflight_result is not None):
+            raise ValueError("pre-action rejection must carry exactly one CFW gate result")
         if self.observation.goal_set != self.goal_set:
             raise ValueError("observation and control request goal sets differ")
         refs = set(self.observation.evidence_refs)
@@ -267,6 +271,7 @@ class ControlTickRequest:
                 "approach_epoch": self.observation.approach_epoch,
                 "candidate_action": (self.observation.candidate_action.to_dict()
                                      if self.observation.candidate_action else None),
+                "candidate_preflight_result": self.observation.candidate_preflight_result,
             },
             "goal_set": self.goal_set.to_dict(),
             "cfw_signals": [{"source": item.source, "code": item.code,

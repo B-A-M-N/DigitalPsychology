@@ -105,6 +105,7 @@ class HostControlBridge:
         return await self._control_boundary("task_start")
 
     async def before_action_candidate(self, candidate: ActionCandidate | Mapping[str, Any], *,
+                                      cfw_action_request: Mapping[str, Any] | None = None,
                                       goal_set: GoalSetSnapshot | None = None
                                       ) -> Mapping[str, Any]:
         value = (candidate if isinstance(candidate, ActionCandidate)
@@ -114,10 +115,58 @@ class HostControlBridge:
             raise TypeError("pre-action boundary requires a validated ActionCandidate")
         if not set(value.affected_criterion_ids).issubset(self.objective_criteria):
             raise ValueError("candidate action criteria escape the control objective")
+        cfw_connected = bool(self._cfw_components)
+        action_request = dict(cfw_action_request) if cfw_action_request is not None else None
+        preflight: Mapping[str, str] | None = None
+        if cfw_connected:
+            if action_request is None:
+                raise ValueError(
+                    "combined CFW+DP action boundaries require the original host action request")
+            preflight_action = getattr(self.cfw, "preflight_action", None)
+            authorize_action = getattr(self.cfw, "authorize_action", None)
+            if not callable(preflight_action) or not callable(authorize_action):
+                raise RuntimeError("CFW component port lacks its host action-gate adapter")
+            preflight = preflight_action(action_request)
+            if not isinstance(preflight, Mapping):
+                raise RuntimeError("CFW preflight returned a malformed host receipt")
+            if preflight.get("decision") != "allow":
+                return await self._record_candidate_rejection(
+                    value, str(preflight.get("decision") or "block"),
+                    stage="cfw_preflight", goal_set=goal_set)
+
         observation = self._boundary_observation(
             "pre_action", goal_set=goal_set, candidate_action=value)
-        return await self._control_boundary(
+        control = await self._control_boundary(
             "pre_action", observation, goal_set=goal_set)
+        if not cfw_connected:
+            return {**control, "action_authorized": None}
+
+        authorization = self.cfw.authorize_action(action_request)
+        if not isinstance(authorization, Mapping):
+            raise RuntimeError("CFW final action gate returned a malformed host receipt")
+        if authorization.get("action_digest") != preflight.get("action_digest"):
+            raise RuntimeError("CFW action changed between preflight and the final gate")
+        decision = str(authorization.get("decision") or "block")
+        if decision != "allow":
+            rejected = await self._record_candidate_rejection(
+                value, decision, stage="cfw_final_gate", goal_set=goal_set)
+            return {**rejected, "pre_action_control": dict(control)}
+        request_id = authorization.get("action_request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise RuntimeError("CFW final action gate omitted its correlation ID")
+        return {**control, "action_authorized": True,
+                "action_request_id": request_id}
+
+    async def _record_candidate_rejection(
+            self, candidate: ActionCandidate, decision: str, *, stage: str,
+            goal_set: GoalSetSnapshot | None) -> Mapping[str, Any]:
+        observation = self._boundary_observation(
+            "pre_action_rejected", goal_set=goal_set,
+            candidate_action=candidate, candidate_preflight_result=decision)
+        control = await self._control_boundary(
+            "pre_action_rejected", observation, goal_set=goal_set)
+        return {"status": "rejected", "stage": stage, "decision": decision,
+                "action_authorized": False, "control": dict(control)}
 
     async def observe_boundary(self, boundary_kind: str, *,
                                observation: RuntimeObservation | None = None,
@@ -145,11 +194,14 @@ class HostControlBridge:
                     boundary_kind, goal_set=goal_set)
             if not isinstance(observation, RuntimeObservation):
                 raise TypeError("host control-boundary observation is malformed")
-            is_pre_action = boundary_kind == "pre_action"
+            is_pre_action = boundary_kind in {"pre_action", "pre_action_rejected"}
             if observation.action_completed != (boundary_kind == "post_action"):
                 raise ValueError("only post-action boundaries confirm a completed host action")
             if is_pre_action != (observation.candidate_action is not None):
-                raise ValueError("pre-action boundary must contain exactly one action candidate")
+                raise ValueError("candidate boundary must contain exactly one action candidate")
+            if ((boundary_kind == "pre_action_rejected")
+                    != (observation.candidate_preflight_result is not None)):
+                raise ValueError("rejected candidate boundary must contain the CFW gate result")
             if not self._remote_open or self._needs_reconciliation:
                 if not await self._connect_or_degrade_locked(
                         host_action_index=(observation.action_index
@@ -171,6 +223,9 @@ class HostControlBridge:
             if boundary_kind in {"pre_action", "post_action"}:
                 if observation.action_index <= self._action_index:
                     raise ValueError("action boundary index must advance DP action state")
+            elif boundary_kind == "pre_action_rejected":
+                if observation.action_index != max(0, self._action_index):
+                    raise ValueError("rejected candidates cannot advance the host action index")
             elif observation.action_index != max(0, self._action_index):
                 raise ValueError("non-action boundary must refer to the current DP action index")
             result = await self._apply_tick_locked(
@@ -182,7 +237,8 @@ class HostControlBridge:
 
     def _boundary_observation(self, boundary_kind: str, *,
                               goal_set: GoalSetSnapshot | None = None,
-                              candidate_action: ActionCandidate | None = None
+                              candidate_action: ActionCandidate | None = None,
+                              candidate_preflight_result: str | None = None
                               ) -> RuntimeObservation:
         if boundary_kind == "pre_action":
             action_index = max(1, self._action_index + 1)
@@ -209,6 +265,8 @@ class HostControlBridge:
             goal_set=goal_set or self.goal_set,
             active_trigger_codes=(prior.active_trigger_codes if prior else ()),
             approach_epoch=prior.approach_epoch if prior else "",
+            candidate_action=candidate_action,
+            candidate_preflight_result=candidate_preflight_result,
         )
 
     async def _apply_tick_locked(self, observation: RuntimeObservation,
@@ -218,6 +276,16 @@ class HostControlBridge:
                                  ) -> Mapping[str, Any]:
         snapshot, _candidates = self._csw_snapshot()
         self._boundary_sequence += 1
+        cfw_signals = list(self._cfw_signals(observation))
+        if observation.candidate_preflight_result is not None:
+            cfw_signals = cfw_signals[:31]
+            criterion_id = (observation.candidate_action.affected_criterion_ids[0]
+                            if observation.candidate_action else None)
+            cfw_signals.append(FrameworkSignal(
+                source="cfw_action_gate",
+                code="candidate_rejected." + observation.candidate_preflight_result,
+                severity="critical", criterion_id=criterion_id,
+            ))
         request = ControlTickRequest(
             control_session_id=self.identity.scope,
             tick_id=f"control-tick-{uuid.uuid4().hex}",
@@ -225,7 +293,7 @@ class HostControlBridge:
             cfw_lifecycle_revision=self._current_cfw_revision(),
             observation=observation,
             goal_set=goals,
-            cfw_signals=self._cfw_signals(observation),
+            cfw_signals=tuple(cfw_signals),
             csw_snapshot=snapshot,
             outcome_facts=tuple(outcome_facts),
             boundary_kind=boundary_kind,
@@ -349,13 +417,9 @@ class HostControlBridge:
             )
 
     async def before_tool_planning(self, context: str, *,
-                                   action_hint: Mapping[str, Any] | None = None,
-                                   candidate_action: ActionCandidate | Mapping[str, Any] | None = None
+                                   action_hint: Mapping[str, Any] | None = None
                                    ) -> str:
-        if candidate_action is None:
-            await self._control_boundary("pre_model_call")
-        else:
-            await self.before_action_candidate(candidate_action)
+        await self._control_boundary("pre_model_call")
         async with self._lock:
             self._require_open()
             snapshot, _ = self._csw_snapshot()

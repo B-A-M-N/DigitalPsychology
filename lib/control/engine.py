@@ -69,12 +69,21 @@ class ControlDecisionEngine:
         if boundary_kind in {"pre_action", "post_action"}:
             if request.observation.action_index <= record.action_index:
                 raise ValueError("action boundaries must advance the completed action index")
+        elif boundary_kind == "pre_action_rejected":
+            if request.observation.action_index != max(0, record.action_index):
+                raise ValueError("rejected candidates must retain the completed action index")
         elif request.observation.action_index != max(0, record.action_index):
             raise ValueError("non-action boundary must refer to the current action index")
         if boundary_kind == "pre_action" and (
                 request.observation.candidate_action is None or request.outcome_facts):
             raise ValueError("pre-action control requires a candidate without outcome facts")
-        if boundary_kind != "pre_action" and request.observation.candidate_action is not None:
+        if boundary_kind == "pre_action_rejected" and (
+                request.observation.candidate_action is None
+                or request.observation.candidate_preflight_result is None
+                or request.outcome_facts):
+            raise ValueError("rejected-candidate control requires its CFW gate result")
+        if (boundary_kind not in {"pre_action", "pre_action_rejected"}
+                and request.observation.candidate_action is not None):
             raise ValueError("candidate actions are accepted only at pre-action boundaries")
         if not set(request.observation.criterion_status).issubset(goal_ids):
             raise ValueError("host criterion status escapes the control objective")
@@ -141,7 +150,7 @@ class ControlDecisionEngine:
             host_action_index=request.observation.action_index,
             criterion_status=request.observation.criterion_status,
             action_completed=boundary_kind == "post_action",
-            pre_action=boundary_kind == "pre_action",
+            pre_action=boundary_kind in {"pre_action", "pre_action_rejected"},
             progress_made=request.observation.progress_made,
             regression_observed=request.observation.regression_observed,
             artifact_changed=request.observation.artifact_changed,

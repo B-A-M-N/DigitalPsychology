@@ -33,6 +33,39 @@ class CFWRuntimeAdapter:
             raise ValueError("CFW returned malformed component capability IDs")
         return values
 
+    def preflight_action(self, action: Mapping[str, Any]) -> Mapping[str, str]:
+        if not isinstance(action, Mapping):
+            raise TypeError("CFW action preflight requires the host's original action request")
+        result = self.component_port.preflight_action(action)
+        return self._validate_action_gate_result(result, final=False)
+
+    def authorize_action(self, action: Mapping[str, Any]) -> Mapping[str, str]:
+        if not isinstance(action, Mapping):
+            raise TypeError("CFW final action gate requires the host's original action request")
+        result = self.component_port.authorize_action(action)
+        return self._validate_action_gate_result(result, final=True)
+
+    @staticmethod
+    def _validate_action_gate_result(value: Any, *, final: bool) -> dict[str, str]:
+        if not isinstance(value, Mapping):
+            raise RuntimeError("CFW action gate returned a malformed receipt")
+        action_digest = value.get("action_digest")
+        decision = value.get("decision")
+        if (not isinstance(action_digest, str) or len(action_digest) != 64
+                or any(char not in "0123456789abcdef" for char in action_digest)
+                or decision not in {
+                    "allow", "block", "require_confirmation", "require_reinspection",
+                    "require_recovery", "require_changed_hypothesis",
+                    "require_goal_reanchor"}):
+            raise RuntimeError("CFW action gate receipt is outside its contract")
+        result = {"action_digest": action_digest, "decision": str(decision)}
+        if final:
+            request_id = value.get("action_request_id")
+            if not isinstance(request_id, str) or not request_id:
+                raise RuntimeError("CFW final gate omitted its action correlation ID")
+            result["action_request_id"] = request_id
+        return result
+
     def lifecycle_revision(self) -> int:
         raw = getattr(self.component_port, "lifecycle_revision", None)
         value = raw() if callable(raw) else raw
