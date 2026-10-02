@@ -72,6 +72,127 @@ The audit's numbered findings are retained here so none disappear during handoff
 |---|---|---|---|
 | P2 | DP | Use `SemanticProvider` for the interface and `Laya` for its implementation; retain legacy `SystemOne*` names only for compatibility | Still needs public-surface terminology review |
 
+## Continuation record (2026-10-02)
+
+Test commands and observed results for the final three-project worktree:
+
+| Project | Command | Result |
+|---|---|---|
+| DigitalPsychology | `python -m pytest tests -q` | **159 passed** (was 152; +5 naming, +2 gate) |
+| CognitiveFrameWorks | `COGNITIVE_STATEWORK_ROOT=/home/bamn/CognitiveStateWork python -m pytest tests -q --deselect tests/test_p0_boundaries.py::test_cfw_does_not_discover_optional_provider_during_default_startup` | **143 passed, 1 deselected** |
+| CognitiveFrameWorks | `env -u COGNITIVE_STATEWORK_ROOT python -m pytest tests/test_p0_boundaries.py -q` | **14 passed** (includes the default-provider assertion) |
+| CognitiveStateWork | `python -m pytest tests -q` | **31 passed** |
+
+The one previously reported CFW failure is fully explained and closed. The
+deselected assertion reads `COGNITIVE_STATEWORK_ROOT`, so it can only pass when
+that variable is unset; the resolver deliberately honors an explicitly
+configured root and otherwise refuses to discover an installed provider.
+Implementation behavior is correct in both modes.
+
+Do **not** run the whole CFW suite with that variable unset. Most of it resolves
+real workflows, so it legitimately fails with `StateWork capability is required by
+this task but no registry is installed` (26 failures). The correct split is the
+full suite with the root configured, and `test_p0_boundaries.py` on its own
+without it. That two-command split is deliberate, not an environment quirk.
+
+### Resolved in this pass
+
+- **P2 naming cleanup (done, committed `d0606f5`).** `SemanticProvider` is now the
+  interface name and `LayaProvider` the implementation name.
+  `SystemOneBackend`, `LayaSystemOneBackend`, and `BehavioralJudge` remain as
+  aliases, so no host is forced to migrate. Schema, protocol-artifact, and
+  persisted-event field names are unchanged, so stored receipts still validate.
+- **`subsystem_matrix` (done, committed CFW `a9c6eb7`).** New
+  `tests/test_subsystem_matrix.py` proves all four supported compositions start
+  independently and that each cell never constructs the subsystems it does not
+  name. Cells run against isolated durable stores.
+- **CFW process-group test race (fixed, committed `a9c6eb7`).** The descendant
+  wrote its pid marker non-atomically, so the parent's `exists()` check could win
+  before the write landed. It now publishes via `os.replace` and the parent waits
+  for parseable content. `PersistentAgent.close()` was already correct.
+- **`laya_disabled_parity` and `laya_semantic_gain` (done, committed `d0606f5`).**
+  Provider-free determinism and paired baseline/treatment evidence are now
+  asserted directly, using the authoritative `BEHAVIOR_MODES` set.
+- **`no_cross_implementation_imports` (verified).** Static scan across all three
+  projects shows zero implementation-module imports in either direction.
+
+### Real-agent cohort harness (committed CFW `b0222f9`, `3c48673`)
+
+The `real_agent_behavioral_cohort` gate previously had no harness at all. One
+now exists and has been exercised against real agents:
+
+- `scripts/cohort/run_cohort.py` runs the benchmark across all five required
+  configurations with host-assigned blinded cohort labels, holdout trials
+  reported separately from treatment results, and per-task-family aggregation
+  of completion rate, evidence quality, latency, and regressions.
+- `scripts/cohort/agent_codex.py` drives a real `codex exec` subprocess per turn.
+- Evidence comes only from each task module's host evaluator. The report is
+  hardcoded `qualification_eligible: false` with recorded blockers, so the
+  harness cannot self-certify the gate it measures.
+
+Two adapter protocol bugs were found and fixed before any result was trusted.
+The evaluators call `json.loads(response["answer"])`, so the answer must be a
+JSON string rather than a nested object. And `execute_benchmark` only ends a
+trial on an explicit `complete` flag, so an adapter that omits it burns the
+full model-call budget and every trial is recorded as a resource-limit failure.
+The first full run scored 0.00 across all 70 trials for exactly this reason
+while showing 5-68s of real latency; that run was discarded, not reported.
+`tests/test_cohort_harness.py` now pins both protocol facts.
+
+### First real cohort run (2026-10-02, 70 trials)
+
+Command, run from `CognitiveFrameWorks`:
+
+```
+python3 scripts/cohort/run_cohort.py \
+  --configurations baseline,cfw,cfw_csw,cfw_csw_dp,cfw_csw_dp_laya \
+  --trials-per-cell 2 --holdout-fraction 0.5 \
+  --report-out build/cohort-report.json --label-out build/cohort-labels.json
+```
+
+Five blinded cohorts, 14 real agent trials each, 70 total, evidence from host
+evaluators only. Whole-task completion rate:
+
+| Blinded label | Configuration | Treatment | Holdout | Regressions |
+|---|---|---|---|---|
+| cohort-A | baseline (CFW off) | 0.714 | 0.714 | 4/14 |
+| cohort-B | CFW | 0.429 | 0.714 | 6/14 |
+| cohort-C | CFW + CSW | 0.571 | 0.571 | 6/14 |
+| cohort-D | CFW + CSW + DP | 0.429 | 0.571 | 7/14 |
+| cohort-E | CFW + CSW + DP + Laya | 0.714 | 0.714 | 4/14 |
+
+**This run does not support the hypothesis.** There is no monotonic improvement
+across the ladder, and cohort-B (CFW alone) scored below the baseline control.
+At 2 trials per cell a single flipped trial moves a family rate by 0.5, so
+these gaps are noise, not signal. The honest reading is that this matrix is
+**inconclusive**, not that CFW or DP harms outcomes, and not that they help.
+
+Two families scored 0.0 in every cell including baseline: `code_repair` and
+`multi_agent_delegation`. That is an evaluator/task-authoring gap to resolve
+before any comparison between configurations is meaningful.
+
+A further confound: the Laya cell ran with
+`DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER=disabled`, because no pinned local Laya
+checkpoint is available on this host. Cohort-E therefore exercised the same
+composition as cohort-D with no semantic provider and must not be read as a
+Laya treatment result.
+
+The gate is still **not** closed. Completion on task outcome alone does not
+establish the required whole-task correctness improvement without increased
+starvation or mode thrash, and the current evaluators do not measure
+starvation, mode thrash, equivalent retries, busywork, redundant tests,
+premature completion, operator corrections, or context growth. Closing it needs
+those evaluators plus a multi-backend run, not another harness iteration.
+
+### Note on local checkout state
+
+`CognitiveStateWork/state/` holds untracked runtime residue from earlier runs and
+is not part of the repository. Its `evidence.json` contains a record whose
+`attestation_digest` no longer matches its content, so CSW correctly fails
+closed when a host points at that path. This is stale local data, not a defect;
+the suite passes because tests use isolated stores. Delete it before running any
+harness against the live checkout root.
+
 ## Remaining work by project
 
 ### DigitalPsychology
