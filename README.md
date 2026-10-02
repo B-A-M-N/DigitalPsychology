@@ -320,6 +320,10 @@ host-observed action. DP assesses intervention outcomes only from later host
 evidence. `bridge.before_model_call(...)` adds the current committed behavioral
 projection. The client launches the control MCP as a private child process; do
 not add its control tools to the model-visible MCP configuration.
+Model guidance is held separately from audit metadata and replaces one bounded
+context slot. Internal behavior revisions with unchanged semantic guidance do
+not rewrite that slot; intervention IDs, authority revisions, and reconciliation
+details remain in the host audit projection.
 
 Laya remains optional. Install it only when the deployment selects the native
 Laya semantic backend:

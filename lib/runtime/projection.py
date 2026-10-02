@@ -106,6 +106,13 @@ def replace_model_projection(context: str, projection: ModelProjection) -> str:
         raise TypeError("model context must be text")
     opening = "===== CURRENT BEHAVIOR GUIDANCE ====="
     closing = "===== END CURRENT BEHAVIOR GUIDANCE ====="
+    if context.count(opening) == 1:
+        start = context.index(opening)
+        end = context.find(closing, start)
+        if (end >= 0
+                and context[start:end].rstrip("\n") == projection.text
+                and context.count(closing) == 1):
+            return context
     while opening in context:
         start = context.index(opening)
         end = context.find(closing, start)
