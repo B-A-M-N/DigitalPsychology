@@ -201,10 +201,57 @@ The canary preflight also caught a defect in itself: it enforced a 512-character
 bound on the agent's `reason` that no evaluator requires, so it would have
 rejected correct work. Removed.
 
+### Pass 5 - triad cohort, first run with real systems
+
+Command, from `CognitiveFrameWorks`:
+
+```
+python3 scripts/cohort/run_cohort.py \
+  --configurations baseline,cfw,cfw_csw,cfw_csw_dp \
+  --trials-per-cell 5 --holdout-fraction 0.4 \
+  --report-out build/cohort-triad.json
+```
+
+140 real agent trials, 35 per cohort. All four compositions were constructed for
+real and the report records `constructed` for each. Whole-task completion:
+
+| Cohort | Configuration | Treatment | Holdout | DP telemetry |
+|---|---|---|---|---|
+| A | baseline | 0.952 | 1.000 | none (DP unbound) |
+| B | CFW | 0.952 | 0.929 | none (DP unbound) |
+| C | CFW + CSW | 0.952 | 1.000 | none (DP unbound) |
+| D | CFW + CSW + DP | 0.905 | 0.929 | present |
+
+DP telemetry from the DP cohort is real and internally consistent:
+3 committed actions, fairness bound 3, max starvation age 2,
+`fairness_violation_count` 0, no mode transitions, no rapid reversals.
+
+**This run cannot support the hypothesis, and the reason is a ceiling effect
+rather than a defect.** Five of the seven task families scored 1.00 in every
+cell. With the model already solving them, no behavioral policy has room to
+improve the outcome, and the only two families that vary at all
+(`long_running_recovery`, `multi_agent_delegation`) move by single trials at
+5 trials per cell, which is noise.
+
+Two conclusions follow, and only two:
+
+1. There is **no evidence of harm**. The DP cohort is 0.047 below baseline on
+   treatment and 0.071 below on holdout, which at this sample size is one
+   trial. That is not a regression finding.
+2. The benchmark is **not yet discriminative**. To measure whether DP improves
+   whole-task correctness, the task families have to be hard enough that the
+   unassisted model fails some of them. Until then the cohort can only ever
+   report saturation.
+
+This is the opposite failure from the discarded runs: those measured nothing,
+this one measures something real and still cannot answer the question, because
+the tasks are too easy. Fixing that means authoring harder tasks, not spending
+more inference on the current ones.
+
 ### Remaining
 
 - Pass 6: Laya arm, blocked until a pinned Laya checkpoint exists on the host.
-- P1-10/11/23 legacy CFW workflow helpers and the duplicate `yaml` import.
+- The triad benchmark needs harder task families before the gate can close.
 
 ## Continuation record (2026-10-02)
 
