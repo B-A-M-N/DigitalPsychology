@@ -591,3 +591,155 @@ def test_laya_semantic_gain_improves_retry_decision_without_taking_authority():
     # gain is advisory ranking, which the receipts record rather than assert.
     for receipt in getattr(baseline, "receipts", ()) or ():
         assert receipt.get("authority") != "semantic_provider"
+
+
+# -- P1-7: starvation is a hard fairness constraint, then a tiebreak ------
+
+def _starved_selection(*, action_index, last_seen_value, lease_actions,
+                       focus, required_mode=None):
+    """Build a 20-item runnable set where one branch ignores an old criterion."""
+    state = BehaviorState()
+    goal_set = GoalSetSnapshot(1, tuple(
+        GoalItemSnapshot(f"criterion-{index}") for index in range(20)))
+    lease = AttentionLease("lease-fair", focus, 1, 1, 5,
+                           max_actions=lease_actions)
+    last_seen = {item.criterion_id: last_seen_value for item in goal_set.items}
+    return BehaviorPolicySelector().select(
+        (), constraints=BehaviorPolicyConstraints(
+            current_state=state, available_frameworks=ALL_FRAMEWORKS,
+            goal_set=goal_set, required_mode=required_mode),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0), goal_set=goal_set,
+        policy_context={}, attention_lease=lease,
+        attention_last_seen=last_seen, current_action_index=action_index)
+
+
+def _focused_candidate(focus, state=None, *, reason_codes=("continue_current",)):
+    """A candidate that names an explicit focus.
+
+    ``focus_scope`` must be ``explicit`` or the candidate ID ignores the focus,
+    and two candidates that differ only in attention would collide.
+    """
+    base = BehaviorCandidate.from_state(
+        state or BehaviorState(), focus_criteria=focus,
+        statework_preferences=(), reason_codes=reason_codes,
+        cause="test", expected_effect="test")
+    return replace(base, focus_scope="explicit",
+                   candidate_id=candidate_id_for(
+                       cognitive_mode=base.cognitive_mode,
+                       framework_modes=base.framework_modes,
+                       controls=base.controls, focus_scope="explicit",
+                       statework_preferences=base.statework_preferences,
+                       focus_criteria=focus))
+
+
+def test_candidate_breaching_the_fairness_bound_is_not_selected():
+    """A candidate whose lease pushes an old criterion past the bound is dropped.
+
+    The alternative candidate rotates to the starved criterion, so its projected
+    age stays inside the bound and it is chosen instead.
+    """
+    starved = _focused_candidate(("criterion-0",))
+    rotating = _focused_candidate(("criterion-19",),
+                                  reason_codes=("deterministic_rule",))
+
+    selection = BehaviorPolicySelector().select(
+        (starved, rotating),
+        constraints=BehaviorPolicyConstraints(
+            current_state=BehaviorState(), available_frameworks=ALL_FRAMEWORKS,
+            goal_set=GoalSetSnapshot(1, tuple(
+                GoalItemSnapshot(f"criterion-{index}") for index in range(20)))),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0),
+        goal_set=GoalSetSnapshot(1, tuple(
+            GoalItemSnapshot(f"criterion-{index}") for index in range(20))),
+        policy_context={},
+        attention_lease=AttentionLease("lease-fair", ("criterion-0",), 1, 1, 5,
+                                       max_actions=6),
+        attention_last_seen={f"criterion-{index}": 0 for index in range(20)},
+        current_action_index=20)
+
+    assert selection.candidate.candidate_id != starved.candidate_id
+    assert selection.candidate.candidate_id == rotating.candidate_id
+
+
+def test_fairness_breach_still_risks_one_when_the_bound_is_respected():
+    """When every candidate is fair, ranking proceeds normally."""
+    focus = ("criterion-0",)
+    goal_set = GoalSetSnapshot(1, tuple(
+        GoalItemSnapshot(f"criterion-{index}") for index in range(4)))
+    only = _focused_candidate(focus)
+
+    selection = BehaviorPolicySelector().select(
+        (only,),
+        constraints=BehaviorPolicyConstraints(
+            current_state=BehaviorState(), available_frameworks=ALL_FRAMEWORKS,
+            goal_set=goal_set),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0), goal_set=goal_set,
+        policy_context={},
+        attention_lease=AttentionLease("lease-ok", focus, 1, 1, 5, max_actions=2),
+        attention_last_seen={f"criterion-{index}": 0 for index in range(4)},
+        current_action_index=1)
+
+    assert selection.candidate.candidate_id == only.candidate_id
+    assert selection.score.starvation_risk is not None
+    assert selection.score.starvation_risk <= 1.0
+
+
+def test_a_host_required_mode_may_still_breach_fairness():
+    """An external authority outranks fairness: DP must act legally, not refuse.
+
+    When the host requires a mode, fairness degrades to a ranking tiebreak
+    rather than vetoing the only legal candidate.
+    """
+    focus = ("criterion-0",)
+    goal_set = GoalSetSnapshot(1, tuple(
+        GoalItemSnapshot(f"criterion-{index}") for index in range(20)))
+    only = _focused_candidate(focus)
+
+    selection = BehaviorPolicySelector().select(
+        (only,),
+        constraints=BehaviorPolicyConstraints(
+            current_state=BehaviorState(), available_frameworks=ALL_FRAMEWORKS,
+            goal_set=goal_set, required_mode=only.cognitive_mode),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0), goal_set=goal_set,
+        policy_context={},
+        attention_lease=AttentionLease("lease-forced", focus, 1, 1, 5,
+                                       max_actions=8),
+        attention_last_seen={f"criterion-{index}": 0 for index in range(20)},
+        current_action_index=20)
+
+    assert selection.candidate.candidate_id == only.candidate_id
+    # Risk is clamped to 1.0, which is itself the fairness-violation signal:
+    # the projected age exceeded the bound and saturated.
+    assert selection.score.starvation_risk == 1.0
+
+
+def test_starvation_breaks_a_tie_between_otherwise_equal_candidates():
+    """With equal evidence, attending the starved criterion wins.
+
+    criterion-0 has not been attended for four actions while criterion-1 is
+    fresh, so keeping focus on criterion-1 projects a starvation ratio of 1.0
+    and rotating to criterion-0 projects 0.33. Both candidates are equally
+    supported, so the fairness tiebreak is the only thing separating them.
+    """
+    goal_set = GoalSetSnapshot(1, tuple(
+        GoalItemSnapshot(f"criterion-{index}") for index in range(2)))
+    last_seen = {"criterion-0": 0, "criterion-1": 4}
+    attending_starved = _focused_candidate(("criterion-0",),
+                                            reason_codes=("deterministic_rule",))
+    attending_fresh = _focused_candidate(("criterion-1",),
+                                          reason_codes=("deterministic_rule",))
+
+    selection = BehaviorPolicySelector().select(
+        (attending_fresh, attending_starved),
+        constraints=BehaviorPolicyConstraints(
+            current_state=BehaviorState(), available_frameworks=ALL_FRAMEWORKS,
+            goal_set=goal_set),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0), goal_set=goal_set,
+        policy_context={},
+        attention_lease=AttentionLease("lease-tie", ("criterion-1",), 1, 1, 5,
+                                       max_actions=1),
+        attention_last_seen=last_seen, current_action_index=4)
+
+    assert selection.candidate.candidate_id == attending_starved.candidate_id
+    # The chosen candidate relieves starvation rather than deepening it.
+    assert selection.score.starvation_risk == pytest.approx(1 / 3)

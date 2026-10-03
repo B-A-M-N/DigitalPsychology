@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from ..behavior_state import (BEHAVIOR_MODES, FRAMEWORK_MODES, BehaviorState,
                               AttentionLease, CSWBehaviorSnapshot, GoalSetSnapshot)
@@ -513,6 +513,28 @@ class SemanticCandidateEvidence:
         return sum(values) / len(values) if values else None
 
 
+def _fairness_is_forced(legal: Sequence[tuple[BehaviorCandidate, "CandidateScore"]],
+                        constraints: BehaviorPolicyConstraints) -> bool:
+    """True when an external authority makes a fairness breach unavoidable.
+
+    A host-required mode, a CFW requirement, or the WARD floor outrank the
+    fairness preference: the system must still act legally rather than refuse to
+    act. In that case fairness cannot be a hard constraint, so it degrades to the
+    ranking tiebreak.
+    """
+    return constraints.required_mode is not None
+
+
+def _would_violate_fairness(score: "CandidateScore") -> bool:
+    """True when a candidate's projected lease breaches the fairness bound.
+
+    ``starvation_risk`` is normalized projected age over the bound, so a value
+    above one means the candidate would carry an unattended criterion past it.
+    """
+    return (score.starvation_risk is not None
+            and score.starvation_risk > 1.0)
+
+
 @dataclass(frozen=True)
 class CandidateScore:
     candidate_id: str
@@ -710,15 +732,29 @@ class BehaviorPolicySelector:
                 starvation_risk=starvation_risk,
                 estimated_cost=estimated_cost,
             )))
+        # Fairness is a hard constraint, not a preference. A candidate whose
+        # projected lease would push an unattended runnable criterion past the
+        # round-robin bound is excluded unless a host or CFW requirement forces
+        # it, because the production invariant is zero fairness violations.
+        fairness_forced = _fairness_is_forced(legal, constraints)
+        if not fairness_forced:
+            bounded = [pair for pair in legal
+                       if not _would_violate_fairness(pair[1])]
+            if bounded:
+                legal = bounded
         if not legal:
             raise ValueError("all behavior candidates violate host, CFW, CSW, or goal constraints")
 
+        # Starvation pressure is a tiebreak between otherwise legal candidates,
+        # never an opaque weighted reward competing with evidence.
         ranked = sorted(legal, key=lambda pair: (
             pair[1].decision_support,
             pair[1].correct_progress_lower_bound
             if pair[1].correct_progress_lower_bound is not None else -1.0,
             -(pair[1].regression_upper_bound
               if pair[1].regression_upper_bound is not None else 1.0),
+            -(pair[1].starvation_risk
+              if pair[1].starvation_risk is not None else 0.0),
             -pair[1].estimated_cost,
             pair[0].candidate_id,
         ), reverse=True)
