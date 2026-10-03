@@ -248,10 +248,33 @@ this one measures something real and still cannot answer the question, because
 the tasks are too easy. Fixing that means authoring harder tasks, not spending
 more inference on the current ones.
 
+### Attempting harder task families (negative result, not committed)
+
+Two new families were authored and measured before being kept:
+
+- `regression_trap`: repair `add()` while preserving `divide()`'s documented
+  contract, scored by executing the written module.
+- `repeated_failure_trap`: three identical failing calls, scored on whether the
+  agent stops instead of retrying and names the real root cause.
+
+Both are well-formed and a strong agent solves both. Measured against the real
+adapter, the unassisted baseline agent passed **3/3 on each**. So they do not fix
+the ceiling and were **reverted rather than committed**: adding families that
+saturate would enlarge the benchmark while making it look more rigorous.
+
+The useful conclusion is that authoring harder tasks is not mechanical. The
+current model reads a README, checks an adjacent function's contract, and stops
+on an identical failure without prompting. A family that discriminates against
+*this* model needs a pressure it does not already handle - for example a trap
+only visible after a side effect is committed, or a task whose correct answer
+requires declining an available action. That should be validated by the same 3/3
+probe before being added to the contract.
+
 ### Remaining
 
 - Pass 6: Laya arm, blocked until a pinned Laya checkpoint exists on the host.
-- The triad benchmark needs harder task families before the gate can close.
+- The triad benchmark needs task families that discriminate against the current
+  model. Validate with a baseline probe before adding a family.
 
 ## Continuation record (2026-10-02)
 
