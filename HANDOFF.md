@@ -171,10 +171,38 @@ actions 9-13 asserting all three agree.
 | CognitiveFrameWorks | **190 passed** (1 deselected) |
 | CognitiveStateWork | **31 passed** |
 
+### Pass 5 - the cohort was measuring nothing
+
+The most important correction of this pass. The benchmark harness
+(`acceptance-real-agent-benchmark.py`) speaks JSON to an agent subprocess and
+never constructs CFW or binds DP. Every earlier cohort run set only environment
+variables, so the cohorts measured the model, not the systems under test, and
+no starvation, fairness, or mode evidence could possibly have existed in them.
+
+That makes the three discarded runs moot for convergence purposes: they were not
+broken measurements of the systems, they were not measurements of the systems
+at all. The adapter defects found along the way were still real bugs, but
+fixing them would not have produced system evidence.
+
+`scripts/cohort/runtime_harness.py` now builds each composition for real:
+
+- `baseline` - CFW RuntimeSession only.
+- `cfw_csw` - the above plus a real CSW WorkflowAuthority.
+- `cfw_csw_dp` - plus a real DP RuntimeSession bound through
+  `CFWBehaviorAdapter`, the production DP-facing port.
+
+Verified end to end: four committed actions through CFW into DP produce a
+telemetry record with the real fairness bound, zero violations, and the
+criterion actually attended. A configuration that cannot be built is recorded as
+FAILED; one without live provider attestation is INVALID_TREATMENT; telemetry
+for a configuration without DP is absent rather than zeroed.
+
+The canary preflight also caught a defect in itself: it enforced a 512-character
+bound on the agent's `reason` that no evaluator requires, so it would have
+rejected correct work. Removed.
+
 ### Remaining
 
-- Pass 5: close the core triad cohort (baseline, CFW, CFW+CSW, CFW+CSW+DP) with
-  both external outcomes and internal behavioral metrics.
 - Pass 6: Laya arm, blocked until a pinned Laya checkpoint exists on the host.
 - P1-10/11/23 legacy CFW workflow helpers and the duplicate `yaml` import.
 
