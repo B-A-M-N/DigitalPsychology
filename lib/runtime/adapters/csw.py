@@ -15,6 +15,11 @@ from typing import Any, Mapping, Sequence
 from ...behavior_state import CSWBehaviorSnapshot, StateWorkOption
 from ..contracts import RuntimeIdentity
 
+# CSW owns workflow eligibility and composition; this names the port contract
+# DP drives so a version mismatch is caught at session startup instead of on
+# the first workflow transition.
+CSW_WORKFLOW_PORT_VERSION = "1.1.0"
+
 
 @dataclass(frozen=True)
 class CSWWorkflowBinding:
@@ -129,7 +134,11 @@ class CSWRuntimeAdapter:
         return {
             "adapter_kind": "csw-workflow-authority",
             "authority_id": authority_id,
-            "protocol_version": "1.0.0",
+            "protocol_version": CSW_WORKFLOW_PORT_VERSION,
+            # Named explicitly so a host can compare the workflow port it will
+            # drive against the one CSW implements, at startup rather than on
+            # the first workflow transition.
+            "workflow_port_version": CSW_WORKFLOW_PORT_VERSION,
             "scope": hashlib.sha256(scope.encode()).hexdigest(),
             "scope_hash": hashlib.sha256(scope.encode()).hexdigest(),
             "capability_hash": hashlib.sha256(capabilities.encode()).hexdigest(),

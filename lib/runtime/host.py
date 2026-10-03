@@ -81,6 +81,10 @@ class RuntimeHost:
             return existing
         cfw_port = cfw if cfw is not None else NullCFWComponentPort()
         csw_port = csw if csw is not None else NullCSWWorkflowPort()
+        # Check contract versions before the first behavioral decision, so an
+        # incompatible framework or workflow engine is refused at session
+        # startup rather than discovered mid-intervention.
+        self._check_contract_versions(cfw_port, csw_port)
         session = RuntimeSession(
             identity=identity, objective_criteria=objective_criteria,
             objective=objective, controller=self.service, cfw=cfw_port, csw=csw_port,
@@ -95,6 +99,32 @@ class RuntimeHost:
             evicted.close()
             self._sessions.pop(_scope)
         return session
+
+    @staticmethod
+    def _check_contract_versions(cfw: Any, csw: Any) -> None:
+        """Fail closed when an adapter does not declare a compatible contract."""
+        from .cfw_projection import CFW_BEHAVIOR_PROJECTION_VERSION
+        from .adapters.csw import CSW_WORKFLOW_PORT_VERSION
+
+        def _declared(adapter: Any, field: str) -> str | None:
+            provider = getattr(adapter, "authority_identity", None)
+            identity = provider() if callable(provider) else provider
+            if hasattr(identity, "get"):
+                value = identity.get(field)
+                return str(value) if value else None
+            value = getattr(adapter, field, None)
+            return str(value) if value else None
+
+        cfw_version = _declared(cfw, "behavior_projection_version")
+        if cfw_version is not None and cfw_version != CFW_BEHAVIOR_PROJECTION_VERSION:
+            raise ValueError(
+                f"CFW behavior projection version {cfw_version!r} is incompatible "
+                f"with DP's {CFW_BEHAVIOR_PROJECTION_VERSION!r}")
+        csw_version = _declared(csw, "workflow_port_version")
+        if csw_version is not None and csw_version != CSW_WORKFLOW_PORT_VERSION:
+            raise ValueError(
+                f"CSW workflow port version {csw_version!r} is incompatible "
+                f"with DP's {CSW_WORKFLOW_PORT_VERSION!r}")
 
     @staticmethod
     def _same_authority(left: Any, right: Any) -> bool:
