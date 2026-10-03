@@ -41,6 +41,7 @@ class DecisionPreparation:
     decision: BehavioralDecision
     system_one_frame: Mapping[str, Any] | None
     system_one_result: Mapping[str, Any] | None
+    semantic_judgment_used: bool
     attention_last_seen: Mapping[str, int]
     goal_set: GoalSetSnapshot
     fairness_bound_actions: int
@@ -175,7 +176,7 @@ class ControlDecisionEngine:
             raise RuntimeError("DP controller did not apply the host attention lease")
         self._validate_directives(descriptor, request.csw_snapshot, decision)
         return DecisionPreparation(
-            decision, system_one_frame, system_one_result,
+            decision, system_one_frame, system_one_result, judgment is not None,
             attention.last_seen, goal_set,
             fairness_bound_actions=attention.fairness_bound_actions,
             starvation_prevented=attention.starvation_prevented,

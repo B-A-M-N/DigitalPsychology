@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from ..behavior_state import CSWBehaviorSnapshot
+from ..behavior_state import BehaviorState, CSWBehaviorSnapshot
+from ..lease_window import intervention_expiry
+from ..runtime.cfw_projection import build_cfw_behavior_projection
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,11 @@ class ControlActuator:
         candidate_ids, snapshot = self._initial_csw_snapshot()
         self._validate_basis(snapshot, basis)
 
+        projection = build_cfw_behavior_projection(
+            BehaviorState.from_mapping(state),
+            host_action_index=int(basis["host_action_index"]),
+        ).to_dict()
+
         cfw_prepared = None
         cfw_attempted = False
         csw_changes: list[tuple[str, dict[str, Any]]] = []
@@ -64,8 +71,8 @@ class ControlActuator:
             if cfw_connected:
                 cfw_prepared = self.cfw.prepare_behavior_directives(cfw_directives)
                 cfw_attempted = True
-                returned = tuple(self.cfw.apply_behavior_directives(
-                    cfw_prepared, state))
+                returned = tuple(self.cfw.apply_behavior_projection(
+                    cfw_prepared, projection))
                 expected = {item["directive_id"] for item in cfw_directives}
                 if len(returned) != len(set(returned)) or set(returned) != expected:
                     raise RuntimeError("CFW did not confirm the exact prepared directives")
@@ -91,8 +98,7 @@ class ControlActuator:
                         raise RuntimeError("CSW release does not match the current selection")
                     csw_changes.append(("release_statework", {
                         **directive,
-                        "expires_at_action": (int(basis["host_action_index"])
-                                              + int(directive["expires_after_actions"])),
+                        "expires_at_action": self._directive_expiry(directive),
                     }))
                     snapshot = self.csw.deactivate_statework(
                         statework_id,
@@ -106,8 +112,12 @@ class ControlActuator:
                     eligible = {item.statework_id for item in snapshot.eligible_stateworks}
                     if directive.get("value") != "preferred" or statework_id not in eligible:
                         raise RuntimeError("CSW activation is outside current eligibility")
-                    expires_at_action = (int(basis["host_action_index"])
-                                         + int(directive["expires_after_actions"]))
+                    expires_at_action = self._directive_expiry(directive)
+                    owner_expiry = intervention_expiry(
+                        state.get("active_interventions") or (), intervention_id)
+                    if owner_expiry != expires_at_action:
+                        raise RuntimeError(
+                            "CSW activation expiry differs from its owning intervention")
                     csw_changes.append(("prefer_statework", {
                         **directive, "expires_at_action": expires_at_action}))
                     snapshot = self.csw.activate_statework(
@@ -179,20 +189,27 @@ class ControlActuator:
     def lifecycle_revision(self) -> int:
         return self.cfw.lifecycle_revision() if self._cfw_connected() else 0
 
-    def applied_behavior_state(self) -> Mapping[str, Any] | None:
+    def applied_behavior_projection(self) -> Mapping[str, Any] | None:
         if not self._cfw_connected():
             return None
-        return self.cfw.applied_behavior_state()
+        return self.cfw.applied_behavior_projection()
 
-    def synchronize_behavior_state(self, state: Mapping[str, Any]) -> None:
+    def synchronize_behavior_projection(self, projection: Mapping[str, Any]) -> None:
         if self._cfw_connected():
-            self.cfw.synchronize_behavior_state(state)
+            self.cfw.synchronize_behavior_projection(projection)
 
-    def restore_behavior_state(self, state: Mapping[str, Any], *,
-                               expected_current_revision: int) -> None:
+    def restore_behavior_projection(self, projection: Mapping[str, Any], *,
+                                    expected_current_revision: int) -> None:
         if self._cfw_connected():
-            self.cfw.restore_behavior_state(
-                state, expected_current_revision=expected_current_revision)
+            self.cfw.restore_behavior_projection(
+                projection, expected_current_revision=expected_current_revision)
+
+    @staticmethod
+    def _directive_expiry(directive: Mapping[str, Any]) -> int:
+        expiry = directive.get("expires_at_action")
+        if type(expiry) is not int or expiry < 0:
+            raise ValueError("CSW directive lacks its absolute lease expiry")
+        return expiry
 
     def _cfw_connected(self) -> bool:
         return self.cfw is not None and bool(self.cfw.available_component_ids())

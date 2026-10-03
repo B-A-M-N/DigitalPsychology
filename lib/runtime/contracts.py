@@ -179,6 +179,7 @@ class RuntimeObservation:
     approach_epoch: str = ""
     candidate_action: ActionCandidate | None = None
     candidate_preflight_result: str | None = None
+    candidate_rejection_stage: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.action_index, int) or self.action_index < 0:
@@ -209,6 +210,14 @@ class RuntimeObservation:
                     "require_recovery", "require_changed_hypothesis",
                     "require_goal_reanchor"}):
             raise ValueError("candidate preflight result is invalid or has no candidate")
+        if self.candidate_rejection_stage is not None and (
+                self.candidate_preflight_result is None
+                or self.candidate_rejection_stage not in {
+                    "cfw_preflight", "cfw_final_gate"}):
+            raise ValueError("candidate rejection stage is invalid or has no rejection")
+        if (self.candidate_preflight_result is not None
+                and self.candidate_rejection_stage is None):
+            raise ValueError("candidate rejection must identify its authoritative CFW gate")
         # The private control protocol carries a candidate at the pre-action
         # boundary and again only when CFW reports a rejection.
         if not self.action_completed and (
@@ -260,10 +269,15 @@ class CFWComponentPort(Protocol):
 
     def prepare_behavior_directives(self, directives: Sequence[Mapping[str, Any]]) -> Any: ...
 
-    def apply_behavior_directives(self, prepared: Any,
-                                  behavior_state: Mapping[str, Any]) -> Sequence[str]: ...
+    def apply_behavior_projection(self, prepared: Any,
+                                  projection: Mapping[str, Any]) -> Sequence[str]: ...
 
-    def synchronize_behavior_state(self, behavior_state: Mapping[str, Any]) -> None: ...
+    def synchronize_behavior_projection(self, projection: Mapping[str, Any]) -> None: ...
+
+    def restore_behavior_projection(self, projection: Mapping[str, Any], *,
+                                    expected_current_revision: int) -> None: ...
+
+    def applied_behavior_projection(self) -> Mapping[str, Any] | None: ...
 
     def rollback_behavior_directives(self, prepared: Any) -> None: ...
 

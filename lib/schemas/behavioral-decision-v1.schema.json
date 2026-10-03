@@ -28,7 +28,8 @@
         "expected_effect": {"type": "string", "minLength": 1, "maxLength": 512},
         "scope": {"type": "string", "minLength": 1, "maxLength": 256},
         "expires_after_actions": {"type": "integer", "minimum": 1, "maximum": 64},
-        "intervention_id": {"type": "string", "minLength": 1, "maxLength": 128}
+        "intervention_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "expires_at_action": {"type": ["integer", "null"], "minimum": 0}
       }
     },
     "outcome": {

@@ -10,6 +10,7 @@ from ..behavior_state import (
 )
 from .fast_loop_input import FastLoopInput
 from .interventions import InterventionStateBuilder, _mode_exit_condition
+from ..lease_window import lease_window
 
 
 class DirectiveBuilder:
@@ -75,16 +76,19 @@ class DirectiveBuilder:
                     continue
                 expected_effect = target_values[0][3]
                 expiry = 1 if cause == "progress_observed" else self.intervention_expiry_actions
+                window = lease_window(
+                    "PRE_ACTION" if context.pre_action else "POST_ACTION",
+                    context.host_action_index, expiry)
                 intervention = self.intervention_state_builder.new_intervention(
                     scope=context.scope, revision=next_revision, cause=cause,
                     expected_effect=expected_effect,
                     targets=tuple((target, previous, value)
                                   for target, previous, value, _effect in target_values),
                     expiry=expiry,
+                    expires_at_action=window.expires_at_action,
                     target_criteria=tuple(next_focus or attention_ids),
                     baseline_criterion_status=context.criterion_status,
-                    baseline_action_index=max(
-                        0, context.host_action_index - (1 if context.pre_action else 0)),
+                    baseline_action_index=max(0, window.effective_from_action - 1),
                     concurrent_intervention_ids=tuple(
                         item.intervention_id for item in interventions),
                     baseline_goal_set=context.goal_set,
@@ -103,7 +107,8 @@ class DirectiveBuilder:
                         operation=operation, target=directive_target, value=value,
                         cause=cause, expected_effect=effect, scope=context.scope,
                         expires_after_actions=expiry,
-                        intervention_id=intervention.intervention_id))
+                        intervention_id=intervention.intervention_id,
+                        expires_at_action=window.expires_at_action))
                     working = self.intervention_state_builder.set_target(working, target, value)
 
             mode_lease = original.mode_lease
@@ -166,15 +171,18 @@ class DirectiveBuilder:
                 else:
                     condition = condition_for(
                         "statework_fit", tuple(next_focus or attention_ids)[:8])
+                    window = lease_window(
+                        "PRE_ACTION" if context.pre_action else "POST_ACTION",
+                        context.host_action_index, 1)
                     intervention = self.intervention_state_builder.new_intervention(
                         scope=context.scope, revision=next_revision, cause="statework_fit",
                         expected_effect="Use the eligible StateWork that best fits the current behavioral mode; CSW validates and commits it.",
                         targets=((f"statework:{preference[0]}", "unselected", "preferred"),),
                         expiry=1,
+                        expires_at_action=window.expires_at_action,
                         target_criteria=tuple(next_focus or attention_ids),
                         baseline_criterion_status=context.criterion_status,
-                        baseline_action_index=max(
-                            0, context.host_action_index - (1 if context.pre_action else 0)),
+                        baseline_action_index=max(0, window.effective_from_action - 1),
                         concurrent_intervention_ids=tuple(
                             item.intervention_id for item in interventions),
                         baseline_goal_set=context.goal_set,
@@ -189,8 +197,9 @@ class DirectiveBuilder:
                             "statework": preference[0]})[:24],
                         operation="prefer_statework", target=preference[0], value="preferred",
                         cause=intervention.cause, expected_effect=intervention.expected_effect,
-                        scope=context.scope, expires_after_actions=1,
-                        intervention_id=intervention.intervention_id)
+                                scope=context.scope, expires_after_actions=1,
+                                intervention_id=intervention.intervention_id,
+                                expires_at_action=window.expires_at_action)
                     directives.append(directive)
                     working = replace(working, active_interventions=tuple(interventions[-16:]))
             else:

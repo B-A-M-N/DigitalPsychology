@@ -73,7 +73,13 @@ def test_non_action_control_boundary_does_not_age_an_intervention():
         identity=identity, objective="Render the requested page",
         objective_criteria=("criterion-visual",), initial_goal_set=goals,
         available_frameworks=("owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"),
-        csw_authority_identity={"authority": "test"}, host_capabilities={})
+        cfw_authority_identity={
+            "adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
+            "adapter_protocol_version": "1.0.0",
+            "behavior_projection_version": "2.0.0",
+            "scope_hash": "a" * 64, "capability_hash": "b" * 64},
+        csw_authority_identity={},
+        host_capabilities={"cfw_connected": True, "csw_connected": False})
     observation = RuntimeObservation(
         action_index=0, action_completed=False, goal_set=goals,
         active_trigger_codes=("equivalent_retry",), equivalent_retry_count=2,

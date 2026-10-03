@@ -73,8 +73,10 @@ def test_evidence_backed_transitions_are_not_counted_as_thrash():
     """DELIVER -> VERIFY -> DELIVER with real evidence is correct behavior."""
     trace = BehavioralTrace()
     trace.record(_action(0, mode="DELIVER"))
-    trace.record(_action(1, mode="VERIFY"), mode_cause="verification_result")
-    trace.record(_action(2, mode="DELIVER"), mode_cause="verification_result")
+    trace.record(_action(1, mode="VERIFY", authoritative_evidence_classes=(
+        "host_evidence_ref",)), authoritative_evidence=True)
+    trace.record(_action(2, mode="DELIVER", authoritative_evidence_classes=(
+        "host_evidence_ref",)), authoritative_evidence=True)
     assert trace.mode_transitions == 2
     assert trace.rapid_mode_reversals == 0
 
@@ -112,7 +114,9 @@ def test_behavior_counters_accumulate():
     trace = BehavioralTrace()
     trace.record(_action(0, equivalent_retry=True, goal_drift=True, abstained=True,
                           cfw_preflight_rejection=True, cfw_final_rejection=True,
-                          semantic_query=True, attention_rotated=True))
+                          semantic_query=True, attention_rotated=True,
+                          fairness_forced_rotation=True,
+                          attention_lease_started=True))
     assert trace.equivalent_retries == 1
     assert trace.goal_drift_interventions == 1
     assert trace.abstentions == 1
@@ -120,6 +124,8 @@ def test_behavior_counters_accumulate():
     assert trace.cfw_final_gate_rejections == 1
     assert trace.semantic_queries == 1
     assert trace.forced_attention_rotations == 1
+    assert trace.attention_lease_starts == 1
+    assert trace.attention_rotations == 1
 
 
 def test_projection_churn_counts_distinct_digests():
@@ -192,7 +198,10 @@ def test_runtime_session_records_telemetry_from_real_committed_actions(tmp_path)
             identity=_identity(), objective="Render the requested page",
             objective_criteria=("criterion-visual",),
             cfw=CFWRuntimeAdapter(_CFWPort()), csw=csw,
-            outcome_evidence_authority=_EvidenceAuthority(facts))
+            outcome_evidence_authority=_EvidenceAuthority(facts),
+            policy_context={"configuration": "dp+laya",
+                            "semantic_provider_status": "enabled",
+                            "semantic_model_hash": "e" * 64})
         session.process_action(RuntimeObservation(
             action_index=10, equivalent_retry_count=2,
             criterion_status={"criterion-visual": "unmet"}))
@@ -203,6 +212,9 @@ def test_runtime_session_records_telemetry_from_real_committed_actions(tmp_path)
         assert record["evidence_source"] == "internal_host_telemetry"
         assert record["committed_actions"] == 2
         assert record["task_id"] == "task-1"
+        assert record["configuration"] == "cfw+csw+dp"
+        assert record["semantic_provider_status"] == "disabled"
+        assert record["semantic_model_hash"] is None
         # The fairness bound comes from DP's own scheduler, not a constant here.
         assert record["fairness_bound"] > 0
         assert record["required_criterion_coverage"] == ["criterion-visual"]

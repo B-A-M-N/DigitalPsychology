@@ -593,7 +593,7 @@ def test_laya_semantic_gain_improves_retry_decision_without_taking_authority():
         assert receipt.get("authority") != "semantic_provider"
 
 
-# -- P1-7: starvation is a hard fairness constraint, then a tiebreak ------
+# -- P1-7: runnable fairness belongs to the attention scheduler ---------
 
 def _starved_selection(*, action_index, last_seen_value, lease_actions,
                        focus, required_mode=None):
@@ -632,18 +632,12 @@ def _focused_candidate(focus, state=None, *, reason_codes=("continue_current",))
                        focus_criteria=focus))
 
 
-def test_candidate_breaching_the_fairness_bound_is_not_selected():
-    """A candidate whose lease pushes an old criterion past the bound is dropped.
-
-    The alternative candidate rotates to the starved criterion, so its projected
-    age stays inside the bound and it is chosen instead.
-    """
+def test_candidate_scoring_does_not_replace_scheduler_fairness():
+    """Candidate legality is independent from the global runnable-set bound."""
     starved = _focused_candidate(("criterion-0",))
-    rotating = _focused_candidate(("criterion-19",),
-                                  reason_codes=("deterministic_rule",))
 
     selection = BehaviorPolicySelector().select(
-        (starved, rotating),
+        (starved,),
         constraints=BehaviorPolicyConstraints(
             current_state=BehaviorState(), available_frameworks=ALL_FRAMEWORKS,
             goal_set=GoalSetSnapshot(1, tuple(
@@ -657,8 +651,10 @@ def test_candidate_breaching_the_fairness_bound_is_not_selected():
         attention_last_seen={f"criterion-{index}": 0 for index in range(20)},
         current_action_index=20)
 
-    assert selection.candidate.candidate_id != starved.candidate_id
-    assert selection.candidate.candidate_id == rotating.candidate_id
+    assert selection.candidate.candidate_id == starved.candidate_id
+    # The scalar is a saturated ranking signal; attention scheduling performs
+    # the actual round-robin rotation over all runnable criteria.
+    assert selection.score.starvation_risk == 1.0
 
 
 def test_fairness_breach_still_risks_one_when_the_bound_is_respected():

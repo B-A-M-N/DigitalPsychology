@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import json
 from threading import RLock
 from typing import Any, Mapping, Sequence
@@ -11,6 +12,7 @@ from ..behavior_state import (BehaviorDirective, BehaviorIntervention,
                               CSWBehaviorSnapshot, GoalItemSnapshot,
                               GoalSetSnapshot, InterventionOutcome)
 from ..attention import schedule_attention
+from ..lease_window import intervention_expiry
 from ..fast_loop import FastLoopInput
 from ..outcomes import InterventionEvaluationFrame, InterventionEventContext
 from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
@@ -20,6 +22,7 @@ from .contracts import (BehavioralDecisionService, CFWComponentPort,
 from .adapters.standalone import NullCFWComponentPort, NullCSWWorkflowPort
 from .projection import project_behavior_context as _project_behavior_context
 from .store import BehaviorStateStore, RuntimeStateRecord
+from .cfw_projection import build_cfw_behavior_projection
 
 
 @dataclass(frozen=True)
@@ -74,11 +77,24 @@ class RuntimeSession:
         self._latest_goal_set: GoalSetSnapshot | None = None
         # Internal behavioral telemetry for the production cohort gate. It is
         # derived from committed host state, never from agent self-report.
-        from ..telemetry.behavioral_trace import BehavioralTrace
+        from ..telemetry.behavioral_trace import (
+            BehavioralTrace, provider_attestation, provider_status,
+            runtime_configuration,
+        )
+        attestation = provider_attestation(system_one_frame_factory)
+        cfw_connected = bool(self.cfw.available_component_ids())
+        csw_connected = not isinstance(self.csw, NullCSWWorkflowPort)
         self.behavioral_trace = BehavioralTrace(
             task_id=identity.task_id,
-            semantic_provider_status=str(
-                self.policy_context.get("semantic_provider_status") or "disabled"))
+            configuration=runtime_configuration(
+                cfw_connected=cfw_connected, csw_connected=csw_connected,
+                attestation=attestation),
+            semantic_provider_status=provider_status(
+                attestation, factory_configured=system_one_frame_factory is not None),
+            semantic_model_hash=(attestation.get("model_content_hash")
+                                 if attestation else None),
+            semantic_provider_attestation=attestation,
+        )
         self._closed = False
         if system_one_frame_factory is not None and not callable(
                 getattr(controller, "judge", None)):
@@ -130,6 +146,8 @@ class RuntimeSession:
             available_frameworks = tuple(self.cfw.available_component_ids())
             if len(signals) > 32 or any(not hasattr(item, "code") for item in signals):
                 raise ValueError("CFW adapter returned malformed behavioral signals")
+            semantic_attempted = judgment is not None
+            semantic_result = judgment is not None
             if judgment is None and self.system_one_frame_factory is not None:
                 frame = self.system_one_frame_factory(
                     self.identity, self.objective,
@@ -139,15 +157,18 @@ class RuntimeSession:
                 if frame is not None and not isinstance(frame, SystemOneFrame):
                     raise TypeError("System-1 frame factory must return a validated frame")
                 if frame is not None:
+                    semantic_attempted = True
                     if frame.identity.to_dict() != self._system_one_identity().to_dict():
                         raise ValueError("System-1 frame identity escapes the runtime session")
                     judgment_result = self.controller.judge(frame)
                     if hasattr(judgment_result, "judgment"):
+                        semantic_result = getattr(judgment_result, "status", None) == "ok"
                         judgment = (judgment_result.judgment
                                     if getattr(judgment_result, "status", None) == "ok"
                                     else None)
                     else:
                         judgment = judgment_result
+                        semantic_result = judgment_result is not None
             outcome_assessments = self._assess_ready_interventions(
                 record, observation, goal_set=goal_set,
                 attention_last_seen=(attention.last_seen if attention else {}))
@@ -185,6 +206,8 @@ class RuntimeSession:
             cfw_directives = tuple(item for item in decision.directives
                                    if item.operation not in {
                                        "prefer_statework", "release_statework"})
+            cfw_projection = build_cfw_behavior_projection(
+                decision.state, host_action_index=observation.action_index).to_dict()
             prepared = self.cfw.prepare_behavior_directives(
                 tuple(item.to_dict() for item in cfw_directives))
             applied: set[str] = set()
@@ -194,8 +217,8 @@ class RuntimeSession:
             application_event_payloads: list[Mapping[str, Any]] = []
             outcome_event_payloads: list[Mapping[str, Any]] = []
             try:
-                cfw_applied = tuple(self.cfw.apply_behavior_directives(
-                    prepared, decision.state.to_dict()))
+                cfw_applied = tuple(self.cfw.apply_behavior_projection(
+                    prepared, cfw_projection))
                 if len(cfw_applied) != len(set(cfw_applied)):
                     raise RuntimeError("CFW returned duplicate directive receipts")
                 expected_cfw = {item.directive_id for item in cfw_directives}
@@ -241,8 +264,8 @@ class RuntimeSession:
                         expected_selection_revision=updated_snapshot.revision,
                         candidate_statework_ids=candidate_statework_ids,
                         intervention_id=directive.intervention_id,
-                        expires_at_action=(observation.action_index
-                                           + directive.expires_after_actions))
+                        expires_at_action=self._directive_expiry(
+                            directive, decision.state.active_interventions))
                     if statework_id not in updated_snapshot.active_stateworks:
                         raise RuntimeError("CSW did not confirm StateWork activation")
                     applied.add(directive.directive_id)
@@ -298,15 +321,19 @@ class RuntimeSession:
                 # never from the agent's own report of what it did.
                 self._record_behavioral_trace(
                     decision.state, attention=attention,
+                    prior_state=record.state, goal_set=goal_set,
+                    observation=observation, decision=decision,
+                    cfw_signals=signals,
                     action_index=observation.action_index,
-                    cfw_preflight_rejection=bool(observation.candidate_preflight_result
-                                                is not None
-                                                and not getattr(
-                                                    observation.candidate_preflight_result,
-                                                    "allowed", True)),
+                    cfw_preflight_rejection=(
+                        observation.candidate_rejection_stage == "cfw_preflight"),
+                    cfw_final_rejection=(
+                        observation.candidate_rejection_stage == "cfw_final_gate"),
                     applied_directives=tuple(applied),
                     abstained=bool(str(getattr(decision, "reason", "")).startswith("abstain")),
-                    semantic_query=judgment is not None,
+                    semantic_attempted=semantic_attempted,
+                    semantic_result=semantic_result,
+                    semantic_used=judgment is not None,
                 )
             except Exception as failure:
                 compensation_errors = []
@@ -337,8 +364,8 @@ class RuntimeSession:
                                 expected_selection_revision=current.revision,
                                 candidate_statework_ids=candidate_statework_ids,
                                 intervention_id=directive.intervention_id,
-                                expires_at_action=(observation.action_index
-                                                   + directive.expires_after_actions))
+                                expires_at_action=self._directive_expiry(
+                                    directive, record.state.active_interventions))
                         if statework_id not in current.active_stateworks:
                             raise RuntimeError("CSW did not confirm StateWork release rollback")
                     except Exception as exc:
@@ -368,18 +395,58 @@ class RuntimeSession:
             )
 
     def _record_behavioral_trace(self, state: BehaviorState, *, attention: Any,
+                                 prior_state: BehaviorState,
+                                 goal_set: GoalSetSnapshot | None,
+                                 observation: RuntimeObservation,
+                                 decision: BehavioralDecision,
+                                 cfw_signals: Sequence[Any],
                                  action_index: int, cfw_preflight_rejection: bool,
+                                 cfw_final_rejection: bool,
                                  applied_directives: tuple[str, ...],
                                  abstained: bool,
-                                 semantic_query: bool) -> None:
+                                 semantic_attempted: bool,
+                                 semantic_result: bool,
+                                 semantic_used: bool) -> None:
         """Record one committed action's behavioral facts for the cohort gate."""
         from ..telemetry.behavioral_trace import ActionTrace
         last_seen = dict(state.attention_last_seen)
-        ages = {criterion: action_index - last_seen.get(criterion, action_index)
-                for criterion in (attention.lease.criterion_ids
-                                  if attention and attention.lease
-                                  else state.focus_criteria)}
+        runnable = goal_set.runnable_items if goal_set is not None else ()
+        ages = {
+            item.criterion_id: max(0, action_index - last_seen.get(
+                item.criterion_id, max(0, action_index - 1)))
+            for item in runnable
+        }
         mode_lease = state.mode_lease
+        prior_lease = prior_state.attention_lease
+        lease = state.attention_lease
+        lease_started = bool(lease and (prior_lease is None
+                                        or lease.lease_id != prior_lease.lease_id))
+        rotated = bool(prior_lease and lease
+                       and prior_lease.criterion_ids != lease.criterion_ids)
+        prevented = tuple(attention.starvation_prevented if attention else ())
+        evidence_classes = set()
+        if observation.evidence_refs:
+            evidence_classes.add("host_evidence_ref")
+        if observation.progress_made:
+            evidence_classes.add("host_progress")
+        if observation.regression_observed:
+            evidence_classes.add("host_regression")
+        evidence_classes.update("host_trigger:" + code
+                                for code in observation.active_trigger_codes)
+        evidence_classes.update("cfw_signal:" + signal.code for signal in cfw_signals
+                                if signal.active)
+        if semantic_result:
+            evidence_classes.add("semantic_result")
+        if applied_directives:
+            evidence_classes.add("intervention_application_receipt")
+        from .cfw_projection import build_cfw_behavior_projection
+        projection_digest = hashlib.sha256(json.dumps(
+            build_cfw_behavior_projection(
+                state, host_action_index=action_index).to_dict(),
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        retry = "equivalent_retry" in observation.active_trigger_codes
+        drift = any(item.cause in {"goal_drift", "semantic_goal_drift"}
+                    for item in decision.directives)
         trace = self.behavioral_trace
         trace.record(
             ActionTrace(
@@ -390,14 +457,26 @@ class RuntimeSession:
                 fairness_bound=(attention.fairness_bound_actions if attention else 0),
                 max_starvation_age=max(ages.values(), default=0),
                 mode_entered_action=(mode_lease.entered_action if mode_lease else None),
-                attention_rotated=bool(attention and attention.lease
-                                       and attention.lease.start_action == action_index),
+                attention_lease_started=lease_started,
+                attention_rotated=rotated,
+                fairness_forced_rotation=bool(rotated and prevented),
+                fairness_prevented_criteria=prevented,
                 intervention_applied=bool(applied_directives),
                 abstained=abstained,
+                equivalent_retry=retry,
+                goal_drift=drift,
+                projection_digest=projection_digest,
+                semantic_query=semantic_attempted,
+                semantic_attempted=semantic_attempted,
+                semantic_result=semantic_result,
+                semantic_used=semantic_used,
+                semantic_failed=semantic_attempted and not semantic_result,
                 cfw_preflight_rejection=cfw_preflight_rejection,
-                semantic_query=semantic_query,
+                cfw_final_rejection=cfw_final_rejection,
+                authoritative_evidence_classes=tuple(sorted(evidence_classes)),
             ),
             mode_cause=(mode_lease.cause if mode_lease else "mode_transition"),
+            authoritative_evidence=bool(evidence_classes),
         )
 
     def behavioral_trial_record(self, *, trial_id: str,
@@ -456,7 +535,9 @@ class RuntimeSession:
         self._ensure_adapter_state_is_reconcilable(record.state)
         snapshot = self._csw_snapshot()
         projection = self.project_behavior_context(record.state, snapshot)
-        self.cfw.synchronize_behavior_state(record.state.to_dict())
+        self.cfw.synchronize_behavior_projection(
+            build_cfw_behavior_projection(
+                record.state, host_action_index=max(0, record.action_index)).to_dict())
         return self.cfw.before_model_call(
             projection, tool_capable=tool_capable, action_hint=action_hint,
             active_statework_ids=snapshot.active_stateworks)
@@ -468,7 +549,9 @@ class RuntimeSession:
         self._ensure_adapter_state_is_reconcilable(record.state)
         snapshot = self._csw_snapshot()
         projection = self.project_behavior_context(record.state, snapshot)
-        self.cfw.synchronize_behavior_state(record.state.to_dict())
+        self.cfw.synchronize_behavior_projection(
+            build_cfw_behavior_projection(
+                record.state, host_action_index=max(0, record.action_index)).to_dict())
         return self.cfw.before_tool_planning(
             projection, action_hint=action_hint,
             active_statework_ids=snapshot.active_stateworks)
@@ -489,6 +572,15 @@ class RuntimeSession:
         if isinstance(self.cfw, NullCFWComponentPort) and component_lease:
             raise RuntimeError(
                 "CFW is required to reconcile a previously active component intervention")
+
+    @staticmethod
+    def _directive_expiry(directive: BehaviorDirective,
+                          interventions: Sequence[BehaviorIntervention]) -> int:
+        expiry = directive.expires_at_action
+        owner_expiry = intervention_expiry(interventions, directive.intervention_id)
+        if type(expiry) is not int or expiry != owner_expiry:
+            raise RuntimeError("CSW directive expiry differs from its owning intervention")
+        return expiry
 
     def _csw_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None
                       ) -> CSWBehaviorSnapshot:

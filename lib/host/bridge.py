@@ -141,9 +141,13 @@ class HostControlBridge:
     def _boundary_observation(self, boundary_kind: str, *,
                               goal_set: GoalSetSnapshot | None = None,
                               candidate_action: ActionCandidate | None = None,
-                              candidate_preflight_result: str | None = None
+                              candidate_preflight_result: str | None = None,
+                              candidate_rejection_stage: str | None = None
                               ) -> RuntimeObservation:
-        return self.transaction_coordinator._boundary_observation(boundary_kind, goal_set=goal_set, candidate_action=candidate_action, candidate_preflight_result=candidate_preflight_result)
+        return self.transaction_coordinator._boundary_observation(
+            boundary_kind, goal_set=goal_set, candidate_action=candidate_action,
+            candidate_preflight_result=candidate_preflight_result,
+            candidate_rejection_stage=candidate_rejection_stage)
 
     async def _apply_tick_locked(self, observation: RuntimeObservation,
                                  goals: GoalSetSnapshot, *,
@@ -213,6 +217,9 @@ class HostControlBridge:
 
     def _authority_identity(self) -> dict[str, str]:
         return self.projection_manager._authority_identity()
+
+    def _cfw_authority_identity(self) -> dict[str, str]:
+        return self.projection_manager._cfw_authority_identity()
 
     def _csw_snapshot(self) -> tuple[CSWBehaviorSnapshot, tuple[str, ...]]:
         return self.projection_manager._csw_snapshot()

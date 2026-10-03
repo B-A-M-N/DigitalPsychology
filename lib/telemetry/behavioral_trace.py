@@ -20,9 +20,58 @@ Two rules govern this module:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Iterable, Mapping
 
 from ..attention import fairness_bound_actions
+
+
+def provider_attestation(factory: Any) -> dict[str, Any] | None:
+    """Read only capability metadata pinned by DP's real provider handshake."""
+    raw = getattr(factory, "system_one_attestation", None)
+    if not isinstance(raw, Mapping):
+        return None
+    fields = ("backend_id", "model_id", "model_revision", "model_content_hash",
+              "provider_protocol_hash", "calibration_bundle_hash", "provider_mode",
+              "capability_digest")
+    if any(not isinstance(raw.get(name), str) for name in fields):
+        return None
+    digest = re.compile(r"^[0-9a-f]{64}$")
+    if (not digest.fullmatch(raw["model_content_hash"])
+            or not digest.fullmatch(raw["provider_protocol_hash"])
+            or not digest.fullmatch(raw["capability_digest"])
+            or (raw["calibration_bundle_hash"]
+                and not digest.fullmatch(raw["calibration_bundle_hash"]))
+            or raw["provider_mode"] not in {"shadow", "advisory"}):
+        return None
+    families = raw.get("enabled_question_families")
+    if (not isinstance(families, (tuple, list)) or len(families) > 16
+            or any(not isinstance(item, str) or not item for item in families)
+            or len(families) != len(set(families))):
+        return None
+    return {**{name: raw[name] for name in fields},
+            "enabled_question_families": sorted(families)}
+
+
+def runtime_configuration(*, cfw_connected: bool, csw_connected: bool,
+                          attestation: Mapping[str, Any] | None) -> str:
+    """Describe connected authorities from runtime capabilities, not task labels."""
+    parts = (["cfw"] if cfw_connected else [])
+    if csw_connected:
+        parts.append("csw")
+    parts.append("dp")
+    configuration = "+".join(parts)
+    if (attestation is not None
+            and attestation.get("backend_id") == "digitalpsychology-laya-native"):
+        configuration += "+laya"
+    return configuration
+
+
+def provider_status(attestation: Mapping[str, Any] | None, *,
+                    factory_configured: bool) -> str:
+    if attestation is not None:
+        return str(attestation["provider_mode"])
+    return "unattested" if factory_configured else "disabled"
 
 # A reversal within this many committed actions, with no new evidence, is
 # pathological. Legitimate hard interrupts clear the evidence requirement.
@@ -42,15 +91,68 @@ class ActionTrace:
     fairness_bound: int
     max_starvation_age: int
     mode_entered_action: int | None = None
+    attention_lease_started: bool = False
     attention_rotated: bool = False
+    fairness_forced_rotation: bool = False
+    fairness_prevented_criteria: tuple[str, ...] = ()
     intervention_applied: bool = False
     abstained: bool = False
     equivalent_retry: bool = False
     goal_drift: bool = False
     projection_digest: str | None = None
     semantic_query: bool = False
+    semantic_attempted: bool = False
+    semantic_result: bool = False
+    semantic_used: bool = False
+    semantic_failed: bool = False
     cfw_preflight_rejection: bool = False
     cfw_final_rejection: bool = False
+    authoritative_evidence_classes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "focus_criteria", tuple(self.focus_criteria))
+        object.__setattr__(self, "fairness_prevented_criteria",
+                           tuple(self.fairness_prevented_criteria))
+        object.__setattr__(self, "authoritative_evidence_classes",
+                           tuple(self.authoritative_evidence_classes))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_index": self.action_index,
+            "cognitive_mode": self.cognitive_mode,
+            "focus_criteria": list(self.focus_criteria),
+            "attention_ages": dict(self.attention_ages),
+            "fairness_bound": self.fairness_bound,
+            "max_starvation_age": self.max_starvation_age,
+            "mode_entered_action": self.mode_entered_action,
+            "attention_lease_started": self.attention_lease_started,
+            "attention_rotated": self.attention_rotated,
+            "fairness_forced_rotation": self.fairness_forced_rotation,
+            "fairness_prevented_criteria": list(self.fairness_prevented_criteria),
+            "intervention_applied": self.intervention_applied,
+            "abstained": self.abstained,
+            "equivalent_retry": self.equivalent_retry,
+            "goal_drift": self.goal_drift,
+            "projection_digest": self.projection_digest,
+            "semantic_query": self.semantic_query,
+            "semantic_attempted": self.semantic_attempted,
+            "semantic_result": self.semantic_result,
+            "semantic_used": self.semantic_used,
+            "semantic_failed": self.semantic_failed,
+            "cfw_preflight_rejection": self.cfw_preflight_rejection,
+            "cfw_final_rejection": self.cfw_final_rejection,
+            "authoritative_evidence_classes": list(
+                self.authoritative_evidence_classes),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ActionTrace":
+        data = dict(value)
+        for name in ("focus_criteria", "fairness_prevented_criteria",
+                     "authoritative_evidence_classes"):
+            data[name] = tuple(data.get(name) or ())
+        data["attention_ages"] = dict(data.get("attention_ages") or {})
+        return cls(**data)
 
     @property
     def starvation_ratio(self) -> float:
@@ -72,8 +174,9 @@ class BehavioralTrace:
     task_id: str = "unknown"
     semantic_provider_status: str = "disabled"
     semantic_model_hash: str | None = None
+    semantic_provider_attestation: Mapping[str, Any] | None = None
     actions: list[ActionTrace] = field(default_factory=list)
-    _mode_history: list[tuple[int, str, str]] = field(default_factory=list)
+    _mode_history: list[tuple[int, str, str, bool]] = field(default_factory=list)
 
     def record(self, action: ActionTrace, *, mode_cause: str = "mode_transition",
                authoritative_evidence: bool = False) -> None:
@@ -83,10 +186,14 @@ class BehavioralTrace:
         # origin to be measured from.
         if not self._mode_history:
             self._mode_history.append(
-                (action.action_index, action.cognitive_mode, mode_cause))
+                (action.action_index, action.cognitive_mode, mode_cause,
+                 authoritative_evidence
+                 or bool(action.authoritative_evidence_classes)))
         elif self._mode_history[-1][1] != action.cognitive_mode:
             self._mode_history.append(
-                (action.action_index, action.cognitive_mode, mode_cause))
+                (action.action_index, action.cognitive_mode, mode_cause,
+                 authoritative_evidence
+                 or bool(action.authoritative_evidence_classes)))
         self.actions.append(action)
 
     # -- starvation ---------------------------------------------------------
@@ -115,7 +222,28 @@ class BehavioralTrace:
 
     @property
     def forced_attention_rotations(self) -> int:
-        return sum(1 for a in self.actions if a.attention_rotated)
+        return self.fairness_forced_rotations
+
+    @property
+    def attention_lease_starts(self) -> int:
+        return sum(1 for action in self.actions if action.attention_lease_started)
+
+    @property
+    def attention_rotations(self) -> int:
+        return sum(1 for action in self.actions if action.attention_rotated)
+
+    @property
+    def fairness_forced_rotations(self) -> int:
+        return sum(1 for action in self.actions if action.fairness_forced_rotation)
+
+    @property
+    def fairness_prevented_criteria(self) -> tuple[str, ...]:
+        seen: list[str] = []
+        for action in self.actions:
+            for criterion in action.fairness_prevented_criteria:
+                if criterion not in seen:
+                    seen.append(criterion)
+        return tuple(seen)
 
     # -- mode behavior ------------------------------------------------------
 
@@ -137,8 +265,8 @@ class BehavioralTrace:
         history = self._mode_history
         reversals = 0
         for first, second in zip(history, history[1:]):
-            _index_a, mode_a, _cause_a = first
-            index_b, mode_b, cause_b = second
+            _index_a, mode_a, _cause_a, evidence_a = first
+            index_b, mode_b, _cause_b, evidence_b = second
             if mode_a == mode_b:
                 continue
             # The next genuine change of mode after entering mode_b.
@@ -149,7 +277,7 @@ class BehavioralTrace:
             within_window = (third[0] - index_b) <= REVERSAL_WINDOW_ACTIONS
             # New authoritative evidence justifies the move; only unsupported
             # oscillation counts as thrash.
-            justified = cause_b != "mode_transition" or third[2] != "mode_transition"
+            justified = evidence_a or evidence_b or third[3]
             if within_window and not justified:
                 reversals += 1
         return reversals
@@ -207,7 +335,19 @@ class BehavioralTrace:
 
     @property
     def semantic_queries(self) -> int:
-        return sum(1 for a in self.actions if a.semantic_query)
+        return sum(1 for a in self.actions if a.semantic_attempted or a.semantic_query)
+
+    @property
+    def semantic_results(self) -> int:
+        return sum(1 for action in self.actions if action.semantic_result)
+
+    @property
+    def semantic_uses(self) -> int:
+        return sum(1 for action in self.actions if action.semantic_used)
+
+    @property
+    def semantic_failures(self) -> int:
+        return sum(1 for action in self.actions if action.semantic_failed)
 
     def to_dict(self, *, trial_id: str, task_outcome_score: float | None = None,
                 task_completed: bool | None = None) -> dict[str, Any]:
@@ -224,6 +364,10 @@ class BehavioralTrace:
             "fairness_bound": max((a.fairness_bound for a in self.actions), default=0),
             "fairness_violation_count": self.fairness_violation_count,
             "forced_attention_rotations": self.forced_attention_rotations,
+            "attention_lease_starts": self.attention_lease_starts,
+            "attention_rotations": self.attention_rotations,
+            "fairness_forced_rotations": self.fairness_forced_rotations,
+            "fairness_prevented_criteria": list(self.fairness_prevented_criteria),
             "required_criterion_coverage": list(self.required_criterion_coverage),
 
             "mode_transitions": self.mode_transitions,
@@ -240,8 +384,14 @@ class BehavioralTrace:
             "projection_updates": self.projection_updates,
             "unique_projection_digests": self.unique_projection_digests,
             "semantic_queries": self.semantic_queries,
+            "semantic_results": self.semantic_results,
+            "semantic_uses": self.semantic_uses,
+            "semantic_failures": self.semantic_failures,
             "semantic_provider_status": self.semantic_provider_status,
             "semantic_model_hash": self.semantic_model_hash,
+            "semantic_provider_attestation": (
+                dict(self.semantic_provider_attestation)
+                if self.semantic_provider_attestation is not None else None),
         }
         if task_outcome_score is not None:
             record["task_outcome_score"] = task_outcome_score
@@ -251,4 +401,5 @@ class BehavioralTrace:
 
 
 __all__ = ["REVERSAL_WINDOW_ACTIONS", "ActionTrace", "BehavioralTrace",
-           "fairness_bound_actions"]
+           "fairness_bound_actions", "provider_attestation",
+           "provider_status", "runtime_configuration"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
 from threading import RLock
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ..feedback_loop import trusted_state_root
 from .contracts import (BehavioralDecisionService, CFWComponentPort,
@@ -115,12 +115,36 @@ class RuntimeHost:
             value = getattr(adapter, field, None)
             return str(value) if value else None
 
+        if not isinstance(cfw, NullCFWComponentPort):
+            provider = getattr(cfw, "authority_identity", None)
+            cfw_identity = provider() if callable(provider) else provider
+            required = {"adapter_kind", "authority_id", "adapter_protocol_version",
+                        "behavior_projection_version", "scope_hash", "capability_hash"}
+            if not isinstance(cfw_identity, Mapping) or not required.issubset(cfw_identity):
+                raise ValueError("CFW did not advertise its complete authority identity")
+            if (cfw_identity["adapter_kind"] != "cfw-component-runtime"
+                    or cfw_identity["adapter_protocol_version"] != "1.0.0"):
+                raise ValueError("CFW adapter identity or protocol version is incompatible")
         cfw_version = _declared(cfw, "behavior_projection_version")
+        if not isinstance(cfw, NullCFWComponentPort) and cfw_version is None:
+            raise ValueError("CFW did not advertise behavior projection version")
         if cfw_version is not None and cfw_version != CFW_BEHAVIOR_PROJECTION_VERSION:
             raise ValueError(
                 f"CFW behavior projection version {cfw_version!r} is incompatible "
                 f"with DP's {CFW_BEHAVIOR_PROJECTION_VERSION!r}")
+        if not isinstance(csw, NullCSWWorkflowPort):
+            provider = getattr(csw, "authority_identity", None)
+            csw_identity = provider() if callable(provider) else provider
+            required = {"adapter_kind", "authority_id", "adapter_protocol_version",
+                        "workflow_port_version", "scope_hash", "capability_hash"}
+            if not isinstance(csw_identity, Mapping) or not required.issubset(csw_identity):
+                raise ValueError("CSW did not advertise its complete authority identity")
+            if (csw_identity["adapter_kind"] != "csw-workflow-authority"
+                    or csw_identity["adapter_protocol_version"] != "1.0.0"):
+                raise ValueError("CSW adapter identity or protocol version is incompatible")
         csw_version = _declared(csw, "workflow_port_version")
+        if not isinstance(csw, NullCSWWorkflowPort) and csw_version is None:
+            raise ValueError("CSW did not advertise workflow port version")
         if csw_version is not None and csw_version != CSW_WORKFLOW_PORT_VERSION:
             raise ValueError(
                 f"CSW workflow port version {csw_version!r} is incompatible "
@@ -163,9 +187,14 @@ class RuntimeHost:
                                   client: Any = None,
                                   csw_authority_identity: Any = None,
                                   outcome_evidence_connected: bool = False,
+                                  host_policy_context: dict[str, Any] | None = None,
+                                  host_has_stable_objective_context: bool = False,
                                   fault_handler: Any = None):
         """Open a host-driven session whose decisions cross the private DP MCP."""
         from ..host.bridge import HostControlBridge
+        cfw_port = cfw if cfw is not None else NullCFWComponentPort()
+        csw_port = csw if csw is not None else NullCSWWorkflowPort()
+        self._check_contract_versions(cfw_port, csw_port)
         bridge = HostControlBridge(
             identity=identity,
             objective=objective,
@@ -176,6 +205,8 @@ class RuntimeHost:
             client=client,
             csw_authority_identity=csw_authority_identity,
             outcome_evidence_connected=outcome_evidence_connected,
+            host_policy_context=host_policy_context,
+            host_has_stable_objective_context=host_has_stable_objective_context,
             fault_handler=fault_handler,
         )
         await bridge.open()

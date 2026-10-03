@@ -13,7 +13,7 @@ from ...behavior_state import CSWBehaviorSnapshot
 class _PreparedStandaloneDirectives:
     directives: tuple[dict[str, Any], ...]
     prior_controls: Mapping[str, Mapping[str, Any]]
-    prior_state: Mapping[str, Any] | None
+    prior_projection: Mapping[str, Any] | None
 
 
 class NullCFWComponentPort:
@@ -26,11 +26,12 @@ class NullCFWComponentPort:
 
     def __init__(self) -> None:
         self._controls: dict[str, dict[str, Any]] = {}
-        self._behavior_state: dict[str, Any] | None = None
+        self._behavior_projection: dict[str, Any] | None = None
 
     def authority_identity(self) -> Mapping[str, str]:
         return {"adapter_kind": "null-cfw", "authority_id": "none",
-                "protocol_version": "1.0.0", "scope": "none",
+                "adapter_protocol_version": "1.0.0",
+                "behavior_projection_version": "2.0.0", "scope": "none",
                 "capability_hash": sha256(b"digitalpsychology:null-cfw").hexdigest()}
 
     def available_component_ids(self) -> tuple[str, ...]:
@@ -39,13 +40,13 @@ class NullCFWComponentPort:
     def lifecycle_revision(self) -> int:
         return 0
 
-    def applied_behavior_state(self) -> Mapping[str, Any] | None:
-        return self._behavior_state
+    def applied_behavior_projection(self) -> Mapping[str, Any] | None:
+        return self._behavior_projection
 
-    def restore_behavior_state(self, behavior_state: Mapping[str, Any], *,
-                               expected_current_revision: int) -> None:
+    def restore_behavior_projection(self, projection: Mapping[str, Any], *,
+                                    expected_current_revision: int) -> None:
         del expected_current_revision
-        self._behavior_state = dict(behavior_state)
+        self._behavior_projection = dict(projection)
 
     def collect_behavior_signals(self, _observation: Any) -> tuple[()]:
         return ()
@@ -61,16 +62,16 @@ class NullCFWComponentPort:
             directives=normalized,
             prior_controls=MappingProxyType({key: MappingProxyType(dict(value))
                                              for key, value in self._controls.items()}),
-            prior_state=(MappingProxyType(dict(self._behavior_state))
-                         if self._behavior_state is not None else None),
+            prior_projection=(MappingProxyType(dict(self._behavior_projection))
+                              if self._behavior_projection is not None else None),
         )
 
-    def apply_behavior_directives(self, prepared: Any,
-                                  behavior_state: Mapping[str, Any]) -> tuple[str, ...]:
+    def apply_behavior_projection(self, prepared: Any,
+                                  projection: Mapping[str, Any]) -> tuple[str, ...]:
         if not isinstance(prepared, _PreparedStandaloneDirectives):
             raise TypeError("standalone DP directives were not prepared by this port")
-        if not isinstance(behavior_state, Mapping):
-            raise TypeError("DP behavior state must be a mapping")
+        if not isinstance(projection, Mapping):
+            raise TypeError("DP CFW projection must be a mapping")
         controls = dict(self._controls)
         directive_ids = []
         for item in prepared.directives:
@@ -84,21 +85,21 @@ class NullCFWComponentPort:
         if len(directive_ids) != len(set(directive_ids)):
             raise ValueError("standalone DP directive IDs must be unique")
         self._controls = controls
-        self._behavior_state = dict(behavior_state)
+        self._behavior_projection = dict(projection)
         return tuple(directive_ids)
 
-    def synchronize_behavior_state(self, behavior_state: Mapping[str, Any]) -> None:
-        if not isinstance(behavior_state, Mapping):
-            raise TypeError("DP behavior state must be a mapping")
-        self._behavior_state = dict(behavior_state)
+    def synchronize_behavior_projection(self, projection: Mapping[str, Any]) -> None:
+        if not isinstance(projection, Mapping):
+            raise TypeError("DP CFW projection must be a mapping")
+        self._behavior_projection = dict(projection)
 
     def rollback_behavior_directives(self, prepared: Any) -> None:
         if not isinstance(prepared, _PreparedStandaloneDirectives):
             raise TypeError("standalone DP rollback requires its prepared directive batch")
         self._controls = {key: dict(value)
                           for key, value in prepared.prior_controls.items()}
-        self._behavior_state = (dict(prepared.prior_state)
-                                if prepared.prior_state is not None else None)
+        self._behavior_projection = (dict(prepared.prior_projection)
+                                     if prepared.prior_projection is not None else None)
 
     def render_behavior_context(self, context: str, *,
                                 active_statework_ids: Sequence[str] = ()) -> str:

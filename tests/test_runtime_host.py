@@ -28,6 +28,13 @@ class _CFWPort:
                          "severity": "warning", "evidence_refs": []}]
         self.controls = {}
         self.active_statework_contexts = []
+        self.projection = None
+
+    def authority_identity(self):
+        return {"adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
+                "adapter_protocol_version": "1.0.0",
+                "behavior_projection_version": "2.0.0",
+                "scope_hash": "a" * 64, "capability_hash": "b" * 64}
 
     def available_component_ids(self):
         return ("owl", "anchor", "fuse", "ward", "sispis")
@@ -36,21 +43,35 @@ class _CFWPort:
         return tuple(self.signals)
 
     def prepare_behavior_directives(self, directives):
-        return dict(self.controls), tuple(dict(item) for item in directives)
+        return (dict(self.controls), dict(self.projection) if self.projection else None,
+                tuple(dict(item) for item in directives))
 
-    def apply_behavior_directives(self, prepared, behavior_state):
-        _prior, directives = prepared
+    def apply_behavior_projection(self, prepared, projection):
+        _prior, _prior_projection, directives = prepared
         for item in directives:
             self.controls[item["directive_id"]] = item
-        self.behavior_state = dict(behavior_state)
+        self.projection = dict(projection)
         return tuple(item["directive_id"] for item in directives)
 
-    def synchronize_behavior_state(self, behavior_state):
-        self.behavior_state = dict(behavior_state)
+    def synchronize_behavior_projection(self, projection):
+        self.projection = dict(projection)
+
+    @property
+    def applied_behavior_projection(self):
+        return dict(self.projection) if self.projection is not None else None
+
+    def restore_behavior_projection(self, projection, *, expected_current_revision):
+        self.projection = dict(projection)
+
+    @property
+    def lifecycle_revision(self):
+        return (int(self.projection["behavior_revision"])
+                if self.projection is not None else -1)
 
     def rollback_behavior_directives(self, prepared):
-        prior, _directives = prepared
+        prior, prior_projection, _directives = prepared
         self.controls = dict(prior)
+        self.projection = dict(prior_projection) if prior_projection is not None else None
 
     def render_behavior_context(self, context, *, active_statework_ids=()):
         return context
@@ -74,6 +95,11 @@ class _CSWPort:
         self.options = (StateWorkOption(
             "repair", behavior_tags=("recovery",),
             purpose="Rebuild a failed approach from evidence."),)
+
+    def authority_identity(self):
+        return {"adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
+                "adapter_protocol_version": "1.0.0", "workflow_port_version": "1.1.0",
+                "scope_hash": "c" * 64, "capability_hash": "d" * 64}
 
     def behavioral_snapshot(self, *, candidate_statework_ids=None):
         self.requested_candidates.append(tuple(candidate_statework_ids or ()))

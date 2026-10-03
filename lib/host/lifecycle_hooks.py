@@ -98,7 +98,8 @@ class HostLifecycleHooks:
             goal_set: GoalSetSnapshot | None) -> Mapping[str, Any]:
         observation = self.host._boundary_observation(
             "pre_action_rejected", goal_set=goal_set,
-            candidate_action=candidate, candidate_preflight_result=decision)
+            candidate_action=candidate, candidate_preflight_result=decision,
+            candidate_rejection_stage=stage)
         control = await self.host._control_boundary(
             "pre_action_rejected", observation, goal_set=goal_set)
         return {"status": "rejected", "stage": stage, "decision": decision,

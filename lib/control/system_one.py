@@ -112,12 +112,15 @@ def create_system_one_frame_factory(system_one_service: Any):
                 else capability[name])
     enabled = set(system_one_service.enabled_question_families)
     supported = set(field("supported_question_families"))
+    effective_enabled_questions = sorted(enabled & supported)
     available_questions = tuple(item for item in (
         "action_relation", "progress_relation", "retry_relation", "goal_drift",
         "route_preference")
-        if item in enabled and item in supported)
+        if item in effective_enabled_questions)
     if not available_questions:
         return None
+    capability_payload = (capability.to_dict() if callable(
+        getattr(capability, "to_dict", None)) else dict(capability))
     query_planner = SemanticQueryPlanner()
     candidate_generator = BehaviorCandidateGenerator()
     def build(identity: RuntimeIdentity, objective: str,
@@ -338,6 +341,23 @@ def create_system_one_frame_factory(system_one_service: Any):
             questions=questions,
         )
 
+    attestation = {
+        "backend_id": str(field("backend_id")),
+        "model_id": str(field("model_id")),
+        "model_revision": str(field("model_revision")),
+        "model_content_hash": str(field("model_content_hash")),
+        "provider_protocol_hash": str(field("provider_protocol_hash")),
+        "calibration_bundle_hash": str(system_one_service.calibration_bundle_hash),
+        "enabled_question_families": effective_enabled_questions,
+        "provider_mode": str(system_one_service.mode),
+        "capability_digest": canonical_hash({
+            "capability": capability_payload,
+            "provider_mode": system_one_service.mode,
+            "enabled_question_families": effective_enabled_questions,
+            "calibration_bundle_hash": system_one_service.calibration_bundle_hash,
+        }),
+    }
+    build.system_one_attestation = attestation
     return build
 
 

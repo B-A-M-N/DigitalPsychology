@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import pytest
 
 from lib.behavior_state import (CSWBehaviorSnapshot, GoalItemSnapshot,
                                 GoalSetSnapshot, StateWorkOption)
@@ -13,6 +14,7 @@ from lib.control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
                                   ControlTickRequest)
 from lib.host import (HostControlBridge, InProcessControlClient, MCPControlClient,
                       MCPControlUnavailable)
+from lib.host.mcp_client import ClientSession, StdioServerParameters, stdio_client
 from lib.control.service import ControlPlaneService
 from lib.runtime.store import BehaviorStateStore
 from lib.service import DigitalPsychologyService
@@ -37,6 +39,13 @@ class _CFWPort:
         self.preflight_decision = preflight_decision
         self.final_decision = final_decision
         self.action_gate_calls = []
+        self._projection = None
+
+    def authority_identity(self):
+        return {"adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
+                "adapter_protocol_version": "1.0.0",
+                "behavior_projection_version": "2.0.0",
+                "scope_hash": "a" * 64, "capability_hash": "b" * 64}
 
     @staticmethod
     def _action_digest(action):
@@ -62,35 +71,39 @@ class _CFWPort:
 
     @property
     def lifecycle_revision(self):
-        return int(self._state["revision"]) if self._state is not None else -1
+        return int(self._state["behavior_revision"]) if self._state is not None else -1
 
     @property
-    def applied_behavior_state(self):
-        return dict(self._state) if self._state is not None else None
+    def applied_behavior_projection(self):
+        return dict(self._projection) if self._projection is not None else None
 
     def prepare_behavior_directives(self, directives):
-        return (dict(self.controls), dict(self._state) if self._state else None,
+        return (dict(self.controls), dict(self._projection) if self._projection else None,
                 tuple(dict(item) for item in directives))
 
-    def apply_behavior_directives(self, prepared, behavior_state):
+    def apply_behavior_projection(self, prepared, projection):
         _controls, _prior, directives = prepared
-        self._state = dict(behavior_state)
+        self._projection = dict(projection)
+        self._state = dict(projection)
         self.controls = {**self.controls,
                          **{item["directive_id"]: item for item in directives}}
         return tuple(item["directive_id"] for item in directives)
 
-    def synchronize_behavior_state(self, behavior_state):
-        self._state = dict(behavior_state)
+    def synchronize_behavior_projection(self, projection):
+        self._projection = dict(projection)
+        self._state = dict(projection)
 
     def rollback_behavior_directives(self, prepared):
         controls, prior, _directives = prepared
         self.controls = dict(controls)
+        self._projection = dict(prior) if prior is not None else None
         self._state = dict(prior) if prior is not None else None
 
-    def restore_behavior_state(self, behavior_state, *, expected_current_revision):
+    def restore_behavior_projection(self, projection, *, expected_current_revision):
         if self.lifecycle_revision != expected_current_revision:
             raise RuntimeError("stale CFW lifecycle revision")
-        self._state = dict(behavior_state)
+        self._projection = dict(projection)
+        self._state = dict(projection)
 
     def before_model_call(self, context, **_kwargs):
         return context
@@ -114,8 +127,9 @@ class _CSWPort:
         return ("repair",)
 
     def authority_identity(self):
-        return {"adapter_kind": "test-csw", "scope_hash": "b" * 64,
-                "capability_hash": "c" * 64}
+        return {"adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
+                "adapter_protocol_version": "1.0.0", "workflow_port_version": "1.1.0",
+                "scope_hash": "b" * 64, "capability_hash": "c" * 64}
 
     def behavioral_snapshot(self, *, candidate_statework_ids=None):
         candidates = set(candidate_statework_ids or ("repair",))
@@ -193,9 +207,9 @@ def _goal_set(revision=1):
         criterion_id="criterion-visual", status="READY"),))
 
 
-class _CapturingControlClient(MCPControlClient):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+class _CapturingControlClient(InProcessControlClient):
+    def __init__(self, control_service, *, close_service=False):
+        super().__init__(control_service, close_service=close_service)
         self.prepared_requests = []
 
     async def prepare_control_tick(self, request):
@@ -216,7 +230,25 @@ def _client(tmp_path, *, client_type=MCPControlClient):
                        timeout_seconds=20)
 
 
-def _bridge(tmp_path, *, identity, goal_set, cfw_port, csw_port, client=None):
+def _in_process_client(tmp_path, *, client_type=InProcessControlClient,
+                       close_service=True):
+    decision_service = DigitalPsychologyService(
+        event_db=tmp_path / "local-events.sqlite3",
+        system_one_service=SystemOneService(
+            DisabledSystemOneBackend(), mode="disabled"))
+    control = ControlPlaneService(
+        decision_service=decision_service,
+        state_store=BehaviorStateStore(tmp_path / "local-behavior.sqlite3"))
+    return client_type(control, close_service=close_service)
+
+
+_MCP_STDIO_AVAILABLE = all(
+    dependency is not None
+    for dependency in (ClientSession, StdioServerParameters, stdio_client))
+
+
+def _bridge(tmp_path, *, identity, goal_set, cfw_port, csw_port, client=None,
+            host_policy_context=None):
     return HostControlBridge(
         identity=identity,
         objective="Render the requested page",
@@ -225,6 +257,7 @@ def _bridge(tmp_path, *, identity, goal_set, cfw_port, csw_port, client=None):
         cfw=CFWRuntimeAdapter(cfw_port),
         csw=csw_port,
         client=client or _client(tmp_path),
+        host_policy_context=host_policy_context,
     )
 
 
@@ -260,7 +293,7 @@ def test_dp_mcp_outage_keeps_host_runtime_usable():
             criterion_status={"criterion-visual": "unmet"},
         ))
         assert result["status"] == "degraded"
-        assert cfw.applied_behavior_state is None
+        assert cfw.applied_behavior_projection is None
         assert csw.expiration_calls == [1]
         assert csw.active == ()
         await bridge.close()
@@ -268,6 +301,8 @@ def test_dp_mcp_outage_keeps_host_runtime_usable():
     asyncio.run(run())
 
 
+@pytest.mark.skipif(not _MCP_STDIO_AVAILABLE,
+                    reason="MCP stdio transport dependencies are unavailable")
 def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
     async def run():
         cfw = _CFWPort()
@@ -287,7 +322,7 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
             assert result["behavior_state"]["cognitive_mode"] == "RECOVER"
             assert csw.active == ("repair",)
             assert cfw.lifecycle_revision == 1
-            assert cfw.applied_behavior_state["revision"] == 1
+            assert cfw.applied_behavior_projection["source_revision"] == 1
             assert cfw.controls
             context = await bridge.before_model_call("base host context")
             assert "CURRENT BEHAVIOR GUIDANCE" in context
@@ -333,6 +368,73 @@ def test_in_process_client_runs_the_same_host_bridge_transaction(tmp_path):
     asyncio.run(run())
 
 
+def test_private_control_plane_persists_actions_and_boundary_transitions_separately(
+        tmp_path):
+    async def run():
+        identity = _identity("persisted-control-trace")
+        goals = _goal_set()
+        decision_service = DigitalPsychologyService(
+            event_db=tmp_path / "trace-events.sqlite3",
+            system_one_service=SystemOneService(
+                DisabledSystemOneBackend(), mode="disabled"))
+        store = BehaviorStateStore(tmp_path / "trace-behavior.sqlite3")
+        control = ControlPlaneService(
+            decision_service=decision_service, state_store=store)
+        client = InProcessControlClient(control)
+        bridge = _bridge(
+            tmp_path, identity=identity, goal_set=goals,
+            cfw_port=_CFWPort(preflight_decision="require_confirmation"),
+            csw_port=_CSWPort(), client=client,
+            host_policy_context={
+                "configuration": "cfw+csw+dp+laya",
+                "semantic_provider_status": "enabled",
+                "semantic_model_hash": "d" * 64,
+                "deliverable_kind": "visual_ui",
+            })
+        try:
+            await bridge.open()
+            rejected = await bridge.before_action_candidate(
+                ActionCandidate(
+                    action_class="external_write",
+                    proposed_purpose="Publish the result",
+                    affected_criterion_ids=("criterion-visual",),
+                    action_id="rejected-publish", tool_name="deploy",
+                    operation="publish", mutating=True, reversible=False,
+                    external=True),
+                cfw_action_request={
+                    "tool_binding_id": "deploy", "arguments": {"target": "prod"}})
+            assert rejected["stage"] == "cfw_preflight"
+            for action_index in (1, 2):
+                result = await bridge.after_action(RuntimeObservation(
+                    action_index=action_index,
+                    criterion_status={"criterion-visual": "unmet"},
+                ), goal_set=goals)
+                assert result["status"] == "ready"
+
+            trial = control.behavioral_trial_record(
+                identity.scope, trial_id="trace-trial")
+            actions = store.behavioral_action_traces(identity.scope)
+            transitions = store.committed_control_transitions(identity.scope)
+            assert trial["committed_actions"] == 2
+            assert [item["action_index"] for item in actions] == [1, 2]
+            assert trial["control_transition_count"] == 3
+            assert trial["cfw_preflight_rejections"] == 1
+            assert trial["configuration"] == "cfw+csw+dp"
+            assert trial["semantic_provider_status"] == "disabled"
+            assert trial["semantic_model_hash"] is None
+            assert [item["boundary_sequence"] for item in transitions] == [0, 1, 2]
+            assert transitions[0]["boundary_kind"] == "pre_action_rejected"
+            assert transitions[0]["cfw_rejection_stage"] == "cfw_preflight"
+            assert all("basis" not in item for item in transitions)
+        finally:
+            await bridge.close()
+            control.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(not _MCP_STDIO_AVAILABLE,
+                    reason="MCP stdio transport dependencies are unavailable")
 def test_private_stdio_mcp_abort_response_keeps_protocol_version(tmp_path):
     async def run():
         identity = _identity("abort-protocol-task")
@@ -430,7 +532,8 @@ def test_candidate_action_is_committed_before_execution_without_advancing_action
         cfw = _CFWPort()
         goals = _goal_set()
         bridge = _bridge(tmp_path, identity=_identity("candidate-task"),
-                         goal_set=goals, cfw_port=cfw, csw_port=_CSWPort())
+                         goal_set=goals, cfw_port=cfw, csw_port=_CSWPort(),
+                         client=_in_process_client(tmp_path))
         try:
             opened = await bridge.open()
             assert opened["status"] == "ready"
@@ -471,7 +574,8 @@ def test_cfw_preflight_rejection_is_reported_to_dp_without_advancing_action_inde
     async def run():
         cfw = _CFWPort(preflight_decision="require_confirmation")
         goals = _goal_set()
-        client = _client(tmp_path, client_type=_CapturingControlClient)
+        client = _in_process_client(
+            tmp_path, client_type=_CapturingControlClient, close_service=True)
         bridge = _bridge(tmp_path, identity=_identity("rejected-candidate-task"),
                          goal_set=goals, cfw_port=cfw, csw_port=_CSWPort(),
                          client=client)
@@ -515,7 +619,8 @@ def test_cfw_final_gate_rejection_is_reported_to_dp_after_pre_action_tick(tmp_pa
         cfw = _CFWPort(final_decision="require_reinspection")
         goals = _goal_set()
         bridge = _bridge(tmp_path, identity=_identity("final-rejection-task"),
-                         goal_set=goals, cfw_port=cfw, csw_port=_CSWPort())
+                         goal_set=goals, cfw_port=cfw, csw_port=_CSWPort(),
+                         client=_in_process_client(tmp_path))
         try:
             await bridge.open()
             result = await bridge.before_action_candidate(
@@ -550,8 +655,9 @@ def test_restart_reconciles_applied_prepare_before_mcp_commit(tmp_path):
         goals = _goal_set()
         cfw = _CFWPort()
         csw = _CSWPort()
+        client = _in_process_client(tmp_path, close_service=False)
         first = _bridge(tmp_path, identity=identity, goal_set=goals,
-                        cfw_port=cfw, csw_port=csw)
+                        cfw_port=cfw, csw_port=csw, client=client)
         await first.open()
         observation = RuntimeObservation(
             action_index=1, equivalent_retry_count=2,
@@ -572,7 +678,7 @@ def test_restart_reconciles_applied_prepare_before_mcp_commit(tmp_path):
         await first.client.close()
 
         resumed = _bridge(tmp_path, identity=identity, goal_set=goals,
-                          cfw_port=cfw, csw_port=csw)
+                          cfw_port=cfw, csw_port=csw, client=client)
         try:
             state = await resumed.open()
             assert state["status"] == "ready"
@@ -581,5 +687,6 @@ def test_restart_reconciles_applied_prepare_before_mcp_commit(tmp_path):
             assert csw.active == ("repair",)
         finally:
             await resumed.close()
+            await client.close()
 
     asyncio.run(run())

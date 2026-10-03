@@ -26,13 +26,18 @@ class HostProjectionManager:
             objective_criteria=self.host.objective_criteria,
             initial_goal_set=self.host.goal_set,
             available_frameworks=self.host._cfw_components,
+            cfw_authority_identity=self.host._cfw_authority_identity(),
             csw_authority_identity=self.host._csw_identity,
             host_capabilities={
                 "cfw_connected": bool(self.host._cfw_components),
                 "csw_connected": self.host.csw is not None,
                 "outcome_evidence_connected": self.host.outcome_evidence_connected,
                 "host_initiated": True,
-                "policy_context": dict(self.host.host_policy_context),
+                "policy_context": {
+                    **dict(self.host.host_policy_context),
+                    "host_has_stable_objective_context": (
+                        self.host.host_has_stable_objective_context),
+                },
             },
         )
 
@@ -71,6 +76,17 @@ class HostProjectionManager:
             "scope_hash": self.host.identity.scope,
             "capability_hash": snapshot.snapshot_id,
         }
+
+    def _cfw_authority_identity(self) -> dict[str, str]:
+        if self.host.cfw is None or not self.host._cfw_components:
+            return {}
+        provider = getattr(self.host.cfw, "authority_identity", None)
+        value = provider() if callable(provider) else provider
+        if (not isinstance(value, Mapping)
+                or any(not isinstance(key, str) or not isinstance(item, str)
+                       for key, item in value.items())):
+            raise RuntimeError("CFW did not provide a valid authority identity")
+        return dict(value)
 
     def _csw_snapshot(self) -> tuple[CSWBehaviorSnapshot, tuple[str, ...]]:
         if self.host.csw is None:
@@ -116,13 +132,7 @@ class HostProjectionManager:
                              expected: Mapping[str, Any]) -> bool:
         if actual is None:
             return False
-        actual_projection = dict(actual)
-        expected_projection = dict(expected)
-        # CSW owns workflow selection. CFW's revisioned overlay carries DP
-        # policy but does not duplicate that independent authority's state.
-        actual_projection.pop("active_stateworks", None)
-        expected_projection.pop("active_stateworks", None)
-        return actual_projection == expected_projection
+        return dict(actual) == dict(expected)
 
     @staticmethod
     def _directives(raw: Any) -> tuple[dict[str, Any], ...]:

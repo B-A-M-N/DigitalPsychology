@@ -6,6 +6,7 @@ from typing import Any, Mapping
 from ..behavior_state import BehaviorState, GoalSetSnapshot
 from ..control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
                                 ControlCommitRequest)
+from ..runtime.cfw_projection import build_cfw_behavior_projection
 
 class HostReconciler:
     """Responsibility-focused host bridge collaborator."""
@@ -79,10 +80,13 @@ class HostReconciler:
             self.host._boundary_sequence = int(response.get("boundary_sequence", -1))
             self.host.goal_set = self.host._reported_goal_set(response)
         if not response.get("pending_decisions"):
-            actual = self.host.actuator.applied_behavior_state()
+            actual = self.host.actuator.applied_behavior_projection()
+            expected = build_cfw_behavior_projection(
+                self.host._state,
+                host_action_index=max(0, self.host._action_index)).to_dict()
             if self.host._cfw_components and not self.host._same_cfw_projection(
-                    actual, self.host._state.to_dict()):
-                self.host.actuator.synchronize_behavior_state(self.host._state.to_dict())
+                    actual, expected):
+                self.host.actuator.synchronize_behavior_projection(expected)
         if not unresolved:
             self.host._fault = None
             self.host._needs_reconciliation = False
@@ -109,9 +113,11 @@ class HostReconciler:
             elif directive["operation"] == "prefer_statework":
                 expected_active.add(directive["target"])
         snapshot, candidates = self.host._csw_snapshot()
-        actual_cfw = self.host.actuator.applied_behavior_state()
+        actual_cfw = self.host.actuator.applied_behavior_projection()
+        expected_cfw = build_cfw_behavior_projection(
+            candidate, host_action_index=int(basis["host_action_index"])).to_dict()
         cfw_matches = (not self.host._cfw_components or (
-            actual_cfw == candidate
+            self.host._same_cfw_projection(actual_cfw, expected_cfw)
             and self.host._current_cfw_revision() == int(candidate["revision"])))
         csw_matches = set(snapshot.active_stateworks) == expected_active
         owns_activation = getattr(self.host.csw, "activation_matches", None)
@@ -169,16 +175,18 @@ class HostReconciler:
                     expected_selection_revision=snapshot.revision,
                     candidate_statework_ids=candidates,
                     intervention_id=directive["intervention_id"],
-                    expires_at_action=(int(basis["host_action_index"])
-                                       + int(directive["expires_after_actions"])),
+                    expires_at_action=self._directive_expiry(directive),
                 )
             except Exception as exc:
                 rollback_errors.append(f"CSW activation recovery failed: {exc}")
         committed_state = BehaviorState.from_mapping(self.host._state.to_dict())
         if self.host._cfw_components:
             try:
-                self.host.actuator.restore_behavior_state(
-                    committed_state.to_dict(),
+                committed_projection = build_cfw_behavior_projection(
+                    committed_state,
+                    host_action_index=max(0, self.host._action_index)).to_dict()
+                self.host.actuator.restore_behavior_projection(
+                    committed_projection,
                     expected_current_revision=self.host._current_cfw_revision(),
                 )
             except Exception as exc:
@@ -201,6 +209,13 @@ class HostReconciler:
                 rollback_errors)
             self.host._notify_fault(self.host._fault)
         return bool(rollback_errors)
+
+    @staticmethod
+    def _directive_expiry(directive: Mapping[str, Any]) -> int:
+        expiry = directive.get("expires_at_action")
+        if type(expiry) is not int or expiry < 0:
+            raise ValueError("CSW recovery directive lacks its absolute lease expiry")
+        return expiry
 
     def _accept_committed(self, result: Mapping[str, Any],
                           goal_set: GoalSetSnapshot) -> None:

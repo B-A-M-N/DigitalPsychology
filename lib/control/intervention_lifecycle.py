@@ -221,7 +221,8 @@ class InterventionLifecycle:
                                 expected_effect=(
                                     "Release the CSW StateWork activated by this temporary DP lease."),
                                 scope=context.scope, expires_after_actions=1,
-                                intervention_id=closed.intervention_id))
+                                intervention_id=closed.intervention_id,
+                                expires_at_action=closed.expires_at_action))
                     continue
                 before = self.state_builder.target_value(working, target.target)
                 working = self.state_builder.set_target(working, target.target, target.previous_value)
@@ -244,7 +245,8 @@ class InterventionLifecycle:
                     value=target.previous_value, cause=cause,
                     expected_effect="Release a temporary behavior change after its trigger clears or expires.",
                     scope=context.scope, expires_after_actions=1,
-                    intervention_id=closed.intervention_id))
+                    intervention_id=closed.intervention_id,
+                    expires_at_action=closed.expires_at_action))
 
         return working, directives, mode_hold
 

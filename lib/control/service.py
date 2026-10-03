@@ -65,6 +65,7 @@ class ControlPlaneService:
 
     def open_control_session(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         descriptor = ControlSessionDescriptor.from_mapping(raw)
+        self._validate_session_capabilities(descriptor)
         scope = descriptor.control_session_id
         self.state_store.register_control_session(scope, descriptor.to_dict())
         record = self.state_store.load(scope)
@@ -84,6 +85,43 @@ class ControlPlaneService:
                 "max_active_stateworks": 16,
             },
         }
+
+    def _validate_session_capabilities(self,
+                                       descriptor: ControlSessionDescriptor) -> None:
+        """Fail closed on actuation versions and provider-required task semantics."""
+        from ..runtime.cfw_projection import CFW_BEHAVIOR_PROJECTION_VERSION
+        from ..runtime.adapters.csw import CSW_WORKFLOW_PORT_VERSION
+
+        capabilities = descriptor.host_capabilities
+        if capabilities["cfw_connected"]:
+            if (descriptor.cfw_authority_identity.get("adapter_kind")
+                    != "cfw-component-runtime"
+                    or descriptor.cfw_authority_identity.get(
+                        "adapter_protocol_version") != "1.0.0"):
+                raise ValueError("CFW adapter identity or protocol version is incompatible")
+            actual = descriptor.cfw_authority_identity.get(
+                "behavior_projection_version")
+            if actual != CFW_BEHAVIOR_PROJECTION_VERSION:
+                raise ValueError(
+                    f"CFW behavior projection version {actual!r} is incompatible "
+                    f"with DP's {CFW_BEHAVIOR_PROJECTION_VERSION!r}")
+        if capabilities["csw_connected"]:
+            if (descriptor.csw_authority_identity.get("adapter_kind")
+                    != "csw-workflow-authority"
+                    or descriptor.csw_authority_identity.get(
+                        "adapter_protocol_version") != "1.0.0"):
+                raise ValueError("CSW adapter identity or protocol version is incompatible")
+            actual = descriptor.csw_authority_identity.get("workflow_port_version")
+            if actual != CSW_WORKFLOW_PORT_VERSION:
+                raise ValueError(
+                    f"CSW workflow port version {actual!r} is incompatible "
+                    f"with DP's {CSW_WORKFLOW_PORT_VERSION!r}")
+        if self.engine.system_one_frame_factory is not None:
+            from .system_one import _deliverable_kind
+            policy_context = capabilities.get("policy_context") or {}
+            if not isinstance(policy_context, Mapping):
+                raise ValueError("host semantic policy context must be a mapping")
+            _deliverable_kind(policy_context, provider_enabled=True)
 
     def prepare_control_tick(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         request = ControlTickRequest.from_mapping(raw)
@@ -123,6 +161,19 @@ class ControlPlaneService:
             "goal_set": request.goal_set.to_dict(),
             "attention_fairness_bound_actions": preparation.fairness_bound_actions,
             "attention_starvation_prevented": list(preparation.starvation_prevented),
+            "semantic_query_attempted": preparation.system_one_frame is not None,
+            "semantic_judgment_used": preparation.semantic_judgment_used,
+            "behavioral_facts": {
+                "active_trigger_codes": list(request.observation.active_trigger_codes),
+                "equivalent_retry_count": request.observation.equivalent_retry_count,
+                "candidate_preflight_result": request.observation.candidate_preflight_result,
+                "candidate_rejection_stage": request.observation.candidate_rejection_stage,
+                "evidence_refs": list(request.observation.evidence_refs),
+                "progress_made": request.observation.progress_made,
+                "regression_observed": request.observation.regression_observed,
+                "cfw_signal_codes": [signal.code for signal in request.cfw_signals
+                                     if signal.active],
+            },
         }
         if preparation.system_one_frame is not None:
             basis["system_one"] = {
@@ -231,6 +282,12 @@ class ControlPlaneService:
                                   for item in outcome_events],
             "commit_digest": commit_digest,
         }
+        action_trace = (self._committed_action_trace(
+            descriptor, record.state, committed_state, decision, basis,
+            application_events)
+            if basis.get("boundary_kind") == "post_action" else None)
+        transition_trace = self._control_transition_trace(
+            scope, record.state, committed_state, decision, basis)
         self.state_store.save(
             scope,
             expected_revision=record.state.revision,
@@ -242,9 +299,189 @@ class ControlPlaneService:
             outbox_events=event_values,
             control_tick_id=request.tick_id,
             control_tick_result=result,
+            behavioral_action_trace=(action_trace.to_dict()
+                                     if action_trace is not None else None),
+            behavioral_control_transition=transition_trace,
         )
         self._dispatch_outbox(scope)
         return result
+
+    @staticmethod
+    def _control_transition_trace(scope: str, prior_state: BehaviorState,
+                                  state: BehaviorState,
+                                  decision: BehavioralDecision,
+                                  basis: Mapping[str, Any]) -> dict[str, Any]:
+        from ..telemetry.control_trace import ControlTransitionTrace
+
+        facts = dict(basis.get("behavioral_facts") or {})
+        evidence_classes = []
+        if facts.get("evidence_refs"):
+            evidence_classes.append("host_evidence")
+        if facts.get("progress_made"):
+            evidence_classes.append("host_progress")
+        if facts.get("regression_observed"):
+            evidence_classes.append("host_regression")
+        if facts.get("cfw_signal_codes"):
+            evidence_classes.append("cfw_signal")
+        if basis.get("semantic_judgment_used"):
+            evidence_classes.append("semantic_judgment")
+        if facts.get("candidate_rejection_stage"):
+            evidence_classes.append("cfw_action_gate")
+        if not evidence_classes:
+            evidence_classes.append("policy_observation")
+        causes = tuple(dict.fromkeys(
+            [decision.reason] + [item.cause for item in decision.directives]))
+        return ControlTransitionTrace(
+            control_session_id=scope,
+            boundary_sequence=int(basis["boundary_sequence"]),
+            boundary_kind=str(basis["boundary_kind"]),
+            behavior_revision=state.revision,
+            prior_mode=prior_state.cognitive_mode,
+            resulting_mode=state.cognitive_mode,
+            transition_causes=causes,
+            justification_class="+".join(evidence_classes),
+            semantic_query_attempted=bool(basis.get("semantic_query_attempted")),
+            semantic_judgment_used=bool(basis.get("semantic_judgment_used")),
+            cfw_rejection_stage=(str(facts["candidate_rejection_stage"])
+                                 if facts.get("candidate_rejection_stage") else None),
+        ).to_dict()
+
+    @staticmethod
+    def _committed_action_trace(descriptor: ControlSessionDescriptor,
+                                prior_state: BehaviorState,
+                                state: BehaviorState,
+                                decision: BehavioralDecision,
+                                basis: Mapping[str, Any],
+                                application_events: list[Mapping[str, Any]]) -> Any:
+        """Build a committed-action record from private host/control evidence."""
+        from ..attention import fairness_bound_actions
+        from ..runtime.cfw_projection import build_cfw_behavior_projection
+        from ..telemetry.behavioral_trace import ActionTrace
+
+        goal_set = parse_goal_set(basis["goal_set"])
+        action_index = int(basis["host_action_index"])
+        last_seen = dict(state.attention_last_seen)
+        runnable = goal_set.runnable_items
+        ages = {
+            item.criterion_id: max(
+                0, action_index - last_seen.get(item.criterion_id,
+                                                max(0, action_index - 1)))
+            for item in runnable
+        }
+        fairness_bound = int(basis.get(
+            "attention_fairness_bound_actions", fairness_bound_actions(len(runnable))))
+        prior_lease = prior_state.attention_lease
+        lease = state.attention_lease
+        lease_started = bool(lease and (prior_lease is None
+                                        or lease.lease_id != prior_lease.lease_id))
+        rotated = bool(prior_lease and lease
+                       and prior_lease.criterion_ids != lease.criterion_ids)
+        prevented = tuple(str(item) for item in
+                          basis.get("attention_starvation_prevented") or ())
+        facts = dict(basis.get("behavioral_facts") or {})
+        system_one = dict(basis.get("system_one") or {})
+        system_result = system_one.get("result")
+        semantic_attempted = bool(system_one.get("frame"))
+        semantic_result = bool(isinstance(system_result, Mapping)
+                               and system_result.get("status") == "ok")
+        evidence_classes = set()
+        if facts.get("evidence_refs"):
+            evidence_classes.add("host_evidence_ref")
+        if facts.get("progress_made"):
+            evidence_classes.add("host_progress")
+        if facts.get("regression_observed"):
+            evidence_classes.add("host_regression")
+        if facts.get("active_trigger_codes"):
+            evidence_classes.update("host_trigger:" + str(item)
+                                    for item in facts["active_trigger_codes"])
+        if facts.get("cfw_signal_codes"):
+            evidence_classes.update("cfw_signal:" + str(item)
+                                    for item in facts["cfw_signal_codes"])
+        if semantic_result:
+            evidence_classes.add("semantic_result")
+        if facts.get("candidate_preflight_result"):
+            evidence_classes.add("candidate_gate_rejection")
+        if application_events:
+            evidence_classes.add("intervention_application_receipt")
+        projection = build_cfw_behavior_projection(
+            state, host_action_index=action_index).to_dict()
+        projection_digest = hashlib.sha256(_canonical(projection).encode()).hexdigest()
+        newly_applied = bool(application_events)
+        goal_drift = any(
+            item.cause in {"goal_drift", "semantic_goal_drift"}
+            for item in decision.directives)
+        candidate_stage = facts.get("candidate_rejection_stage")
+        return ActionTrace(
+            action_index=action_index,
+            cognitive_mode=state.cognitive_mode,
+            focus_criteria=tuple(state.focus_criteria),
+            attention_ages=ages,
+            fairness_bound=fairness_bound,
+            max_starvation_age=max(ages.values(), default=0),
+            mode_entered_action=(state.mode_lease.entered_action
+                                 if state.mode_lease else None),
+            attention_lease_started=lease_started,
+            attention_rotated=rotated,
+            fairness_forced_rotation=bool(rotated and prevented),
+            fairness_prevented_criteria=prevented,
+            intervention_applied=newly_applied,
+            abstained=decision.reason.startswith("abstain"),
+            equivalent_retry=("equivalent_retry" in
+                              set(facts.get("active_trigger_codes") or ())),
+            goal_drift=goal_drift,
+            projection_digest=projection_digest,
+            semantic_query=semantic_attempted,
+            semantic_attempted=semantic_attempted,
+            semantic_result=semantic_result,
+            semantic_used=semantic_result,
+            semantic_failed=semantic_attempted and not semantic_result,
+            cfw_preflight_rejection=candidate_stage == "cfw_preflight",
+            cfw_final_rejection=candidate_stage == "cfw_final_gate",
+            authoritative_evidence_classes=tuple(sorted(evidence_classes)),
+        )
+
+    def behavioral_trial_record(self, control_session_id: str, *, trial_id: str,
+                                task_outcome_score: float | None = None,
+                                task_completed: bool | None = None) -> dict[str, Any]:
+        """Return persisted action metrics plus separately stored control transitions."""
+        from ..telemetry.behavioral_trace import (
+            ActionTrace, BehavioralTrace, provider_attestation, provider_status,
+            runtime_configuration,
+        )
+
+        descriptor = self._descriptor(control_session_id)
+        attestation = provider_attestation(self.engine.system_one_frame_factory)
+        trace = BehavioralTrace(
+            task_id=descriptor.identity.task_id,
+            configuration=runtime_configuration(
+                cfw_connected=bool(descriptor.available_frameworks),
+                csw_connected=bool(descriptor.host_capabilities.get("csw_connected")),
+                attestation=attestation),
+            semantic_provider_status=provider_status(
+                attestation,
+                factory_configured=self.engine.system_one_frame_factory is not None),
+            semantic_model_hash=(attestation.get("model_content_hash")
+                                 if attestation else None),
+            semantic_provider_attestation=attestation,
+        )
+        for row in self.state_store.behavioral_action_traces(control_session_id):
+            trace.record(ActionTrace.from_dict(row), mode_cause=(
+                str(row.get("authoritative_evidence_classes") or ["mode_transition"])[0]
+                if row.get("authoritative_evidence_classes") else "mode_transition"),
+                         authoritative_evidence=bool(
+                             row.get("authoritative_evidence_classes")))
+        record = trace.to_dict(trial_id=trial_id,
+                               task_outcome_score=task_outcome_score,
+                               task_completed=task_completed)
+        transitions = self.state_store.committed_control_transitions(control_session_id)
+        record["cfw_preflight_rejections"] = sum(
+            1 for item in transitions
+            if item.get("cfw_rejection_stage") == "cfw_preflight")
+        record["cfw_final_gate_rejections"] = sum(
+            1 for item in transitions
+            if item.get("cfw_rejection_stage") == "cfw_final_gate")
+        record["control_transition_count"] = len(transitions)
+        return record
 
     def _validate_applied_authorities(self, decision: BehavioralDecision,
                                       basis: Mapping[str, Any],

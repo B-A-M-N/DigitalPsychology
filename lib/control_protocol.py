@@ -11,7 +11,7 @@ from .outcomes import HostOutcomeFact
 from .runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
 
 
-PROTOCOL_VERSION = "1.3.0"
+PROTOCOL_VERSION = "1.4.0"
 MAX_CONTROL_PAYLOAD_BYTES = 131_072
 CONTROL_BOUNDARY_KINDS = frozenset({
     "task_start", "pre_model_call", "pre_action", "pre_action_rejected", "post_action",
@@ -75,6 +75,7 @@ class ControlSessionDescriptor:
     objective_criteria: tuple[str, ...]
     initial_goal_set: GoalSetSnapshot
     available_frameworks: tuple[str, ...]
+    cfw_authority_identity: Mapping[str, str]
     csw_authority_identity: Mapping[str, str]
     host_capabilities: Mapping[str, Any]
 
@@ -98,6 +99,13 @@ class ControlSessionDescriptor:
                     "owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"}
                        for item in frameworks)):
             raise ValueError("available frameworks are invalid")
+        cfw_authority = dict(_mapping(
+            self.cfw_authority_identity, "cfw_authority_identity"))
+        if len(cfw_authority) > 16 or any(
+                not isinstance(key, str) or not key or len(key) > 64
+                or not isinstance(value, str) or not value or len(value) > 256
+                for key, value in cfw_authority.items()):
+            raise ValueError("CFW authority identity is invalid")
         authority = dict(_mapping(self.csw_authority_identity, "csw_authority_identity"))
         if len(authority) > 16 or any(
                 not isinstance(key, str) or not key or len(key) > 64
@@ -107,8 +115,29 @@ class ControlSessionDescriptor:
         capabilities = dict(_mapping(self.host_capabilities, "host_capabilities"))
         if len(capabilities) > 32:
             raise ValueError("host capabilities exceed their bound")
+        if not isinstance(capabilities.get("cfw_connected"), bool):
+            raise ValueError("host capabilities must declare CFW connectivity")
+        if capabilities["cfw_connected"]:
+            required_cfw = {"adapter_kind", "authority_id", "adapter_protocol_version",
+                            "behavior_projection_version", "scope_hash", "capability_hash"}
+            if not required_cfw.issubset(cfw_authority):
+                raise ValueError("CFW authority identity lacks projection capabilities")
+            if not frameworks:
+                raise ValueError("connected CFW must advertise at least one component")
+        elif cfw_authority:
+            raise ValueError("disconnected CFW cannot supply an authority identity")
+        if not isinstance(capabilities.get("csw_connected"), bool):
+            raise ValueError("host capabilities must declare CSW connectivity")
+        if capabilities["csw_connected"]:
+            required_csw = {"adapter_kind", "authority_id", "adapter_protocol_version",
+                            "workflow_port_version", "scope_hash", "capability_hash"}
+            if not required_csw.issubset(authority):
+                raise ValueError("CSW authority identity lacks workflow capabilities")
+        elif authority:
+            raise ValueError("disconnected CSW cannot supply an authority identity")
         object.__setattr__(self, "objective_criteria", tuple(criteria))
         object.__setattr__(self, "available_frameworks", tuple(item.lower() for item in frameworks))
+        object.__setattr__(self, "cfw_authority_identity", cfw_authority)
         object.__setattr__(self, "csw_authority_identity", authority)
         object.__setattr__(self, "host_capabilities", capabilities)
 
@@ -124,6 +153,7 @@ class ControlSessionDescriptor:
             "objective_criteria": list(self.objective_criteria),
             "initial_goal_set": self.initial_goal_set.to_dict(),
             "available_frameworks": list(self.available_frameworks),
+            "cfw_authority_identity": dict(self.cfw_authority_identity),
             "csw_authority_identity": dict(self.csw_authority_identity),
             "host_capabilities": dict(self.host_capabilities),
         }
@@ -133,7 +163,7 @@ class ControlSessionDescriptor:
         data = dict(_mapping(value, "control session"))
         expected = {"protocol_version", "identity", "objective", "objective_criteria",
                     "initial_goal_set", "available_frameworks", "csw_authority_identity",
-                    "host_capabilities"}
+                    "cfw_authority_identity", "host_capabilities"}
         if set(data) != expected or data["protocol_version"] != PROTOCOL_VERSION:
             raise ValueError("control session protocol version or fields are invalid")
         return cls(
@@ -142,6 +172,7 @@ class ControlSessionDescriptor:
             objective_criteria=tuple(data["objective_criteria"]),
             initial_goal_set=parse_goal_set(data["initial_goal_set"]),
             available_frameworks=tuple(data["available_frameworks"]),
+            cfw_authority_identity=dict(data["cfw_authority_identity"]),
             csw_authority_identity=dict(data["csw_authority_identity"]),
             host_capabilities=dict(data["host_capabilities"]),
         )
@@ -201,6 +232,8 @@ class ControlTickRequest:
         rejected = kind == "pre_action_rejected"
         if rejected != (self.observation.candidate_preflight_result is not None):
             raise ValueError("pre-action rejection must carry exactly one CFW gate result")
+        if rejected != (self.observation.candidate_rejection_stage is not None):
+            raise ValueError("pre-action rejection must identify its CFW gate stage")
         if self.observation.goal_set != self.goal_set:
             raise ValueError("observation and control request goal sets differ")
         refs = set(self.observation.evidence_refs)
@@ -275,6 +308,7 @@ class ControlTickRequest:
                 "candidate_action": (self.observation.candidate_action.to_dict()
                                      if self.observation.candidate_action else None),
                 "candidate_preflight_result": self.observation.candidate_preflight_result,
+                "candidate_rejection_stage": self.observation.candidate_rejection_stage,
             },
             "goal_set": self.goal_set.to_dict(),
             "cfw_signals": [{"source": item.source, "code": item.code,

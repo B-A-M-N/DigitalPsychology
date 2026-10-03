@@ -81,6 +81,20 @@ class BehaviorStateStore:
                     PRIMARY KEY (scope, tick_id),
                     UNIQUE (scope, decision_id)
                 );
+                CREATE TABLE IF NOT EXISTS behavioral_action_traces (
+                    scope TEXT NOT NULL,
+                    action_index INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    PRIMARY KEY (scope, action_index)
+                );
+                CREATE TABLE IF NOT EXISTS behavioral_control_transitions (
+                    scope TEXT NOT NULL,
+                    boundary_sequence INTEGER NOT NULL,
+                    behavior_revision INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    PRIMARY KEY (scope, boundary_sequence),
+                    UNIQUE (scope, boundary_sequence, behavior_revision)
+                );
             CREATE UNIQUE INDEX IF NOT EXISTS control_ticks_one_pending
                 ON control_ticks(scope) WHERE status='prepared';
             """)
@@ -144,7 +158,9 @@ class BehaviorStateStore:
              application_receipts: Mapping[str, tuple[str, ...]] | None = None,
              outbox_events: Sequence[Mapping[str, Any]] = (),
              control_tick_id: str | None = None,
-             control_tick_result: Mapping[str, Any] | None = None) -> None:
+             control_tick_result: Mapping[str, Any] | None = None,
+             behavioral_action_trace: Mapping[str, Any] | None = None,
+             behavioral_control_transition: Mapping[str, Any] | None = None) -> None:
         if state.revision != expected_revision + 1:
             raise ValueError("saved DP behavior state must advance exactly one revision")
         if action_index < 0 and control_tick_id is None:
@@ -177,6 +193,31 @@ class BehaviorStateStore:
                     or len(directive_ids) != len(set(directive_ids))):
                 raise ValueError("intervention application receipt is malformed")
         state_json = json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":"))
+        trace_json = None
+        if behavioral_action_trace is not None:
+            if (not isinstance(behavioral_action_trace, Mapping)
+                    or type(behavioral_action_trace.get("action_index")) is not int
+                    or behavioral_action_trace.get("action_index") != action_index
+                    or control_tick_id is None):
+                raise ValueError("committed action trace does not match its control commit")
+            trace_json = json.dumps(dict(behavioral_action_trace), sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False)
+        transition_json = None
+        transition_sequence = None
+        if behavioral_control_transition is not None:
+            transition = dict(behavioral_control_transition)
+            transition_sequence = transition.get("boundary_sequence")
+            if (control_tick_id is None
+                    or transition.get("control_session_id") != scope
+                    or type(transition_sequence) is not int
+                    or transition_sequence < 0
+                    or transition.get("behavior_revision") != state.revision):
+                raise ValueError(
+                    "control transition trace does not match its committed control state")
+            transition_json = json.dumps(
+                transition, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        elif control_tick_id is not None:
+            raise ValueError("every committed control tick requires a transition trace")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             tick = None
@@ -194,6 +235,10 @@ class BehaviorStateStore:
                                          basis.get("host_action_index", -1))) != action_index):
                     database.rollback()
                     raise RuntimeError("control tick basis differs from the behavior-state commit")
+                if (transition_sequence is None
+                        or int(basis.get("boundary_sequence", -1)) != transition_sequence):
+                    database.rollback()
+                    raise RuntimeError("control transition sequence differs from its tick basis")
             row = database.execute(
                 "SELECT revision, action_index FROM behavior_state WHERE scope=?",
                 (scope,)).fetchone()
@@ -254,6 +299,31 @@ class BehaviorStateStore:
                     "INSERT OR IGNORE INTO runtime_event_outbox "
                     "(scope, event_id, event_json, action_index) VALUES (?, ?, ?, ?)",
                     (scope, event_id, encoded, action_index))
+            if trace_json is not None:
+                prior_trace = database.execute(
+                    "SELECT event_json FROM behavioral_action_traces "
+                    "WHERE scope=? AND action_index=?", (scope, action_index)).fetchone()
+                if prior_trace is not None and prior_trace[0] != trace_json:
+                    database.rollback()
+                    raise RuntimeError("committed action trace changed")
+                database.execute(
+                    "INSERT OR IGNORE INTO behavioral_action_traces "
+                    "(scope, action_index, event_json) VALUES (?, ?, ?)",
+                    (scope, action_index, trace_json))
+            if transition_json is not None:
+                prior_transition = database.execute(
+                    "SELECT event_json FROM behavioral_control_transitions "
+                    "WHERE scope=? AND boundary_sequence=?",
+                    (scope, transition_sequence)).fetchone()
+                if (prior_transition is not None
+                        and prior_transition[0] != transition_json):
+                    database.rollback()
+                    raise RuntimeError("committed control transition changed")
+                database.execute(
+                    "INSERT OR IGNORE INTO behavioral_control_transitions "
+                    "(scope, boundary_sequence, behavior_revision, event_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (scope, transition_sequence, state.revision, transition_json))
             if control_tick_id is not None:
                 result = dict(control_tick_result or {"behavior_revision": state.revision})
                 updated = database.execute(
@@ -362,6 +432,24 @@ class BehaviorStateStore:
                 "basis": json.loads(row[2]), "status": row[3],
                 "result": json.loads(row[4]) if row[4] else None,
                 "detail": json.loads(row[5]) if row[5] else None}
+
+    def behavioral_action_traces(self, scope: str) -> tuple[Mapping[str, Any], ...]:
+        """Read committed-action telemetry, separate from control transitions."""
+        with self._connect() as database:
+            rows = database.execute(
+                "SELECT event_json FROM behavioral_action_traces "
+                "WHERE scope=? ORDER BY action_index", (scope,)).fetchall()
+        return tuple(json.loads(row[0]) for row in rows)
+
+    def committed_control_transitions(self, scope: str
+                                      ) -> tuple[Mapping[str, Any], ...]:
+        """Read durable committed boundary traces, including rejected candidates."""
+        with self._connect() as database:
+            rows = database.execute(
+                "SELECT event_json FROM behavioral_control_transitions "
+                "WHERE scope=? ORDER BY boundary_sequence",
+                (scope,)).fetchall()
+        return tuple(json.loads(row[0]) for row in rows)
 
     def abort_control_tick(self, scope: str, tick_id: str, *,
                            decision_id: str, detail: Mapping[str, Any]) -> Mapping[str, Any]:

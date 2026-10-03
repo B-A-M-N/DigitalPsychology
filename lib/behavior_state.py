@@ -25,6 +25,8 @@ INTERVENTION_OUTCOMES = frozenset({
 INTERVENTION_ATTRIBUTIONS = frozenset({
     "supported", "confounded", "not_attributed", "none", "insufficient",
 })
+MAX_ACTIVE_INTERVENTIONS = 16
+MAX_TARGETS_PER_INTERVENTION = 12
 
 
 def _text(value: Any, name: str, *, limit: int = 256) -> str:
@@ -303,6 +305,7 @@ class BehaviorIntervention:
     expires_after_actions: int
     actions_elapsed: int
     targets: tuple[InterventionTarget, ...]
+    expires_at_action: int | None = None
     target_criteria: tuple[str, ...] = ()
     baseline_criterion_status: Mapping[str, str] = field(default_factory=dict)
     baseline_action_index: int = 0
@@ -332,7 +335,19 @@ class BehaviorIntervention:
             raise ValueError("intervention evaluation horizon is out of bounds")
         if not isinstance(self.baseline_action_index, int) or self.baseline_action_index < 0:
             raise ValueError("baseline action index must be non-negative")
-        if not 1 <= len(self.targets) <= 12:
+        # Persist the absolute last-covered action. Older stored rows omitted
+        # it; their baseline is the last completed action, so duration N ends
+        # at baseline + N under the shared PRE/POST boundary convention.
+        expiry = self.expires_at_action
+        if expiry is None:
+            from .lease_window import lease_window
+            expiry = lease_window(
+                "POST_ACTION", self.baseline_action_index,
+                self.expires_after_actions).expires_at_action
+            object.__setattr__(self, "expires_at_action", expiry)
+        if type(expiry) is not int or expiry < self.baseline_action_index:
+            raise ValueError("intervention absolute expiry is invalid")
+        if not 1 <= len(self.targets) <= MAX_TARGETS_PER_INTERVENTION:
             raise ValueError("intervention must have one to twelve targets")
         if len({target.target for target in self.targets}) != len(self.targets):
             raise ValueError("intervention targets must be unique")
@@ -373,6 +388,7 @@ class BehaviorIntervention:
                 "expected_effect": self.expected_effect,
                 "start_revision": self.start_revision, "scope": self.scope,
                 "expires_after_actions": self.expires_after_actions,
+                "expires_at_action": self.expires_at_action,
                 "evaluation_horizon_actions": self.evaluation_horizon_actions,
                 "actions_elapsed": self.actions_elapsed,
                 "targets": [target.to_dict() for target in self.targets],
@@ -613,7 +629,7 @@ class BehaviorState:
             raise ValueError("unsupported context strategy")
         if self.response_strategy not in {"direct", "detailed", "structured"}:
             raise ValueError("unsupported response strategy")
-        if len(self.active_interventions) > 16:
+        if len(self.active_interventions) > MAX_ACTIVE_INTERVENTIONS:
             raise ValueError("too many active interventions")
         ids = [item.intervention_id for item in self.active_interventions]
         if len(ids) != len(set(ids)):
@@ -676,6 +692,7 @@ class BehaviorDirective:
     scope: str
     expires_after_actions: int
     intervention_id: str
+    expires_at_action: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("directive_id", "target", "cause", "scope", "intervention_id"):
@@ -687,6 +704,10 @@ class BehaviorDirective:
             raise ValueError("unsupported behavior directive operation")
         if not 1 <= self.expires_after_actions <= 64:
             raise ValueError("directive expiry must be between one and 64 actions")
+        if (self.expires_at_action is not None
+                and (type(self.expires_at_action) is not int
+                     or self.expires_at_action < 0)):
+            raise ValueError("directive absolute expiry must be a non-negative action index")
         if self.operation == "set_framework" and self.target.lower() == "ward" \
                 and self.value != "mandatory":
             raise ValueError("behavior directives cannot lower the WARD hard floor")
@@ -696,7 +717,8 @@ class BehaviorDirective:
                 "target": self.target, "value": self.value, "cause": self.cause,
                 "expected_effect": self.expected_effect, "scope": self.scope,
                 "expires_after_actions": self.expires_after_actions,
-                "intervention_id": self.intervention_id}
+                "intervention_id": self.intervention_id,
+                "expires_at_action": self.expires_at_action}
 
 
 @dataclass(frozen=True)

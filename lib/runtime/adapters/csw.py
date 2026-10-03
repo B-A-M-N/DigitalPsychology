@@ -48,6 +48,11 @@ class CSWRuntimeAdapter:
         self.authority = authority
         self.identity = identity
         self.bindings = MappingProxyType(dict(bindings))
+        actual_version = getattr(authority, "workflow_port_version", None)
+        if actual_version != CSW_WORKFLOW_PORT_VERSION:
+            raise ValueError(
+                f"CSW authority workflow port {actual_version!r} is incompatible with "
+                f"DP's {CSW_WORKFLOW_PORT_VERSION!r}")
         if len(self.bindings) > 32:
             raise ValueError("CSW workflow binding set exceeds its bound")
         for statework_id, binding in self.bindings.items():
@@ -134,11 +139,11 @@ class CSWRuntimeAdapter:
         return {
             "adapter_kind": "csw-workflow-authority",
             "authority_id": authority_id,
-            "protocol_version": CSW_WORKFLOW_PORT_VERSION,
+            "adapter_protocol_version": "1.0.0",
             # Named explicitly so a host can compare the workflow port it will
             # drive against the one CSW implements, at startup rather than on
             # the first workflow transition.
-            "workflow_port_version": CSW_WORKFLOW_PORT_VERSION,
+            "workflow_port_version": str(self.authority.workflow_port_version),
             "scope": hashlib.sha256(scope.encode()).hexdigest(),
             "scope_hash": hashlib.sha256(scope.encode()).hexdigest(),
             "capability_hash": hashlib.sha256(capabilities.encode()).hexdigest(),

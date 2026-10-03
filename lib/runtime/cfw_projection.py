@@ -15,19 +15,26 @@ and framework pair fail at startup rather than during the first intervention.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from types import MappingProxyType
 from typing import Any, Mapping
+from ..behavior_state import MAX_ACTIVE_INTERVENTIONS, MAX_TARGETS_PER_INTERVENTION
 
 CFW_BEHAVIOR_PROJECTION_VERSION = "2.0.0"
 
 _MAX_FOCUS = 8
-_MAX_LEASES = 16
+_MAX_LEASES = MAX_ACTIVE_INTERVENTIONS * MAX_TARGETS_PER_INTERVENTION
+_CONTROL_TARGETS = frozenset({
+    "verification_intensity", "exploration_budget", "retry_policy",
+    "recovery_level", "context_strategy", "response_strategy", "focus_criteria",
+})
 
 
 @dataclass(frozen=True)
 class CFWTargetLease:
     """One bounded, expiring control value CFW must hold for DP."""
 
+    lease_id: str
     intervention_id: str
     target: str
     previous_value: str
@@ -36,7 +43,8 @@ class CFWTargetLease:
     source_revision: int
 
     def __post_init__(self) -> None:
-        for name in ("intervention_id", "target", "previous_value", "applied_value"):
+        for name in ("lease_id", "intervention_id", "target", "previous_value",
+                     "applied_value"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value or len(value) > 512:
                 raise ValueError(f"CFW target lease {name} must be bounded text")
@@ -46,7 +54,8 @@ class CFWTargetLease:
                 raise ValueError(f"CFW target lease {name} must be a non-negative integer")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"intervention_id": self.intervention_id, "target": self.target,
+        return {"lease_id": self.lease_id,
+                "intervention_id": self.intervention_id, "target": self.target,
                 "previous_value": self.previous_value,
                 "applied_value": self.applied_value,
                 "expires_at_action": self.expires_at_action,
@@ -69,10 +78,13 @@ class CFWBehaviorProjection:
     response_strategy: str
     target_leases: tuple[CFWTargetLease, ...] = ()
     protocol_version: str = CFW_BEHAVIOR_PROJECTION_VERSION
+    host_action_index: int = 0
 
     def __post_init__(self) -> None:
         if type(self.behavior_revision) is not int or self.behavior_revision < 0:
             raise ValueError("CFW behavior revision must be a non-negative integer")
+        if type(self.host_action_index) is not int or self.host_action_index < 0:
+            raise ValueError("CFW host action index must be non-negative")
         if not isinstance(self.cognitive_mode, str) or not self.cognitive_mode:
             raise ValueError("CFW projection requires a cognitive mode")
         if (not isinstance(self.framework_modes, Mapping)
@@ -97,6 +109,9 @@ class CFWBehaviorProjection:
         leases = tuple(self.target_leases)
         if not isinstance(self.target_leases, (tuple, list)) or len(leases) > _MAX_LEASES:
             raise ValueError("CFW projection target leases exceed their bound")
+        if (any(not isinstance(item, CFWTargetLease) for item in leases)
+                or len({item.lease_id for item in leases}) != len(leases)):
+            raise ValueError("CFW projection target lease identities are malformed")
         object.__setattr__(self, "framework_modes",
                            MappingProxyType(dict(self.framework_modes)))
         object.__setattr__(self, "focus_criteria", focus)
@@ -116,6 +131,7 @@ class CFWBehaviorProjection:
             "context_strategy": self.context_strategy,
             "response_strategy": self.response_strategy,
             "target_leases": [lease.to_dict() for lease in self.target_leases],
+            "host_action_index": self.host_action_index,
         }
 
     @classmethod
@@ -125,7 +141,8 @@ class CFWBehaviorProjection:
         expected = {"protocol_version", "behavior_revision", "cognitive_mode",
                     "framework_modes", "focus_criteria", "verification_intensity",
                     "exploration_budget", "retry_policy", "recovery_level",
-                    "context_strategy", "response_strategy", "target_leases"}
+                    "context_strategy", "response_strategy", "target_leases",
+                    "host_action_index"}
         if set(value) != expected:
             raise ValueError("CFW behavior projection does not match the versioned port")
         version = value.get("protocol_version")
@@ -146,6 +163,7 @@ class CFWBehaviorProjection:
             response_strategy=value["response_strategy"],
             target_leases=leases,
             protocol_version=version,
+            host_action_index=value["host_action_index"],
         )
 
 
@@ -153,49 +171,67 @@ __all__ = ["CFW_BEHAVIOR_PROJECTION_VERSION", "CFWTargetLease", "CFWBehaviorProj
 
 
 def build_cfw_behavior_projection(
-        state: Any, *, directives: tuple[Mapping[str, Any], ...] = (),
-        host_action_index: int = 0) -> CFWBehaviorProjection:
+        state: Any, *, host_action_index: int) -> CFWBehaviorProjection:
     """Project DP's own state into the narrow actuation contract CFW consumes.
 
-    ``directives`` are the CFW-facing control changes DP just decided. Only
-    those become target leases; DP's other intervention bookkeeping stays inside
-    DP. ``host_action_index`` is the action the lease baseline is measured
-    from, so CFW, CSW and DP agree on the expiry boundary.
+    Active target leases come from persisted intervention truth so recovery can
+    reconstruct the same projection without replaying the original directives.
+    ``host_action_index`` is the absolute action boundary shared by all ports.
     """
     if type(host_action_index) is not int or host_action_index < 0:
         raise ValueError("host action index must be a non-negative integer")
 
+    if isinstance(state, Mapping):
+        from ..behavior_state import BehaviorState
+        state = BehaviorState.from_mapping(state)
+
+    def field(value: Any, name: str) -> Any:
+        return value.get(name) if isinstance(value, Mapping) else getattr(value, name)
+
+    def canonical_target(raw: Any) -> str | None:
+        if not isinstance(raw, str) or not raw:
+            return None
+        if raw == "mode":
+            return "mode"
+        if raw.startswith("framework:"):
+            component = raw.split(":", 1)[1].lower()
+            return f"framework:{component}" if component else None
+        if raw.startswith("control:"):
+            name = raw.split(":", 1)[1]
+            return f"control:{name}" if name in _CONTROL_TARGETS else None
+        if raw in _CONTROL_TARGETS:
+            return f"control:{raw}"
+        return None
+
     leases: list[CFWTargetLease] = []
-    for directive in directives:
-        target = directive.get("target")
-        value = directive.get("value")
-        operation = directive.get("operation")
-        if not isinstance(target, str) or not target:
-            continue
-        if operation not in {"set_mode", "set_framework", "set_control"}:
-            continue
-        if isinstance(value, bool) or not isinstance(value, (str, int)):
-            continue
-        duration = directive.get("expires_after_actions")
-        if type(duration) is not int or duration < 0:
-            duration = 0
-        directive_id = directive.get("directive_id")
-        if not isinstance(directive_id, str) or not directive_id:
-            raise ValueError("a CFW target lease requires its owning directive ID")
-        previous = directive.get("previous_value")
-        # A lease must record what it replaced; an unknown baseline is not a
-        # lease, it is an unowned change, so refuse it rather than guess.
-        if not isinstance(previous, (str, int)) or isinstance(previous, bool):
-            raise ValueError(
-                f"CFW target lease for {target!r} lacks its previous value")
-        leases.append(CFWTargetLease(
-            intervention_id=directive_id,
-            target=target,
-            previous_value=str(previous),
-            applied_value=str(value),
-            expires_at_action=host_action_index + duration,
-            source_revision=int(getattr(state, "revision", 0)),
-        ))
+    interventions = field(state, "active_interventions")
+    for intervention in interventions:
+        intervention_id = field(intervention, "intervention_id")
+        source_revision = field(intervention, "start_revision")
+        expires_at_action = field(intervention, "expires_at_action")
+        if (not isinstance(intervention_id, str) or not intervention_id
+                or type(source_revision) is not int
+                or type(expires_at_action) is not int):
+            raise ValueError("active DP intervention lease metadata is malformed")
+        for target_record in field(intervention, "targets"):
+            target = canonical_target(field(target_record, "target"))
+            if target is None:
+                continue
+            previous = field(target_record, "previous_value")
+            applied = field(target_record, "applied_value")
+            if not isinstance(previous, str) or not isinstance(applied, str):
+                raise ValueError(f"CFW target lease for {target!r} is malformed")
+            lease_id = "lease-" + hashlib.sha256(
+                f"{intervention_id}\0{target}".encode()).hexdigest()[:32]
+            leases.append(CFWTargetLease(
+                lease_id=lease_id,
+                intervention_id=intervention_id,
+                target=target,
+                previous_value=previous,
+                applied_value=applied,
+                expires_at_action=expires_at_action,
+                source_revision=source_revision,
+            ))
 
     return CFWBehaviorProjection(
         behavior_revision=int(getattr(state, "revision", 0)),
@@ -209,6 +245,7 @@ def build_cfw_behavior_projection(
         context_strategy=str(state.context_strategy),
         response_strategy=str(state.response_strategy),
         target_leases=tuple(leases),
+        host_action_index=host_action_index,
     )
 
 

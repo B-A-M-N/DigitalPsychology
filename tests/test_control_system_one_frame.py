@@ -20,6 +20,8 @@ from lib.protocol_artifact import (PROTOCOL_HASH, PROTOCOL_VERSION,
                                    QUESTION_REGISTRY, QUESTION_REGISTRY_HASH,
                                    STATE_PROJECTION_SCHEMA_HASH)
 from lib.system_one_service import SystemOneService
+from lib.telemetry.behavioral_trace import (provider_attestation,
+                                            runtime_configuration)
 
 
 class _ShadowBackend:
@@ -105,6 +107,32 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
     assert restored.question_ids == ("retry_relation",)
     assert restored.state.criteria[0].criterion_id == "criterion-visual"
     assert restored.state.criteria[0].status == "active"
+
+
+def test_provider_attestation_and_configuration_come_from_capability_handshake():
+    backend = _ShadowBackend()
+    backend.backend_id = "digitalpsychology-laya-native"
+    service = SystemOneService(
+        backend, mode="shadow", enabled_question_families=("retry_relation",))
+    try:
+        factory = create_system_one_frame_factory(service)
+        attestation = provider_attestation(factory)
+        capability = service.capability()
+    finally:
+        service.close()
+
+    assert attestation is not None
+    assert attestation["backend_id"] == capability["backend_id"]
+    assert attestation["model_id"] == capability["model_id"]
+    assert attestation["model_revision"] == capability["model_revision"]
+    assert attestation["model_content_hash"] == capability["model_content_hash"]
+    assert attestation["provider_protocol_hash"] == capability["provider_protocol_hash"]
+    assert attestation["enabled_question_families"] == ["retry_relation"]
+    assert attestation["provider_mode"] == "shadow"
+    assert len(attestation["capability_digest"]) == 64
+    assert runtime_configuration(
+        cfw_connected=True, csw_connected=True,
+        attestation=attestation) == "cfw+csw+dp+laya"
 
 
 def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
@@ -327,9 +355,18 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         identity=identity, objective="Render the requested page",
         objective_criteria=("criterion-visual",), initial_goal_set=goals,
         available_frameworks=("owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"),
-        csw_authority_identity={"authority": "test-csw"},
+        cfw_authority_identity={
+            "adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
+            "adapter_protocol_version": "1.0.0",
+            "behavior_projection_version": "2.0.0",
+            "scope_hash": "a" * 64, "capability_hash": "b" * 64},
+        csw_authority_identity={
+            "adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
+            "adapter_protocol_version": "1.0.0", "workflow_port_version": "1.1.0",
+            "scope_hash": "b" * 64, "capability_hash": "c" * 64},
         # The host declares real task semantics; DP refuses to guess them.
-        host_capabilities={"policy_context": {"deliverable_kind": "visual_ui"}},
+        host_capabilities={"cfw_connected": True, "csw_connected": True,
+                           "policy_context": {"deliverable_kind": "visual_ui"}},
     )
     control.open_control_session(descriptor.to_dict())
     observation = RuntimeObservation(

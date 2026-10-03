@@ -85,13 +85,13 @@ class CFWRuntimeAdapter:
             raise RuntimeError("CFW returned a malformed authority identity")
         return dict(value)
 
-    def applied_behavior_state(self) -> Mapping[str, Any] | None:
-        raw = getattr(self.component_port, "applied_behavior_state", None)
+    def applied_behavior_projection(self) -> Mapping[str, Any] | None:
+        raw = getattr(self.component_port, "applied_behavior_projection", None)
         value = raw() if callable(raw) else raw
         if value is None:
             return None
         if not isinstance(value, Mapping):
-            raise RuntimeError("CFW returned a malformed applied behavior state")
+            raise RuntimeError("CFW returned a malformed applied behavior projection")
         return dict(value)
 
     def collect_behavior_signals(self, observation: RuntimeObservation
@@ -126,22 +126,22 @@ class CFWRuntimeAdapter:
     def prepare_behavior_directives(self, directives: Sequence[Mapping[str, Any]]) -> Any:
         return self.component_port.prepare_behavior_directives(tuple(directives))
 
-    def apply_behavior_directives(self, prepared: Any,
-                                  behavior_state: Mapping[str, Any]) -> Sequence[str]:
-        return self.component_port.apply_behavior_directives(prepared, behavior_state)
+    def apply_behavior_projection(self, prepared: Any,
+                                  projection: Mapping[str, Any]) -> Sequence[str]:
+        return self.component_port.apply_behavior_projection(prepared, projection)
 
-    def synchronize_behavior_state(self, behavior_state: Mapping[str, Any]) -> None:
-        self.component_port.synchronize_behavior_state(behavior_state)
+    def synchronize_behavior_projection(self, projection: Mapping[str, Any]) -> None:
+        self.component_port.synchronize_behavior_projection(projection)
 
     def rollback_behavior_directives(self, prepared: Any) -> None:
         self.component_port.rollback_behavior_directives(prepared)
 
-    def restore_behavior_state(self, behavior_state: Mapping[str, Any], *,
-                               expected_current_revision: int) -> None:
-        restore = getattr(self.component_port, "restore_behavior_state", None)
+    def restore_behavior_projection(self, projection: Mapping[str, Any], *,
+                                    expected_current_revision: int) -> None:
+        restore = getattr(self.component_port, "restore_behavior_projection", None)
         if not callable(restore):
-            raise RuntimeError("CFW adapter cannot restore a behavior state after restart")
-        restore(behavior_state, expected_current_revision=expected_current_revision)
+            raise RuntimeError("CFW adapter cannot restore a behavior projection after restart")
+        restore(projection, expected_current_revision=expected_current_revision)
 
     def expire_local_behavior_leases(self, action_index: int) -> bool:
         expire = getattr(self.component_port, "expire_local_behavior_leases", None)

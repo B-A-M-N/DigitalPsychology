@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "digital-psychology"
 version = "1.0.0"
-description = "Out-of-band behavioral telemetry, evaluation, and guard research plane"
+description = "Host-driven behavioral policy, runtime orchestration, and persistent telemetry"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [

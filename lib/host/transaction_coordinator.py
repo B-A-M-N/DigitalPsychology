@@ -40,6 +40,9 @@ class HostTransactionCoordinator:
             if ((boundary_kind == "pre_action_rejected")
                     != (observation.candidate_preflight_result is not None)):
                 raise ValueError("rejected candidate boundary must contain the CFW gate result")
+            if ((boundary_kind == "pre_action_rejected")
+                    != (observation.candidate_rejection_stage is not None)):
+                raise ValueError("rejected candidate boundary must identify the CFW gate stage")
             if not self.host._remote_open or self.host._needs_reconciliation:
                 if not await self.host._connect_or_degrade_locked(
                         host_action_index=(observation.action_index
@@ -76,7 +79,8 @@ class HostTransactionCoordinator:
     def _boundary_observation(self, boundary_kind: str, *,
                               goal_set: GoalSetSnapshot | None = None,
                               candidate_action: ActionCandidate | None = None,
-                              candidate_preflight_result: str | None = None
+                              candidate_preflight_result: str | None = None,
+                              candidate_rejection_stage: str | None = None
                               ) -> RuntimeObservation:
         if boundary_kind == "pre_action":
             action_index = max(1, self.host._action_index + 1)
@@ -113,6 +117,7 @@ class HostTransactionCoordinator:
             approach_epoch=prior.approach_epoch if prior else "",
             candidate_action=candidate_action,
             candidate_preflight_result=candidate_preflight_result,
+            candidate_rejection_stage=candidate_rejection_stage,
         )
 
     async def _apply_tick_locked(self, observation: RuntimeObservation,

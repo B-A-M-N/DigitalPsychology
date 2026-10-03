@@ -9,6 +9,7 @@ from ..behavior_state import (
     BehaviorIntervention, BehaviorState, GoalSetSnapshot, InterventionTarget,
 )
 from .fast_loop_input import FastLoopInput
+from ..lease_window import lease_window
 
 def _mode_exit_condition(mode: str) -> str:
     return {
@@ -64,6 +65,7 @@ class InterventionStateBuilder:
                           expected_effect: str,
                           targets: tuple[tuple[str, str, str], ...],
                           expiry: Optional[int] = None,
+                          expires_at_action: Optional[int] = None,
                           target_criteria: tuple[str, ...] = (),
                           baseline_criterion_status: Optional[Mapping[str, str]] = None,
                           baseline_action_index: int = 0,
@@ -80,11 +82,16 @@ class InterventionStateBuilder:
         records = tuple(InterventionTarget(
             target=target, previous_value=previous, applied_value=applied)
             for target, previous, applied in targets)
+        duration = expiry or self.intervention_expiry_actions
+        absolute_expiry = (expires_at_action if expires_at_action is not None else
+                           lease_window("POST_ACTION", baseline_action_index,
+                                        duration).expires_at_action)
         return BehaviorIntervention(
             intervention_id=intervention_id, cause=cause,
             expected_effect=expected_effect, start_revision=revision,
-            scope=scope, expires_after_actions=expiry or self.intervention_expiry_actions,
+            scope=scope, expires_after_actions=duration,
             actions_elapsed=0, targets=records,
+            expires_at_action=absolute_expiry,
             target_criteria=target_criteria,
             baseline_criterion_status={
                 key: (baseline_criterion_status or {}).get(key, "unknown")
