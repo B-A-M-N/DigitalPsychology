@@ -72,6 +72,82 @@ The audit's numbered findings are retained here so none disappear during handoff
 |---|---|---|---|
 | P2 | DP | Use `SemanticProvider` for the interface and `Laya` for its implementation; retain legacy `SystemOne*` names only for compatibility | Still needs public-surface terminology review |
 
+## Convergence audit pass (Pass 1-4 complete)
+
+A newer audit superseded the cohort-first plan. It found the composition was
+broken at the wire boundary even though all three suites were green, and
+directed that no cohort run be started until those defects were fixed.
+
+### Pass 1 - five blocking integration defects (all fixed)
+
+Every defect below was confirmed against live source before being changed.
+
+1. **DP -> CFW schema rejection (blocking).** DP emits `mode_lease` and the
+   attention lease carries `material_progress_revisions` and
+   `continuous_attention_leases`; CFW compared the payload against a frozen
+   expected field set and rejected all three. CFW now validates them using DP's
+   own constraints.
+2. **Missing `json` import (blocking).** `component_control.py` called
+   `json.loads` on the focus-criteria lease path, raising `NameError` for any
+   real DP focus lease.
+3. **DP -> CSW signature drift (blocking).** The DP adapter passed
+   `host_action_index` to CSW's pure-read `behavioral_snapshot`, raising
+   `TypeError` against the real authority. Snapshot is now a pure read and
+   `expire_leases` is the only path that mutates.
+4. **Criterion-free candidate `IndexError` (blocking).** The transaction
+   coordinator indexed `affected_criterion_ids[0]` for candidates that legally
+   carry none.
+5. **No cross-repo wire test.** Added
+   `CognitiveFrameWorks/tests/test_current_cross_repo_wire_contracts.py`.
+
+Two bugs were in the fixes themselves and were caught because the tests drive
+real production objects: `baseline_approach_epoch` is bounded text, not an int,
+and `continuous_attention_leases` is a `Mapping[str, int]`, not a sequence.
+
+### Pass 2 - narrow versioned CFW projection
+
+`lib/runtime/cfw_projection.py` defines `CFWBehaviorProjection` and
+`CFWTargetLease`, carrying only what CFW actuates. `mode_lease`,
+`attention_lease`, `attention_last_seen`, `active_stateworks` and
+`intervention_history` are excluded, and a test proves it. The payload carries
+`protocol_version` 2.0.0, declared on both sides, so an incompatible host fails
+at the boundary instead of mid-intervention.
+
+### Pass 3 - behavioral telemetry
+
+`lib/telemetry/behavioral_trace.py` records per-committed-action starvation,
+mode behavior, retry/drift/abstention counters, projection churn and provider
+attestation, wired into `RuntimeSession` after each durable save so it can only
+describe committed work. Starvation uses DP's own fairness bound. Mode thrash is
+a reversal inside a two-action window with no new evidence, not a raw transition
+count.
+
+### Pass 4 - benchmark sanity system
+
+`scripts/cohort/preflight.py` validates envelopes, derives evaluator contracts
+from evaluator source, runs canaries, and trips hard-zero, full-budget,
+missing-provider and missing-telemetry tripwires. A Laya arm without live
+provider attestation is `INVALID_TREATMENT`.
+
+### Suite results after Pass 1-4
+
+| Project | Result |
+|---|---|
+| DigitalPsychology | **174 passed** |
+| CognitiveFrameWorks | **186 passed** (1 deselected) |
+| CognitiveStateWork | **31 passed** |
+
+### Remaining
+
+- Pass 5: close the core triad cohort (baseline, CFW, CFW+CSW, CFW+CSW+DP) with
+  both external outcomes and internal behavioral metrics.
+- Pass 6: Laya arm, blocked until a pinned Laya checkpoint exists on the host.
+- P1-7 starvation is computed but not yet used as a ranking constraint.
+- P1-9 `deliverable_kind` still falls back to `analysis` when the host omits it.
+- P1-10/11/23 legacy CFW workflow helpers and the duplicate `yaml` import.
+- P1-12 lease-boundary convention is stated once in the projection, but a
+  cross-system contract test over CFW, CSW and DP at actions 9-13 is still open.
+
 ## Continuation record (2026-10-02)
 
 Test commands and observed results for the final three-project worktree:
