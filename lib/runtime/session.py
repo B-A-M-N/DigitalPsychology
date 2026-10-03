@@ -72,6 +72,13 @@ class RuntimeSession:
         self.state_store = state_store
         self.system_one_frame_factory = system_one_frame_factory
         self._latest_goal_set: GoalSetSnapshot | None = None
+        # Internal behavioral telemetry for the production cohort gate. It is
+        # derived from committed host state, never from agent self-report.
+        from ..telemetry.behavioral_trace import BehavioralTrace
+        self.behavioral_trace = BehavioralTrace(
+            task_id=identity.task_id,
+            semantic_provider_status=str(
+                self.policy_context.get("semantic_provider_status") or "disabled"))
         self._closed = False
         if system_one_frame_factory is not None and not callable(
                 getattr(controller, "judge", None)):
@@ -274,6 +281,21 @@ class RuntimeSession:
                                         + outcome_event_payloads),
                 )
                 self._latest_goal_set = goal_set
+                # The action is durably committed, so its behavioral facts can
+                # now be recorded. The trace is derived from committed state,
+                # never from the agent's own report of what it did.
+                self._record_behavioral_trace(
+                    decision.state, attention=attention,
+                    action_index=observation.action_index,
+                    cfw_preflight_rejection=bool(observation.candidate_preflight_result
+                                                is not None
+                                                and not getattr(
+                                                    observation.candidate_preflight_result,
+                                                    "allowed", True)),
+                    applied_directives=tuple(applied),
+                    abstained=bool(str(getattr(decision, "reason", "")).startswith("abstain")),
+                    semantic_query=judgment is not None,
+                )
             except Exception as failure:
                 compensation_errors = []
                 try:
@@ -332,6 +354,48 @@ class RuntimeSession:
                 behavior_context=context,
                 pending_event_ids=pending_event_ids,
             )
+
+    def _record_behavioral_trace(self, state: BehaviorState, *, attention: Any,
+                                 action_index: int, cfw_preflight_rejection: bool,
+                                 applied_directives: tuple[str, ...],
+                                 abstained: bool,
+                                 semantic_query: bool) -> None:
+        """Record one committed action's behavioral facts for the cohort gate."""
+        from ..telemetry.behavioral_trace import ActionTrace
+        last_seen = dict(state.attention_last_seen)
+        ages = {criterion: action_index - last_seen.get(criterion, action_index)
+                for criterion in (attention.lease.criterion_ids
+                                  if attention and attention.lease
+                                  else state.focus_criteria)}
+        mode_lease = state.mode_lease
+        trace = self.behavioral_trace
+        trace.record(
+            ActionTrace(
+                action_index=action_index,
+                cognitive_mode=state.cognitive_mode,
+                focus_criteria=tuple(state.focus_criteria),
+                attention_ages=ages,
+                fairness_bound=(attention.fairness_bound_actions if attention else 0),
+                max_starvation_age=max(ages.values(), default=0),
+                mode_entered_action=(mode_lease.entered_action if mode_lease else None),
+                attention_rotated=bool(attention and attention.lease
+                                       and attention.lease.start_action == action_index),
+                intervention_applied=bool(applied_directives),
+                abstained=abstained,
+                cfw_preflight_rejection=cfw_preflight_rejection,
+                semantic_query=semantic_query,
+            ),
+            mode_cause=(mode_lease.cause if mode_lease else "mode_transition"),
+        )
+
+    def behavioral_trial_record(self, *, trial_id: str,
+                                task_outcome_score: float | None = None,
+                                task_completed: bool | None = None
+                                ) -> dict[str, Any]:
+        """Emit the internal telemetry record the production gate joins on."""
+        return self.behavioral_trace.to_dict(
+            trial_id=trial_id, task_outcome_score=task_outcome_score,
+            task_completed=task_completed)
 
     def _dispatch_outbox(self) -> None:
         """Deliver committed events idempotently, retaining any failed event."""
