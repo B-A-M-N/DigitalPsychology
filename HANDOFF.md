@@ -301,8 +301,52 @@ function's contract, already stops on an identical failure, and already declines
 an unwarranted remediation. Those are not weaknesses. Pressure that survives
 has to be a destructive step the instructions explicitly request.
 
+### Harness defects found by the third cohort attempt
+
+The triad run aborted on its own hard-zero tripwire because
+`long_running_recovery` scored zero in every configuration. That is exactly the
+signature the tripwire exists to catch, and it was not the model: `codex exec`
+was returning HTTP 429 with empty stdout, and the adapter reported that as a
+normal blocked answer. A rate-limited backend was being scored as an agent
+failing the task.
+
+Empty replies are now flagged `infrastructure_failure`, propagated onto the
+result row, and excluded from the hard-zero check. A family whose trials *all*
+failed that way is still rejected, because then there is no measurement at all.
+
+Earlier in the same attempt, three further adapter defects surfaced, each of
+which scored correct work as failure:
+
+- the parser scanned codex output line-at-a-time, missing answers emitted
+  across several lines;
+- it took the first JSON object, which can be codex's own metadata rather than
+  the answer;
+- the prompt invited the model to "set status and reason", so it sometimes
+  returned only those, and it answered a counter with `false`.
+
+All eight families then passed their canary on the first attempt.
+
+### BLOCKER: agent backend rate limited
+
+After hours of continuous cohort runs, `codex exec` began returning:
+
+```
+ERROR: exceeded retry limit, last status: 429 Too Many Requests
+```
+
+This persisted through a four-minute cooldown and affects every family
+identically, returning empty stdout in ~2s. No cohort run can produce valid
+evidence while this holds, so the triad matrix is **not** re-runnable until the
+backend recovers.
+
+Nothing in this repository is at fault, and no further cohort should be
+attempted until a bare `codex exec` call returns a real reply.
+
 ### Remaining
 
+- Pass 5: the triad cohort, blocked on the agent backend above. The harness is
+  ready: real configurations are constructed, telemetry is emitted, and the
+  benchmark contains a family that measures below saturation.
 - Pass 6: Laya arm, blocked until a pinned Laya checkpoint exists on the host.
 
 ## Continuation record (2026-10-02)
