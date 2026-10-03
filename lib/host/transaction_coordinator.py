@@ -125,8 +125,12 @@ class HostTransactionCoordinator:
         cfw_signals = list(self.host._cfw_signals(observation))
         if observation.candidate_preflight_result is not None:
             cfw_signals = cfw_signals[:31]
-            criterion_id = (observation.candidate_action.affected_criterion_ids[0]
-                            if observation.candidate_action else None)
+            # A criterion-free diagnostic/support candidate is legal, so the
+            # first affected criterion may be absent rather than indexed.
+            candidate = observation.candidate_action
+            candidate_criteria = (tuple(candidate.affected_criterion_ids)
+                                  if candidate is not None else ())
+            criterion_id = candidate_criteria[0] if candidate_criteria else None
             cfw_signals.append(FrameworkSignal(
                 source="cfw_action_gate",
                 code="candidate_rejected." + observation.candidate_preflight_result,

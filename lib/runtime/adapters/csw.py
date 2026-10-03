@@ -52,17 +52,20 @@ class CSWRuntimeAdapter:
                 if binding.identity.get(name) != value:
                     raise ValueError("CSW workflow binding escapes the runtime scope")
 
-    def behavioral_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None,
-                            host_action_index: int | None = None
+    def behavioral_snapshot(self, *, candidate_statework_ids: Sequence[str] | None = None
                             ) -> CSWBehaviorSnapshot:
+        """Read the current CSW-owned snapshot.
+
+        This is a pure read. Expiring temporary leases is a separate,
+        explicit mutation so a snapshot can never mutate workflow state.
+        """
         candidates = (tuple(sorted(self.bindings)) if candidate_statework_ids is None
                       else tuple(candidate_statework_ids))
         if not set(candidates).issubset(self.bindings):
             raise ValueError("DP requested a StateWork without a CSW binding")
         raw = self.authority.behavioral_snapshot(
             workflow_scope=self.identity.csw_scope(),
-            candidate_statework_ids=candidates,
-            host_action_index=host_action_index)
+            candidate_statework_ids=candidates)
         active_rows = raw.get("active_workflows") or ()
         active_ids = tuple(sorted(str(row["identity"]["statework_id"])
                                    for row in active_rows))
@@ -88,6 +91,21 @@ class CSWRuntimeAdapter:
             workflow_revisions=revisions,
             eligible_steps=steps,
         )
+
+    def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot:
+        """Expire DP-owned temporary workflow leases, then re-read the snapshot.
+
+        CSW owns the expiry decision; DP only names the host action boundary.
+        """
+        if type(host_action_index) is not int or host_action_index < 0:
+            raise ValueError("host action index must be a non-negative integer")
+        expire = getattr(self.authority, "expire_workflow_leases", None)
+        if not callable(expire):
+            raise AttributeError(
+                "CSW authority does not expose explicit workflow lease expiry")
+        expire(workflow_scope=self.identity.csw_scope(),
+               host_action_index=host_action_index)
+        return self.behavioral_snapshot()
 
     def available_statework_ids(self) -> tuple[str, ...]:
         """Return IDs backed by explicit bindings in this CSW authority."""
@@ -150,10 +168,6 @@ class CSWRuntimeAdapter:
             expected_intervention_id=intervention_id)
         return self.behavioral_snapshot(
             candidate_statework_ids=candidate_statework_ids)
-
-    def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot:
-        """Let CSW release overdue DP activations while DP transport is unavailable."""
-        return self.behavioral_snapshot(host_action_index=host_action_index)
 
     def activation_matches(self, statework_id: str, *,
                            intervention_id: str) -> bool:
