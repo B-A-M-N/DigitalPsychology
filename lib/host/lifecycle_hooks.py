@@ -54,6 +54,7 @@ class HostLifecycleHooks:
         cfw_connected = bool(self.host._cfw_components)
         action_request = dict(cfw_action_request) if cfw_action_request is not None else None
         preflight: Mapping[str, str] | None = None
+        self.host._pending_cfw_gate_decisions.clear()
         if cfw_connected:
             if action_request is None:
                 raise ValueError(
@@ -68,10 +69,13 @@ class HostLifecycleHooks:
             if preflight.get("decision") != "allow":
                 return await self.host._record_candidate_rejection(
                     value, str(preflight.get("decision") or "block"),
-                    stage="cfw_preflight", goal_set=goal_set)
+                    stage="cfw_preflight", goal_set=goal_set,
+                    preflight_decision=str(preflight.get("decision") or "block"))
 
         observation = self.host._boundary_observation(
-            "pre_action", goal_set=goal_set, candidate_action=value)
+            "pre_action", goal_set=goal_set, candidate_action=value,
+            cfw_preflight_decision=(str(preflight["decision"])
+                                    if preflight is not None else None))
         control = await self.host._control_boundary(
             "pre_action", observation, goal_set=goal_set)
         if not cfw_connected:
@@ -85,21 +89,29 @@ class HostLifecycleHooks:
         decision = str(authorization.get("decision") or "block")
         if decision != "allow":
             rejected = await self.host._record_candidate_rejection(
-                value, decision, stage="cfw_final_gate", goal_set=goal_set)
+                value, decision, stage="cfw_final_gate", goal_set=goal_set,
+                preflight_decision=str(preflight["decision"]))
             return {**rejected, "pre_action_control": dict(control)}
         request_id = authorization.get("action_request_id")
         if not isinstance(request_id, str) or not request_id:
             raise RuntimeError("CFW final action gate omitted its correlation ID")
+        self.host._pending_cfw_gate_decisions = {
+            "preflight": str(preflight["decision"]), "final": decision,
+        }
         return {**control, "action_authorized": True,
                 "action_request_id": request_id}
 
     async def _record_candidate_rejection(
             self, candidate: ActionCandidate, decision: str, *, stage: str,
-            goal_set: GoalSetSnapshot | None) -> Mapping[str, Any]:
+            goal_set: GoalSetSnapshot | None,
+            preflight_decision: str | None = None) -> Mapping[str, Any]:
         observation = self.host._boundary_observation(
             "pre_action_rejected", goal_set=goal_set,
             candidate_action=candidate, candidate_preflight_result=decision,
-            candidate_rejection_stage=stage)
+            candidate_rejection_stage=stage,
+            cfw_preflight_decision=preflight_decision or (
+                decision if stage == "cfw_preflight" else "allow"),
+            cfw_final_decision=(decision if stage == "cfw_final_gate" else None))
         control = await self.host._control_boundary(
             "pre_action_rejected", observation, goal_set=goal_set)
         return {"status": "rejected", "stage": stage, "decision": decision,

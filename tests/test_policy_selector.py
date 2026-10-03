@@ -681,11 +681,7 @@ def test_fairness_breach_still_risks_one_when_the_bound_is_respected():
 
 
 def test_a_host_required_mode_may_still_breach_fairness():
-    """An external authority outranks fairness: DP must act legally, not refuse.
-
-    When the host requires a mode, fairness degrades to a ranking tiebreak
-    rather than vetoing the only legal candidate.
-    """
+    """Fairness pressure is diagnostic and cannot veto a legal policy."""
     focus = ("criterion-0",)
     goal_set = GoalSetSnapshot(1, tuple(
         GoalItemSnapshot(f"criterion-{index}") for index in range(20)))
@@ -704,19 +700,13 @@ def test_a_host_required_mode_may_still_breach_fairness():
         current_action_index=20)
 
     assert selection.candidate.candidate_id == only.candidate_id
-    # Risk is clamped to 1.0, which is itself the fairness-violation signal:
-    # the projected age exceeded the bound and saturated.
+    # Risk is clamped as a diagnostic scalar. The scheduler records actual
+    # violations from runnable ages at committed action boundaries.
     assert selection.score.starvation_risk == 1.0
 
 
-def test_starvation_breaks_a_tie_between_otherwise_equal_candidates():
-    """With equal evidence, attending the starved criterion wins.
-
-    criterion-0 has not been attended for four actions while criterion-1 is
-    fresh, so keeping focus on criterion-1 projects a starvation ratio of 1.0
-    and rotating to criterion-0 projects 0.33. Both candidates are equally
-    supported, so the fairness tiebreak is the only thing separating them.
-    """
+def test_starvation_pressure_does_not_rank_behavior_policy_candidates():
+    """Attention ages cannot override the host scheduler's chosen focus."""
     goal_set = GoalSetSnapshot(1, tuple(
         GoalItemSnapshot(f"criterion-{index}") for index in range(2)))
     last_seen = {"criterion-0": 0, "criterion-1": 4}
@@ -725,17 +715,21 @@ def test_starvation_breaks_a_tie_between_otherwise_equal_candidates():
     attending_fresh = _focused_candidate(("criterion-1",),
                                           reason_codes=("deterministic_rule",))
 
-    selection = BehaviorPolicySelector().select(
-        (attending_fresh, attending_starved),
-        constraints=BehaviorPolicyConstraints(
+    selector = BehaviorPolicySelector()
+    kwargs = {
+        "constraints": BehaviorPolicyConstraints(
             current_state=BehaviorState(), available_frameworks=ALL_FRAMEWORKS,
             goal_set=goal_set),
-        csw_snapshot=CSWBehaviorSnapshot(revision=0), goal_set=goal_set,
-        policy_context={},
-        attention_lease=AttentionLease("lease-tie", ("criterion-1",), 1, 1, 5,
-                                       max_actions=1),
-        attention_last_seen=last_seen, current_action_index=4)
+        "csw_snapshot": CSWBehaviorSnapshot(revision=0), "goal_set": goal_set,
+        "policy_context": {},
+        "attention_lease": AttentionLease("lease-tie", ("criterion-1",), 1, 1, 5,
+                                           max_actions=1),
+        "current_action_index": 4,
+    }
+    first = selector.select((attending_fresh, attending_starved),
+                            attention_last_seen=last_seen, **kwargs)
+    swapped = selector.select((attending_fresh, attending_starved),
+                              attention_last_seen={"criterion-0": 4,
+                                                   "criterion-1": 0}, **kwargs)
 
-    assert selection.candidate.candidate_id == attending_starved.candidate_id
-    # The chosen candidate relieves starvation rather than deepening it.
-    assert selection.score.starvation_risk == pytest.approx(1 / 3)
+    assert first.candidate.candidate_id == swapped.candidate.candidate_id

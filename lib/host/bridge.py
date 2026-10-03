@@ -76,6 +76,7 @@ class HostControlBridge:
         self._needs_reconciliation = False
         self._offline_controls_expired = False
         self._latest_observation: RuntimeObservation | None = None
+        self._pending_cfw_gate_decisions: dict[str, str] = {}
         self._latest_system_one_observation: Mapping[str, Any] | None = None
         self._audit_projection = AuditProjection(metadata={})
         self._last_model_projection_digest: str | None = None
@@ -107,7 +108,19 @@ class HostControlBridge:
                            outcome_facts: Sequence[HostOutcomeFact] = ()
                            ) -> Mapping[str, Any]:
         """Run after a completed host-observed action or evidence boundary."""
-        return await self.lifecycle_hooks.after_action(observation, goal_set=goal_set, outcome_facts=outcome_facts)
+        if self._pending_cfw_gate_decisions:
+            observation = replace(
+                observation,
+                cfw_preflight_decision=(observation.cfw_preflight_decision
+                                        or self._pending_cfw_gate_decisions.get("preflight")),
+                cfw_final_decision=(observation.cfw_final_decision
+                                    or self._pending_cfw_gate_decisions.get("final")),
+            )
+        result = await self.lifecycle_hooks.after_action(
+            observation, goal_set=goal_set, outcome_facts=outcome_facts)
+        if result.get("status") == "ready":
+            self._pending_cfw_gate_decisions.clear()
+        return result
 
     async def task_started(self) -> Mapping[str, Any]:
         return await self.lifecycle_hooks.task_started()
@@ -120,8 +133,11 @@ class HostControlBridge:
 
     async def _record_candidate_rejection(
             self, candidate: ActionCandidate, decision: str, *, stage: str,
-            goal_set: GoalSetSnapshot | None) -> Mapping[str, Any]:
-        return await self.lifecycle_hooks._record_candidate_rejection(candidate, decision, stage=stage, goal_set=goal_set)
+            goal_set: GoalSetSnapshot | None,
+            preflight_decision: str | None = None) -> Mapping[str, Any]:
+        return await self.lifecycle_hooks._record_candidate_rejection(
+            candidate, decision, stage=stage, goal_set=goal_set,
+            preflight_decision=preflight_decision)
 
     async def observe_boundary(self, boundary_kind: str, *,
                                observation: RuntimeObservation | None = None,
@@ -142,12 +158,16 @@ class HostControlBridge:
                               goal_set: GoalSetSnapshot | None = None,
                               candidate_action: ActionCandidate | None = None,
                               candidate_preflight_result: str | None = None,
-                              candidate_rejection_stage: str | None = None
+                              candidate_rejection_stage: str | None = None,
+                              cfw_preflight_decision: str | None = None,
+                              cfw_final_decision: str | None = None
                               ) -> RuntimeObservation:
         return self.transaction_coordinator._boundary_observation(
             boundary_kind, goal_set=goal_set, candidate_action=candidate_action,
             candidate_preflight_result=candidate_preflight_result,
-            candidate_rejection_stage=candidate_rejection_stage)
+            candidate_rejection_stage=candidate_rejection_stage,
+            cfw_preflight_decision=cfw_preflight_decision,
+            cfw_final_decision=cfw_final_decision)
 
     async def _apply_tick_locked(self, observation: RuntimeObservation,
                                  goals: GoalSetSnapshot, *,

@@ -79,6 +79,46 @@ REVERSAL_WINDOW_ACTIONS = 2
 
 _MAX_TRACE_ACTIONS = 10_000
 
+JUSTIFICATION_CLASSES = frozenset({
+    "none", "deterministic_host_fact", "validator_evidence", "operator_event",
+    "csw_transition", "hard_safety", "material_progress", "semantic_advisory",
+    "heuristic",
+})
+THRASH_EXEMPTING_JUSTIFICATIONS = frozenset({
+    "deterministic_host_fact", "validator_evidence", "operator_event",
+    "csw_transition", "hard_safety", "material_progress",
+})
+
+
+def classify_justification(*, boundary_kind: str | None = None,
+                           deterministic_host_fact: bool = False,
+                           validator_evidence: bool = False,
+                           operator_event: bool = False,
+                           csw_transition: bool = False,
+                           hard_safety: bool = False,
+                           material_progress: bool = False,
+                           semantic_advisory: bool = False,
+                           heuristic: bool = False) -> str:
+    """Classify why a mode transition had evidence; cause strings are not proof."""
+    if hard_safety:
+        return "hard_safety"
+    if operator_event or boundary_kind == "operator":
+        return "operator_event"
+    if validator_evidence or (boundary_kind == "validator"
+                              and deterministic_host_fact):
+        return "validator_evidence"
+    if csw_transition:
+        return "csw_transition"
+    if material_progress:
+        return "material_progress"
+    if deterministic_host_fact:
+        return "deterministic_host_fact"
+    if semantic_advisory:
+        return "semantic_advisory"
+    if heuristic:
+        return "heuristic"
+    return "none"
+
 
 @dataclass(frozen=True)
 class ActionTrace:
@@ -99,15 +139,22 @@ class ActionTrace:
     abstained: bool = False
     equivalent_retry: bool = False
     goal_drift: bool = False
+    goal_drift_detected: bool = False
+    goal_drift_intervention_applied: bool = False
     projection_digest: str | None = None
     semantic_query: bool = False
     semantic_attempted: bool = False
     semantic_result: bool = False
+    semantic_judgment_returned: bool = False
     semantic_used: bool = False
     semantic_failed: bool = False
+    semantic_query_failed: bool = False
     cfw_preflight_rejection: bool = False
     cfw_final_rejection: bool = False
+    cfw_preflight_decision: str | None = None
+    cfw_final_decision: str | None = None
     authoritative_evidence_classes: tuple[str, ...] = ()
+    justification_class: str = "none"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "focus_criteria", tuple(self.focus_criteria))
@@ -115,6 +162,28 @@ class ActionTrace:
                            tuple(self.fairness_prevented_criteria))
         object.__setattr__(self, "authoritative_evidence_classes",
                            tuple(self.authoritative_evidence_classes))
+        for name in ("semantic_query", "semantic_attempted", "semantic_result",
+                     "semantic_judgment_returned", "semantic_used",
+                     "semantic_failed", "semantic_query_failed"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"action trace {name} must be a boolean")
+        if self.semantic_judgment_returned and not (
+                self.semantic_attempted or self.semantic_query):
+            raise ValueError("a semantic judgment cannot return without a query")
+        if self.semantic_used and not self.semantic_judgment_returned:
+            raise ValueError("a semantic judgment cannot be used without being returned")
+        if (self.semantic_query_failed
+                and not (self.semantic_attempted or self.semantic_query)):
+            raise ValueError("a semantic query cannot fail without being attempted")
+        if self.justification_class not in JUSTIFICATION_CLASSES:
+            raise ValueError("action trace justification class is invalid")
+        for name in ("cfw_preflight_decision", "cfw_final_decision"):
+            decision = getattr(self, name)
+            if decision is not None and decision not in {
+                    "allow", "block", "require_confirmation", "require_reinspection",
+                    "require_recovery", "require_changed_hypothesis",
+                    "require_goal_reanchor"}:
+                raise ValueError(f"action trace {name} is invalid")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -133,21 +202,32 @@ class ActionTrace:
             "abstained": self.abstained,
             "equivalent_retry": self.equivalent_retry,
             "goal_drift": self.goal_drift,
+            "goal_drift_detected": self.goal_drift_detected,
+            "goal_drift_intervention_applied": self.goal_drift_intervention_applied,
             "projection_digest": self.projection_digest,
             "semantic_query": self.semantic_query,
             "semantic_attempted": self.semantic_attempted,
             "semantic_result": self.semantic_result,
+            "semantic_judgment_returned": self.semantic_judgment_returned,
             "semantic_used": self.semantic_used,
             "semantic_failed": self.semantic_failed,
+            "semantic_query_failed": self.semantic_query_failed,
             "cfw_preflight_rejection": self.cfw_preflight_rejection,
             "cfw_final_rejection": self.cfw_final_rejection,
+            "cfw_preflight_decision": self.cfw_preflight_decision,
+            "cfw_final_decision": self.cfw_final_decision,
             "authoritative_evidence_classes": list(
                 self.authoritative_evidence_classes),
+            "justification_class": self.justification_class,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ActionTrace":
         data = dict(value)
+        if "semantic_judgment_returned" not in data:
+            data["semantic_judgment_returned"] = bool(data.get("semantic_result"))
+        if "semantic_query_failed" not in data:
+            data["semantic_query_failed"] = bool(data.get("semantic_failed"))
         for name in ("focus_criteria", "fairness_prevented_criteria",
                      "authoritative_evidence_classes"):
             data[name] = tuple(data.get(name) or ())
@@ -176,10 +256,11 @@ class BehavioralTrace:
     semantic_model_hash: str | None = None
     semantic_provider_attestation: Mapping[str, Any] | None = None
     actions: list[ActionTrace] = field(default_factory=list)
-    _mode_history: list[tuple[int, str, str, bool]] = field(default_factory=list)
+    _mode_history: list[tuple[int, str, str, str]] = field(default_factory=list)
+    _control_mode_transitions: list[tuple[int, int, str, str, str]] = field(
+        default_factory=list)
 
-    def record(self, action: ActionTrace, *, mode_cause: str = "mode_transition",
-               authoritative_evidence: bool = False) -> None:
+    def record(self, action: ActionTrace, *, mode_cause: str = "mode_transition") -> None:
         if len(self.actions) >= _MAX_TRACE_ACTIONS:
             raise ValueError("behavioral trace exceeded its bounded action count")
         # Seed the history with the opening mode so later transitions have an
@@ -187,14 +268,30 @@ class BehavioralTrace:
         if not self._mode_history:
             self._mode_history.append(
                 (action.action_index, action.cognitive_mode, mode_cause,
-                 authoritative_evidence
-                 or bool(action.authoritative_evidence_classes)))
+                 action.justification_class))
         elif self._mode_history[-1][1] != action.cognitive_mode:
             self._mode_history.append(
                 (action.action_index, action.cognitive_mode, mode_cause,
-                 authoritative_evidence
-                 or bool(action.authoritative_evidence_classes)))
+                 action.justification_class))
         self.actions.append(action)
+
+    def record_control_transition(self, transition: Mapping[str, Any]) -> None:
+        """Use durable private-boundary events for mode-transition metrics."""
+        sequence = transition.get("boundary_sequence")
+        action_index = transition.get("host_action_index", sequence)
+        prior_mode = transition.get("prior_mode")
+        resulting_mode = transition.get("resulting_mode")
+        justification = transition.get("justification_class", "none")
+        if (type(sequence) is not int or sequence < 0
+                or type(action_index) is not int or action_index < 0
+                or not isinstance(prior_mode, str) or not prior_mode
+                or not isinstance(resulting_mode, str) or not resulting_mode
+                or justification not in JUSTIFICATION_CLASSES):
+            raise ValueError("persisted control transition mode evidence is malformed")
+        if self._control_mode_transitions and sequence <= self._control_mode_transitions[-1][0]:
+            raise ValueError("control transition sequence must increase")
+        self._control_mode_transitions.append(
+            (sequence, action_index, prior_mode, resulting_mode, justification))
 
     # -- starvation ---------------------------------------------------------
 
@@ -250,6 +347,9 @@ class BehavioralTrace:
     @property
     def mode_transitions(self) -> int:
         """Committed actions that changed the cognitive mode."""
+        if self._control_mode_transitions:
+            return sum(1 for _seq, _index, prior, resulting, _class
+                       in self._control_mode_transitions if prior != resulting)
         return max(0, len(self._mode_history) - 1)
 
     @property
@@ -263,6 +363,29 @@ class BehavioralTrace:
         justified either move.
         """
         history = self._mode_history
+        if self._control_mode_transitions:
+            transitions = self._control_mode_transitions
+            reversals = 0
+            for position, current in enumerate(transitions):
+                _seq_a, index_a, mode_a, mode_b, _class_a = current
+                if mode_a == mode_b:
+                    continue
+                third_position = next((offset for offset in range(position + 1,
+                                      len(transitions))
+                                       if transitions[offset][3] != mode_b), None)
+                if third_position is None:
+                    continue
+                third = transitions[third_position]
+                _seq_c, index_c, _prior_c, resulting_c, _class_c = third
+                if (resulting_c != mode_a
+                        or index_c - index_a > REVERSAL_WINDOW_ACTIONS):
+                    continue
+                justified = any(
+                    item[4] in THRASH_EXEMPTING_JUSTIFICATIONS
+                    for item in transitions[position:third_position + 1])
+                if not justified:
+                    reversals += 1
+            return reversals
         reversals = 0
         for first, second in zip(history, history[1:]):
             _index_a, mode_a, _cause_a, evidence_a = first
@@ -275,9 +398,10 @@ class BehavioralTrace:
             if third is None or third[1] != mode_a:
                 continue
             within_window = (third[0] - index_b) <= REVERSAL_WINDOW_ACTIONS
-            # New authoritative evidence justifies the move; only unsupported
-            # oscillation counts as thrash.
-            justified = evidence_a or evidence_b or third[3]
+            # Only an explicit authoritative class justifies a mode reversal.
+            # Semantic advice, heuristic triggers and descriptive causes do not.
+            justified = any(item in THRASH_EXEMPTING_JUSTIFICATIONS
+                            for item in (evidence_a, evidence_b, third[3]))
             if within_window and not justified:
                 reversals += 1
         return reversals
@@ -305,7 +429,11 @@ class BehavioralTrace:
 
     @property
     def goal_drift_interventions(self) -> int:
-        return sum(1 for a in self.actions if a.goal_drift)
+        return sum(1 for a in self.actions if a.goal_drift_intervention_applied)
+
+    @property
+    def goal_drift_detections(self) -> int:
+        return sum(1 for a in self.actions if a.goal_drift_detected)
 
     @property
     def abstentions(self) -> int:
@@ -339,7 +467,8 @@ class BehavioralTrace:
 
     @property
     def semantic_results(self) -> int:
-        return sum(1 for action in self.actions if action.semantic_result)
+        return sum(1 for action in self.actions
+                   if action.semantic_judgment_returned or action.semantic_result)
 
     @property
     def semantic_uses(self) -> int:
@@ -347,7 +476,8 @@ class BehavioralTrace:
 
     @property
     def semantic_failures(self) -> int:
-        return sum(1 for action in self.actions if action.semantic_failed)
+        return sum(1 for action in self.actions
+                   if action.semantic_query_failed or action.semantic_failed)
 
     def to_dict(self, *, trial_id: str, task_outcome_score: float | None = None,
                 task_completed: bool | None = None) -> dict[str, Any]:
@@ -375,6 +505,7 @@ class BehavioralTrace:
             "median_mode_dwell_actions": self.median_mode_dwell_actions,
 
             "equivalent_retries": self.equivalent_retries,
+            "goal_drift_detections": self.goal_drift_detections,
             "goal_drift_interventions": self.goal_drift_interventions,
             "abstentions": self.abstentions,
 
@@ -385,8 +516,10 @@ class BehavioralTrace:
             "unique_projection_digests": self.unique_projection_digests,
             "semantic_queries": self.semantic_queries,
             "semantic_results": self.semantic_results,
+            "semantic_judgment_returns": self.semantic_results,
             "semantic_uses": self.semantic_uses,
             "semantic_failures": self.semantic_failures,
+            "semantic_query_failures": self.semantic_failures,
             "semantic_provider_status": self.semantic_provider_status,
             "semantic_model_hash": self.semantic_model_hash,
             "semantic_provider_attestation": (

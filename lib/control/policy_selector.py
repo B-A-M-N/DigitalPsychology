@@ -710,17 +710,15 @@ class BehaviorPolicySelector:
                 starvation_risk=starvation_risk,
                 estimated_cost=estimated_cost,
             )))
-        # The attention scheduler owns runnable-criterion fairness. Candidate
-        # scoring uses starvation pressure only as a tie-break and cannot make
-        # the global fairness guarantee by rejecting one candidate.
+        # The attention scheduler owns runnable-criterion fairness. The
+        # projected pressure remains diagnostic; behavior-policy ranking must
+        # not try to reschedule attention from candidate-level projections.
         ranked = sorted(legal, key=lambda pair: (
             pair[1].decision_support,
             pair[1].correct_progress_lower_bound
             if pair[1].correct_progress_lower_bound is not None else -1.0,
             -(pair[1].regression_upper_bound
               if pair[1].regression_upper_bound is not None else 1.0),
-            -(pair[1].starvation_risk
-              if pair[1].starvation_risk is not None else 0.0),
             -pair[1].estimated_cost,
             pair[0].candidate_id,
         ), reverse=True)

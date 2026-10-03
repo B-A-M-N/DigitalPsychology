@@ -20,7 +20,8 @@ from .contracts import (BehavioralDecisionService, CFWComponentPort,
                         CSWWorkflowPort, RuntimeIdentity, RuntimeObservation,
                         SystemOneFrameFactory)
 from .adapters.standalone import NullCFWComponentPort, NullCSWWorkflowPort
-from .projection import project_behavior_context as _project_behavior_context
+from .projection import (build_behavior_projection,
+                         project_behavior_context as _project_behavior_context)
 from .store import BehaviorStateStore, RuntimeStateRecord
 from .cfw_projection import build_cfw_behavior_projection
 
@@ -140,6 +141,14 @@ class RuntimeSession:
             else:
                 attention = None
 
+            # Lease expiry is an explicit action-boundary operation. Signal
+            # collection below is a read and must not change CFW state.
+            expire_cfw = getattr(self.cfw, "expire_local_behavior_leases", None)
+            if callable(expire_cfw):
+                expire_cfw(observation.action_index)
+            expire_csw = getattr(self.csw, "expire_leases", None)
+            if callable(expire_csw):
+                expire_csw(host_action_index=observation.action_index)
             snapshot = self._csw_snapshot()
             candidate_statework_ids = self._candidate_statework_ids(snapshot)
             signals = tuple(self.cfw.collect_behavior_signals(observation))
@@ -147,7 +156,8 @@ class RuntimeSession:
             if len(signals) > 32 or any(not hasattr(item, "code") for item in signals):
                 raise ValueError("CFW adapter returned malformed behavioral signals")
             semantic_attempted = judgment is not None
-            semantic_result = judgment is not None
+            semantic_judgment_returned = judgment is not None
+            semantic_query_failed = False
             if judgment is None and self.system_one_frame_factory is not None:
                 frame = self.system_one_frame_factory(
                     self.identity, self.objective,
@@ -162,13 +172,18 @@ class RuntimeSession:
                         raise ValueError("System-1 frame identity escapes the runtime session")
                     judgment_result = self.controller.judge(frame)
                     if hasattr(judgment_result, "judgment"):
-                        semantic_result = getattr(judgment_result, "status", None) == "ok"
+                        semantic_judgment_returned = (
+                            getattr(judgment_result, "judgment", None) is not None)
+                        semantic_query_failed = getattr(
+                            judgment_result, "status", None) in {
+                                "unavailable", "rejected", "stale"}
                         judgment = (judgment_result.judgment
                                     if getattr(judgment_result, "status", None) == "ok"
                                     else None)
                     else:
                         judgment = judgment_result
-                        semantic_result = judgment_result is not None
+                        semantic_judgment_returned = judgment_result is not None
+                        semantic_query_failed = judgment_result is None
             outcome_assessments = self._assess_ready_interventions(
                 record, observation, goal_set=goal_set,
                 attention_last_seen=(attention.last_seen if attention else {}))
@@ -322,6 +337,7 @@ class RuntimeSession:
                 self._record_behavioral_trace(
                     decision.state, attention=attention,
                     prior_state=record.state, goal_set=goal_set,
+                    csw_snapshot=updated_snapshot,
                     observation=observation, decision=decision,
                     cfw_signals=signals,
                     action_index=observation.action_index,
@@ -332,7 +348,8 @@ class RuntimeSession:
                     applied_directives=tuple(applied),
                     abstained=bool(str(getattr(decision, "reason", "")).startswith("abstain")),
                     semantic_attempted=semantic_attempted,
-                    semantic_result=semantic_result,
+                    semantic_judgment_returned=semantic_judgment_returned,
+                    semantic_query_failed=semantic_query_failed,
                     semantic_used=judgment is not None,
                 )
             except Exception as failure:
@@ -397,6 +414,7 @@ class RuntimeSession:
     def _record_behavioral_trace(self, state: BehaviorState, *, attention: Any,
                                  prior_state: BehaviorState,
                                  goal_set: GoalSetSnapshot | None,
+                                 csw_snapshot: CSWBehaviorSnapshot,
                                  observation: RuntimeObservation,
                                  decision: BehavioralDecision,
                                  cfw_signals: Sequence[Any],
@@ -405,10 +423,11 @@ class RuntimeSession:
                                  applied_directives: tuple[str, ...],
                                  abstained: bool,
                                  semantic_attempted: bool,
-                                 semantic_result: bool,
+                                 semantic_judgment_returned: bool,
+                                 semantic_query_failed: bool,
                                  semantic_used: bool) -> None:
         """Record one committed action's behavioral facts for the cohort gate."""
-        from ..telemetry.behavioral_trace import ActionTrace
+        from ..telemetry.behavioral_trace import ActionTrace, classify_justification
         last_seen = dict(state.attention_last_seen)
         runnable = goal_set.runnable_items if goal_set is not None else ()
         ages = {
@@ -435,18 +454,38 @@ class RuntimeSession:
                                 for code in observation.active_trigger_codes)
         evidence_classes.update("cfw_signal:" + signal.code for signal in cfw_signals
                                 if signal.active)
-        if semantic_result:
+        if semantic_judgment_returned:
             evidence_classes.add("semantic_result")
         if applied_directives:
             evidence_classes.add("intervention_application_receipt")
-        from .cfw_projection import build_cfw_behavior_projection
-        projection_digest = hashlib.sha256(json.dumps(
-            build_cfw_behavior_projection(
-                state, host_action_index=action_index).to_dict(),
-            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        model_projection = build_behavior_projection(
+            state, csw_snapshot, objective=self.objective, goal_set=goal_set,
+            cfw_connected=bool(self.cfw.available_component_ids()),
+            csw_connected=not isinstance(self.csw, NullCSWWorkflowPort),
+            outcome_evidence_connected=self.outcome_evidence_authority is not None,
+            host_has_stable_objective_context=bool(
+                self.policy_context.get("host_has_stable_objective_context")),
+        )
+        projection_digest = model_projection.model.semantic_digest
         retry = "equivalent_retry" in observation.active_trigger_codes
-        drift = any(item.cause in {"goal_drift", "semantic_goal_drift"}
-                    for item in decision.directives)
+        drift_detected = (
+            "goal_drift" in observation.active_trigger_codes
+            or "semantic_goal_drift" in observation.active_trigger_codes
+            or any(signal.active and signal.code in {
+                "goal_drift", "semantic_goal_drift"} for signal in cfw_signals))
+        applied_ids = set(applied_directives)
+        drift_applied = any(
+            item.directive_id in applied_ids
+            and item.cause in {"goal_drift", "semantic_goal_drift"}
+            for item in decision.directives)
+        justification = classify_justification(
+            csw_transition=(prior_state.active_stateworks != state.active_stateworks),
+            deterministic_host_fact=observation.regression_observed,
+            material_progress=observation.progress_made,
+            semantic_advisory=semantic_used,
+            heuristic=bool(observation.active_trigger_codes or cfw_signals
+                           or applied_directives),
+        )
         trace = self.behavioral_trace
         trace.record(
             ActionTrace(
@@ -459,24 +498,28 @@ class RuntimeSession:
                 mode_entered_action=(mode_lease.entered_action if mode_lease else None),
                 attention_lease_started=lease_started,
                 attention_rotated=rotated,
-                fairness_forced_rotation=bool(rotated and prevented),
+                fairness_forced_rotation=bool(prevented),
                 fairness_prevented_criteria=prevented,
                 intervention_applied=bool(applied_directives),
                 abstained=abstained,
                 equivalent_retry=retry,
-                goal_drift=drift,
+                goal_drift=drift_applied,
+                goal_drift_detected=drift_detected,
+                goal_drift_intervention_applied=drift_applied,
                 projection_digest=projection_digest,
                 semantic_query=semantic_attempted,
                 semantic_attempted=semantic_attempted,
-                semantic_result=semantic_result,
+                semantic_result=semantic_judgment_returned,
+                semantic_judgment_returned=semantic_judgment_returned,
                 semantic_used=semantic_used,
-                semantic_failed=semantic_attempted and not semantic_result,
+                semantic_failed=semantic_query_failed,
+                semantic_query_failed=semantic_query_failed,
                 cfw_preflight_rejection=cfw_preflight_rejection,
                 cfw_final_rejection=cfw_final_rejection,
                 authoritative_evidence_classes=tuple(sorted(evidence_classes)),
+                justification_class=justification,
             ),
             mode_cause=(mode_lease.cause if mode_lease else "mode_transition"),
-            authoritative_evidence=bool(evidence_classes),
         )
 
     def behavioral_trial_record(self, *, trial_id: str,
@@ -606,6 +649,8 @@ class RuntimeSession:
             cfw_connected=not isinstance(self.cfw, NullCFWComponentPort),
             csw_connected=not isinstance(self.csw, NullCSWWorkflowPort),
             outcome_evidence_connected=self.outcome_evidence_authority is not None,
+            host_has_stable_objective_context=bool(
+                self.policy_context.get("host_has_stable_objective_context")),
         )
 
     def _goal_set(self, observation: RuntimeObservation) -> GoalSetSnapshot | None:

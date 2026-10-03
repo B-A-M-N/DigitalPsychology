@@ -57,6 +57,58 @@ def test_required_criterion_coverage_is_first_seen_order():
     assert trace.required_criterion_coverage == ("a", "b", "c")
 
 
+def test_semantic_query_attempt_return_use_and_failure_are_separate():
+    trace = BehavioralTrace()
+    trace.record(_action(
+        0, semantic_attempted=True, semantic_judgment_returned=True,
+        semantic_result=True, semantic_used=False,
+    ))
+    trace.record(_action(
+        1, semantic_attempted=True, semantic_query=True,
+        semantic_query_failed=True, semantic_failed=True,
+    ))
+
+    record = trace.to_dict(trial_id="semantic-states")
+    assert record["semantic_queries"] == 2
+    assert record["semantic_judgment_returns"] == 1
+    assert record["semantic_uses"] == 0
+    assert record["semantic_query_failures"] == 1
+
+
+def test_private_transition_trace_records_semantic_and_drift_outcomes():
+    from lib.behavior_state import (BehaviorDirective, BehavioralDecision,
+                                    BehaviorState)
+    from lib.control.service import ControlPlaneService
+
+    prior = BehaviorState(revision=0)
+    state = BehaviorState(revision=1)
+    directive = BehaviorDirective(
+        directive_id="drift-fix", operation="set_mode", target="mode",
+        value="VERIFY", cause="goal_drift", expected_effect="reanchor goal",
+        scope="scope-1", expires_after_actions=2,
+        intervention_id="intervention-1")
+    decision = BehavioralDecision(
+        decision_id="decision-1", scope="scope-1", expected_revision=0,
+        state=state, directives=(directive,), reason="goal drift detected")
+    basis = {
+        "boundary_sequence": 3, "host_action_index": 2,
+        "boundary_kind": "pre_action", "semantic_query_attempted": True,
+        "semantic_judgment_returned": True, "semantic_judgment_used": False,
+        "semantic_query_failed": False,
+        "behavioral_facts": {"active_trigger_codes": ["semantic_goal_drift"]},
+    }
+
+    trace = ControlPlaneService._control_transition_trace(
+        "scope-1", prior, state, decision, basis, ("drift-fix",))
+
+    assert trace["semantic_query_attempted"] is True
+    assert trace["semantic_judgment_returned"] is True
+    assert trace["semantic_judgment_used"] is False
+    assert trace["semantic_query_failed"] is False
+    assert trace["goal_drift_detected"] is True
+    assert trace["goal_drift_intervention_applied"] is True
+
+
 # -- mode thrash --------------------------------------------------------
 
 def test_rapid_reversal_without_new_evidence_counts_as_thrash():
@@ -74,11 +126,49 @@ def test_evidence_backed_transitions_are_not_counted_as_thrash():
     trace = BehavioralTrace()
     trace.record(_action(0, mode="DELIVER"))
     trace.record(_action(1, mode="VERIFY", authoritative_evidence_classes=(
-        "host_evidence_ref",)), authoritative_evidence=True)
+        "host_evidence_ref",), justification_class="validator_evidence"))
     trace.record(_action(2, mode="DELIVER", authoritative_evidence_classes=(
-        "host_evidence_ref",)), authoritative_evidence=True)
+        "host_evidence_ref",), justification_class="validator_evidence"))
     assert trace.mode_transitions == 2
     assert trace.rapid_mode_reversals == 0
+
+
+@pytest.mark.parametrize("justification", ["semantic_advisory", "heuristic"])
+def test_semantic_or_heuristic_transition_does_not_erase_mode_thrash(justification):
+    trace = BehavioralTrace()
+    trace.record(_action(0, mode="DELIVER"))
+    trace.record(_action(1, mode="VERIFY", justification_class=justification))
+    trace.record(_action(2, mode="DELIVER"))
+    assert trace.rapid_mode_reversals == 1
+
+
+def test_private_control_mode_thrashing_uses_boundary_order_and_action_age():
+    trace = BehavioralTrace()
+    trace.record_control_transition({
+        "boundary_sequence": 1, "host_action_index": 4,
+        "prior_mode": "DELIVER", "resulting_mode": "VERIFY",
+        "justification_class": "heuristic",
+    })
+    trace.record_control_transition({
+        "boundary_sequence": 2, "host_action_index": 4,
+        "prior_mode": "VERIFY", "resulting_mode": "DELIVER",
+        "justification_class": "semantic_advisory",
+    })
+    assert trace.mode_transitions == 2
+    assert trace.rapid_mode_reversals == 1
+
+    justified = BehavioralTrace()
+    justified.record_control_transition({
+        "boundary_sequence": 1, "host_action_index": 4,
+        "prior_mode": "DELIVER", "resulting_mode": "VERIFY",
+        "justification_class": "heuristic",
+    })
+    justified.record_control_transition({
+        "boundary_sequence": 2, "host_action_index": 4,
+        "prior_mode": "VERIFY", "resulting_mode": "DELIVER",
+        "justification_class": "validator_evidence",
+    })
+    assert justified.rapid_mode_reversals == 0
 
 
 def test_slow_reversal_is_not_thrash():
@@ -112,12 +202,15 @@ def test_median_dwell_is_none_for_a_single_mode():
 
 def test_behavior_counters_accumulate():
     trace = BehavioralTrace()
-    trace.record(_action(0, equivalent_retry=True, goal_drift=True, abstained=True,
+    trace.record(_action(0, equivalent_retry=True, goal_drift=True,
+                          goal_drift_detected=True,
+                          goal_drift_intervention_applied=True, abstained=True,
                           cfw_preflight_rejection=True, cfw_final_rejection=True,
                           semantic_query=True, attention_rotated=True,
                           fairness_forced_rotation=True,
                           attention_lease_started=True))
     assert trace.equivalent_retries == 1
+    assert trace.goal_drift_detections == 1
     assert trace.goal_drift_interventions == 1
     assert trace.abstentions == 1
     assert trace.cfw_preflight_rejections == 1
@@ -126,6 +219,14 @@ def test_behavior_counters_accumulate():
     assert trace.forced_attention_rotations == 1
     assert trace.attention_lease_starts == 1
     assert trace.attention_rotations == 1
+
+
+def test_goal_drift_detection_is_distinct_from_applied_intervention():
+    trace = BehavioralTrace()
+    trace.record(_action(0, goal_drift_detected=True))
+    record = trace.to_dict(trial_id="trial-drift")
+    assert record["goal_drift_detections"] == 1
+    assert record["goal_drift_interventions"] == 0
 
 
 def test_projection_churn_counts_distinct_digests():

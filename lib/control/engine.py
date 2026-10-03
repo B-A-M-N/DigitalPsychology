@@ -41,6 +41,9 @@ class DecisionPreparation:
     decision: BehavioralDecision
     system_one_frame: Mapping[str, Any] | None
     system_one_result: Mapping[str, Any] | None
+    system_one_query_attempted: bool
+    system_one_judgment_returned: bool
+    system_one_query_failed: bool
     semantic_judgment_used: bool
     attention_last_seen: Mapping[str, int]
     goal_set: GoalSetSnapshot
@@ -107,6 +110,9 @@ class ControlDecisionEngine:
         judgment = None
         system_one_frame = None
         system_one_result = None
+        system_one_query_attempted = False
+        system_one_judgment_returned = False
+        system_one_query_failed = False
         policy_context = {
             **dict(descriptor.host_capabilities.get("policy_context") or {}),
             **identity.to_dict(),
@@ -122,6 +128,7 @@ class ControlDecisionEngine:
             if frame is not None:
                 if frame.identity.to_dict() != self._system_one_identity(identity).to_dict():
                     raise ValueError("System-1 frame identity escapes the control session")
+                system_one_query_attempted = True
                 system_one_frame = frame.canonical_payload()
                 judgment_result = self.decision_service.judge(frame)
                 if hasattr(judgment_result, "judgment"):
@@ -131,11 +138,18 @@ class ControlDecisionEngine:
                     serialize = getattr(judgment_result, "to_dict", None)
                     if callable(serialize):
                         system_one_result = serialize()
+                    system_one_judgment_returned = (
+                        getattr(judgment_result, "judgment", None) is not None)
+                    system_one_query_failed = getattr(
+                        judgment_result, "status", None) in {
+                            "unavailable", "rejected", "stale"}
                     judgment = (judgment_result.judgment
                                 if getattr(judgment_result, "status", None) == "ok"
                                 else None)
                 else:
                     judgment = judgment_result
+                    system_one_judgment_returned = judgment_result is not None
+                    system_one_query_failed = judgment_result is None
 
         assessments = (self._assess_interventions(
             descriptor, record, request, goal_set, attention.last_seen)
@@ -176,7 +190,9 @@ class ControlDecisionEngine:
             raise RuntimeError("DP controller did not apply the host attention lease")
         self._validate_directives(descriptor, request.csw_snapshot, decision)
         return DecisionPreparation(
-            decision, system_one_frame, system_one_result, judgment is not None,
+            decision, system_one_frame, system_one_result,
+            system_one_query_attempted, system_one_judgment_returned,
+            system_one_query_failed, judgment is not None,
             attention.last_seen, goal_set,
             fairness_bound_actions=attention.fairness_bound_actions,
             starvation_prevented=attention.starvation_prevented,

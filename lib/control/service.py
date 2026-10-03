@@ -9,7 +9,8 @@ from ..behavior_state import (BehaviorDirective, BehaviorState, BehavioralDecisi
                               CSWBehaviorSnapshot, InterventionOutcome)
 from ..outcomes import InterventionEventContext
 from ..runtime.store import BehaviorStateStore
-from ..runtime.projection import project_behavior_context
+from ..runtime.projection import (build_behavior_projection,
+                                  project_behavior_context)
 from ..system_one_contracts import SystemOneFrame
 from ..control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
                                 ControlCommitRequest, ControlSessionDescriptor,
@@ -142,6 +143,17 @@ class ControlPlaneService:
         boundary_kind = str(request.boundary_kind)
         commit_action_index = (request.observation.action_index
                                if boundary_kind == "post_action" else record.action_index)
+        policy_context = descriptor.host_capabilities.get("policy_context") or {}
+        model_projection = build_behavior_projection(
+            decision.state, request.csw_snapshot, objective=descriptor.objective,
+            goal_set=request.goal_set,
+            cfw_connected=bool(descriptor.available_frameworks),
+            csw_connected=bool(descriptor.csw_authority_identity),
+            outcome_evidence_connected=bool(
+                descriptor.host_capabilities.get("outcome_evidence_connected")),
+            host_has_stable_objective_context=bool(
+                policy_context.get("host_has_stable_objective_context")),
+        )
         basis = {
             "expected_behavior_revision": record.state.revision,
             "expected_action_index": record.action_index,
@@ -161,13 +173,18 @@ class ControlPlaneService:
             "goal_set": request.goal_set.to_dict(),
             "attention_fairness_bound_actions": preparation.fairness_bound_actions,
             "attention_starvation_prevented": list(preparation.starvation_prevented),
-            "semantic_query_attempted": preparation.system_one_frame is not None,
+            "semantic_query_attempted": preparation.system_one_query_attempted,
+            "semantic_judgment_returned": preparation.system_one_judgment_returned,
             "semantic_judgment_used": preparation.semantic_judgment_used,
+            "semantic_query_failed": preparation.system_one_query_failed,
+            "model_projection_digest": model_projection.model.semantic_digest,
             "behavioral_facts": {
                 "active_trigger_codes": list(request.observation.active_trigger_codes),
                 "equivalent_retry_count": request.observation.equivalent_retry_count,
                 "candidate_preflight_result": request.observation.candidate_preflight_result,
                 "candidate_rejection_stage": request.observation.candidate_rejection_stage,
+                "cfw_preflight_decision": request.observation.cfw_preflight_decision,
+                "cfw_final_decision": request.observation.cfw_final_decision,
                 "evidence_refs": list(request.observation.evidence_refs),
                 "progress_made": request.observation.progress_made,
                 "regression_observed": request.observation.regression_observed,
@@ -175,7 +192,7 @@ class ControlPlaneService:
                                      if signal.active],
             },
         }
-        if preparation.system_one_frame is not None:
+        if preparation.system_one_query_attempted:
             basis["system_one"] = {
                 "frame": dict(preparation.system_one_frame),
                 "result": (dict(preparation.system_one_result)
@@ -284,10 +301,11 @@ class ControlPlaneService:
         }
         action_trace = (self._committed_action_trace(
             descriptor, record.state, committed_state, decision, basis,
-            application_events)
+            application_events, request.applied_directive_ids)
             if basis.get("boundary_kind") == "post_action" else None)
         transition_trace = self._control_transition_trace(
-            scope, record.state, committed_state, decision, basis)
+            scope, record.state, committed_state, decision, basis,
+            request.applied_directive_ids)
         self.state_store.save(
             scope,
             expected_revision=record.state.revision,
@@ -310,13 +328,16 @@ class ControlPlaneService:
     def _control_transition_trace(scope: str, prior_state: BehaviorState,
                                   state: BehaviorState,
                                   decision: BehavioralDecision,
-                                  basis: Mapping[str, Any]) -> dict[str, Any]:
+                                  basis: Mapping[str, Any],
+                                  applied_directive_ids: Sequence[str]
+                                  ) -> dict[str, Any]:
         from ..telemetry.control_trace import ControlTransitionTrace
 
         facts = dict(basis.get("behavioral_facts") or {})
+        from ..telemetry.behavioral_trace import classify_justification
         evidence_classes = []
         if facts.get("evidence_refs"):
-            evidence_classes.append("host_evidence")
+            evidence_classes.append("host_evidence_ref")
         if facts.get("progress_made"):
             evidence_classes.append("host_progress")
         if facts.get("regression_observed"):
@@ -324,26 +345,57 @@ class ControlPlaneService:
         if facts.get("cfw_signal_codes"):
             evidence_classes.append("cfw_signal")
         if basis.get("semantic_judgment_used"):
-            evidence_classes.append("semantic_judgment")
+            evidence_classes.append("semantic_advisory")
         if facts.get("candidate_rejection_stage"):
             evidence_classes.append("cfw_action_gate")
         if not evidence_classes:
             evidence_classes.append("policy_observation")
+        stage = facts.get("candidate_rejection_stage")
+        justification = classify_justification(
+            boundary_kind=str(basis.get("boundary_kind") or ""),
+            hard_safety=bool(stage),
+            validator_evidence=(basis.get("boundary_kind") == "validator"
+                                and bool(facts.get("evidence_refs"))),
+            csw_transition=(prior_state.active_stateworks != state.active_stateworks),
+            deterministic_host_fact=bool(facts.get("regression_observed")),
+            material_progress=bool(facts.get("progress_made")),
+            semantic_advisory=bool(basis.get("semantic_judgment_used")),
+            heuristic=bool(facts.get("active_trigger_codes")
+                           or facts.get("cfw_signal_codes")),
+        )
         causes = tuple(dict.fromkeys(
             [decision.reason] + [item.cause for item in decision.directives]))
+        active_triggers = set(facts.get("active_trigger_codes") or ())
+        drift_detected = bool(active_triggers & {"goal_drift", "semantic_goal_drift"})
+        applied_ids = set(applied_directive_ids)
+        drift_applied = any(
+            item.directive_id in applied_ids
+            and item.cause in {"goal_drift", "semantic_goal_drift"}
+            for item in decision.directives)
         return ControlTransitionTrace(
             control_session_id=scope,
             boundary_sequence=int(basis["boundary_sequence"]),
+            host_action_index=int(basis["host_action_index"]),
             boundary_kind=str(basis["boundary_kind"]),
             behavior_revision=state.revision,
             prior_mode=prior_state.cognitive_mode,
             resulting_mode=state.cognitive_mode,
             transition_causes=causes,
-            justification_class="+".join(evidence_classes),
+            justification_class=justification,
             semantic_query_attempted=bool(basis.get("semantic_query_attempted")),
+            semantic_judgment_returned=bool(
+                basis.get("semantic_judgment_returned")),
             semantic_judgment_used=bool(basis.get("semantic_judgment_used")),
-            cfw_rejection_stage=(str(facts["candidate_rejection_stage"])
-                                 if facts.get("candidate_rejection_stage") else None),
+            semantic_query_failed=bool(basis.get("semantic_query_failed")),
+            goal_drift_detected=drift_detected,
+            goal_drift_intervention_applied=drift_applied,
+            cfw_rejection_stage=(str(stage) if stage else None),
+            cfw_preflight_decision=(str(facts.get("cfw_preflight_decision")
+                                        or (facts.get("candidate_preflight_result")
+                                            if stage == "cfw_preflight" else "")) or None),
+            cfw_final_decision=(str(facts.get("cfw_final_decision")
+                                    or (facts.get("candidate_preflight_result")
+                                        if stage == "cfw_final_gate" else "")) or None),
         ).to_dict()
 
     @staticmethod
@@ -352,11 +404,11 @@ class ControlPlaneService:
                                 state: BehaviorState,
                                 decision: BehavioralDecision,
                                 basis: Mapping[str, Any],
-                                application_events: list[Mapping[str, Any]]) -> Any:
+                                application_events: list[Mapping[str, Any]],
+                                applied_directive_ids: Sequence[str]) -> Any:
         """Build a committed-action record from private host/control evidence."""
         from ..attention import fairness_bound_actions
-        from ..runtime.cfw_projection import build_cfw_behavior_projection
-        from ..telemetry.behavioral_trace import ActionTrace
+        from ..telemetry.behavioral_trace import ActionTrace, classify_justification
 
         goal_set = parse_goal_set(basis["goal_set"])
         action_index = int(basis["host_action_index"])
@@ -379,11 +431,9 @@ class ControlPlaneService:
         prevented = tuple(str(item) for item in
                           basis.get("attention_starvation_prevented") or ())
         facts = dict(basis.get("behavioral_facts") or {})
-        system_one = dict(basis.get("system_one") or {})
-        system_result = system_one.get("result")
-        semantic_attempted = bool(system_one.get("frame"))
-        semantic_result = bool(isinstance(system_result, Mapping)
-                               and system_result.get("status") == "ok")
+        semantic_attempted = bool(basis.get("semantic_query_attempted"))
+        semantic_result = bool(basis.get("semantic_judgment_returned"))
+        semantic_failed = bool(basis.get("semantic_query_failed"))
         evidence_classes = set()
         if facts.get("evidence_refs"):
             evidence_classes.add("host_evidence_ref")
@@ -403,14 +453,32 @@ class ControlPlaneService:
             evidence_classes.add("candidate_gate_rejection")
         if application_events:
             evidence_classes.add("intervention_application_receipt")
-        projection = build_cfw_behavior_projection(
-            state, host_action_index=action_index).to_dict()
-        projection_digest = hashlib.sha256(_canonical(projection).encode()).hexdigest()
+        projection_digest = basis.get("model_projection_digest")
         newly_applied = bool(application_events)
-        goal_drift = any(
-            item.cause in {"goal_drift", "semantic_goal_drift"}
+        active_triggers = set(facts.get("active_trigger_codes") or ())
+        goal_drift_detected = bool(active_triggers & {
+            "goal_drift", "semantic_goal_drift"})
+        applied_ids = set(applied_directive_ids)
+        goal_drift_applied = any(
+            item.directive_id in applied_ids
+            and item.cause in {"goal_drift", "semantic_goal_drift"}
             for item in decision.directives)
         candidate_stage = facts.get("candidate_rejection_stage")
+        justification = classify_justification(
+            hard_safety=bool(candidate_stage),
+            csw_transition=(prior_state.active_stateworks != state.active_stateworks),
+            deterministic_host_fact=bool(facts.get("regression_observed")),
+            material_progress=bool(facts.get("progress_made")),
+            semantic_advisory=bool(basis.get("semantic_judgment_used")),
+            heuristic=bool(active_triggers or facts.get("cfw_signal_codes")
+                           or application_events),
+        )
+        preflight_decision = facts.get("cfw_preflight_decision")
+        final_decision = facts.get("cfw_final_decision")
+        if candidate_stage == "cfw_preflight" and not preflight_decision:
+            preflight_decision = facts.get("candidate_preflight_result")
+        if candidate_stage == "cfw_final_gate" and not final_decision:
+            final_decision = facts.get("candidate_preflight_result")
         return ActionTrace(
             action_index=action_index,
             cognitive_mode=state.cognitive_mode,
@@ -422,22 +490,31 @@ class ControlPlaneService:
                                  if state.mode_lease else None),
             attention_lease_started=lease_started,
             attention_rotated=rotated,
-            fairness_forced_rotation=bool(rotated and prevented),
+            fairness_forced_rotation=bool(prevented),
             fairness_prevented_criteria=prevented,
             intervention_applied=newly_applied,
             abstained=decision.reason.startswith("abstain"),
             equivalent_retry=("equivalent_retry" in
                               set(facts.get("active_trigger_codes") or ())),
-            goal_drift=goal_drift,
+            goal_drift=goal_drift_applied,
+            goal_drift_detected=goal_drift_detected,
+            goal_drift_intervention_applied=goal_drift_applied,
             projection_digest=projection_digest,
             semantic_query=semantic_attempted,
             semantic_attempted=semantic_attempted,
             semantic_result=semantic_result,
-            semantic_used=semantic_result,
-            semantic_failed=semantic_attempted and not semantic_result,
+            semantic_judgment_returned=semantic_result,
+            semantic_used=bool(basis.get("semantic_judgment_used")),
+            semantic_failed=semantic_failed,
+            semantic_query_failed=semantic_failed,
             cfw_preflight_rejection=candidate_stage == "cfw_preflight",
             cfw_final_rejection=candidate_stage == "cfw_final_gate",
+            cfw_preflight_decision=(str(preflight_decision)
+                                    if preflight_decision else None),
+            cfw_final_decision=(str(final_decision)
+                                if final_decision else None),
             authoritative_evidence_classes=tuple(sorted(evidence_classes)),
+            justification_class=justification,
         )
 
     def behavioral_trial_record(self, control_session_id: str, *, trial_id: str,
@@ -449,7 +526,12 @@ class ControlPlaneService:
             runtime_configuration,
         )
 
-        descriptor = self._descriptor(control_session_id)
+        stored = self.state_store.control_session(control_session_id)
+        if stored is None:
+            raise RuntimeError("control session has no persisted descriptor")
+        descriptor = ControlSessionDescriptor.from_mapping(stored["descriptor"])
+        if descriptor.control_session_id != control_session_id:
+            raise RuntimeError("persisted control session identity is inconsistent")
         attestation = provider_attestation(self.engine.system_one_frame_factory)
         trace = BehavioralTrace(
             task_id=descriptor.identity.task_id,
@@ -465,21 +547,32 @@ class ControlPlaneService:
             semantic_provider_attestation=attestation,
         )
         for row in self.state_store.behavioral_action_traces(control_session_id):
-            trace.record(ActionTrace.from_dict(row), mode_cause=(
-                str(row.get("authoritative_evidence_classes") or ["mode_transition"])[0]
-                if row.get("authoritative_evidence_classes") else "mode_transition"),
-                         authoritative_evidence=bool(
-                             row.get("authoritative_evidence_classes")))
+            trace.record(ActionTrace.from_dict(row))
+        transitions = self.state_store.committed_control_transitions(control_session_id)
+        for transition in transitions:
+            trace.record_control_transition(transition)
         record = trace.to_dict(trial_id=trial_id,
                                task_outcome_score=task_outcome_score,
                                task_completed=task_completed)
-        transitions = self.state_store.committed_control_transitions(control_session_id)
         record["cfw_preflight_rejections"] = sum(
             1 for item in transitions
             if item.get("cfw_rejection_stage") == "cfw_preflight")
         record["cfw_final_gate_rejections"] = sum(
             1 for item in transitions
             if item.get("cfw_rejection_stage") == "cfw_final_gate")
+        record["goal_drift_detections"] = sum(
+            1 for item in transitions if item.get("goal_drift_detected"))
+        record["goal_drift_interventions"] = sum(
+            1 for item in transitions
+            if item.get("goal_drift_intervention_applied"))
+        record["semantic_queries"] = sum(
+            1 for item in transitions if item.get("semantic_query_attempted"))
+        record["semantic_results"] = sum(
+            1 for item in transitions if item.get("semantic_judgment_returned"))
+        record["semantic_uses"] = sum(
+            1 for item in transitions if item.get("semantic_judgment_used"))
+        record["semantic_failures"] = sum(
+            1 for item in transitions if item.get("semantic_query_failed"))
         record["control_transition_count"] = len(transitions)
         return record
 

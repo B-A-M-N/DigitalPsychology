@@ -180,6 +180,8 @@ class RuntimeObservation:
     candidate_action: ActionCandidate | None = None
     candidate_preflight_result: str | None = None
     candidate_rejection_stage: str | None = None
+    cfw_preflight_decision: str | None = None
+    cfw_final_decision: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.action_index, int) or self.action_index < 0:
@@ -218,6 +220,14 @@ class RuntimeObservation:
         if (self.candidate_preflight_result is not None
                 and self.candidate_rejection_stage is None):
             raise ValueError("candidate rejection must identify its authoritative CFW gate")
+        gate_decisions = {
+            "allow", "block", "require_confirmation", "require_reinspection",
+            "require_recovery", "require_changed_hypothesis", "require_goal_reanchor",
+        }
+        for name in ("cfw_preflight_decision", "cfw_final_decision"):
+            decision = getattr(self, name)
+            if decision is not None and decision not in gate_decisions:
+                raise ValueError(f"{name} is outside the CFW action-gate contract")
         # The private control protocol carries a candidate at the pre-action
         # boundary and again only when CFW reports a rejection.
         if not self.action_completed and (

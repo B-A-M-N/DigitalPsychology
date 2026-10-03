@@ -309,6 +309,8 @@ class ControlTickRequest:
                                      if self.observation.candidate_action else None),
                 "candidate_preflight_result": self.observation.candidate_preflight_result,
                 "candidate_rejection_stage": self.observation.candidate_rejection_stage,
+                "cfw_preflight_decision": self.observation.cfw_preflight_decision,
+                "cfw_final_decision": self.observation.cfw_final_decision,
             },
             "goal_set": self.goal_set.to_dict(),
             "cfw_signals": [{"source": item.source, "code": item.code,

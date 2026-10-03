@@ -53,7 +53,8 @@ class HostTransactionCoordinator:
                             observation.action_index, expire_cfw=True)
                     return self.host._status()
             if (boundary_kind in {"pre_action", "post_action"}
-                    and self.host._expire_local_leases(observation.action_index)):
+                    and self.host._expire_local_leases(
+                        observation.action_index, expire_cfw=True)):
                 await self.host._reconcile_locked()
             goals = goal_set or observation.goal_set or self.host.goal_set
             if not isinstance(goals, GoalSetSnapshot):
@@ -80,7 +81,9 @@ class HostTransactionCoordinator:
                               goal_set: GoalSetSnapshot | None = None,
                               candidate_action: ActionCandidate | None = None,
                               candidate_preflight_result: str | None = None,
-                              candidate_rejection_stage: str | None = None
+                              candidate_rejection_stage: str | None = None,
+                              cfw_preflight_decision: str | None = None,
+                              cfw_final_decision: str | None = None
                               ) -> RuntimeObservation:
         if boundary_kind == "pre_action":
             action_index = max(1, self.host._action_index + 1)
@@ -100,6 +103,8 @@ class HostTransactionCoordinator:
                                 and candidate_action.approach_epoch else
                                 prior.approach_epoch if prior else ""),
                 candidate_action=candidate_action,
+                cfw_preflight_decision=cfw_preflight_decision,
+                cfw_final_decision=cfw_final_decision,
             )
         prior = self.host._latest_observation
         return RuntimeObservation(
@@ -118,6 +123,8 @@ class HostTransactionCoordinator:
             candidate_action=candidate_action,
             candidate_preflight_result=candidate_preflight_result,
             candidate_rejection_stage=candidate_rejection_stage,
+            cfw_preflight_decision=cfw_preflight_decision,
+            cfw_final_decision=cfw_final_decision,
         )
 
     async def _apply_tick_locked(self, observation: RuntimeObservation,

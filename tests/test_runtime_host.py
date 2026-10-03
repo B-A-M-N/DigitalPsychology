@@ -16,6 +16,8 @@ from lib.outcomes import HostOutcomeFact
 from lib.runtime import (BehaviorStateStore, CFWRuntimeAdapter, RuntimeHost,
                          RuntimeIdentity, RuntimeObservation)
 from lib.runtime.adapters import NullCFWComponentPort, NullCSWWorkflowPort
+from lib.behavior_state import AttentionLease
+from lib.attention import AttentionSchedule, fairness_bound_actions
 from lib.protocol_artifact import QUESTION_REGISTRY
 from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionSpec,
                                       SemanticState, SystemOneFrame,
@@ -386,6 +388,7 @@ def test_runtime_host_keeps_twelve_item_task_set_complete_and_rotates_attention(
 
         observed: set[str] = set()
         focus_after_first_lease = ()
+        fairness_bound = fairness_bound_actions(len(criteria))
         for action_index in range(1, 13):
             result = session.process_action(RuntimeObservation(
                 action_index=action_index,
@@ -397,6 +400,10 @@ def test_runtime_host_keeps_twelve_item_task_set_complete_and_rotates_attention(
             ))
             assert result.state.cognitive_mode != "BLOCKED"
             assert len(result.state.focus_criteria) <= 3
+            action_trace = session.behavioral_trace.actions[-1]
+            assert set(action_trace.attention_ages) == set(criteria)
+            assert action_trace.fairness_bound == fairness_bound
+            assert action_trace.max_starvation_age <= fairness_bound
             observed.update(result.state.focus_criteria)
             if action_index == 1:
                 assert result.state.cognitive_mode == "RECOVER"
@@ -413,6 +420,68 @@ def test_runtime_host_keeps_twelve_item_task_set_complete_and_rotates_attention(
         assert "Current focus" in context
         assert all(item in context for item in result.state.focus_criteria)
         assert session.project_behavior_context().count("criterion-") < 16
+    finally:
+        service.close()
+
+
+def test_twelve_item_starvation_telemetry_detects_a_broken_scheduler(
+        tmp_path, monkeypatch):
+    import importlib
+
+    runtime_session = importlib.import_module("lib.runtime.session")
+    real_schedule = runtime_session.schedule_attention
+    identity = _identity()
+    service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
+    criteria = tuple(f"criterion-{index}" for index in range(1, 13))
+    goal_set = GoalSetSnapshot(revision=9, items=tuple(
+        GoalItemSnapshot(criterion_id=criterion_id, status="READY")
+        for criterion_id in criteria))
+    fixed_focus: tuple[str, ...] = ()
+
+    def broken_schedule(goals, state, *, action_index):
+        nonlocal fixed_focus
+        scheduled = real_schedule(goals, state, action_index=action_index)
+        if not fixed_focus:
+            fixed_focus = scheduled.lease.criterion_ids
+        lease = AttentionLease(
+            lease_id="broken-fixed-focus",
+            criterion_ids=fixed_focus,
+            issued_revision=state.revision + 1,
+            goal_set_revision=goals.revision,
+            start_action=1,
+            max_actions=8,
+            reason="test-only broken scheduler",
+        )
+        last_seen = dict(state.attention_last_seen)
+        for item in goals.runnable_items:
+            last_seen.setdefault(item.criterion_id, max(0, action_index - 1))
+        for criterion_id in fixed_focus:
+            last_seen[criterion_id] = action_index
+        return AttentionSchedule(
+            lease=lease, last_seen=last_seen,
+            runnable_count=len(goals.runnable_items),
+            oldest_starved_criterion=None,
+            fairness_bound_actions=fairness_bound_actions(len(goals.runnable_items)),
+        )
+
+    monkeypatch.setattr(runtime_session, "schedule_attention", broken_schedule)
+    try:
+        host = RuntimeHost(service=service,
+                           state_path=tmp_path / "behavior-state.sqlite3")
+        cfw_port = _CFWPort()
+        cfw_port.signals = []
+        session = host.open_session(
+            identity=identity, objective="Complete all twelve requested items",
+            objective_criteria=criteria, cfw=CFWRuntimeAdapter(cfw_port),
+            csw=_CSWPort(), outcome_evidence_authority=_EvidenceAuthority({}),
+        )
+        for action_index in range(1, 16):
+            session.process_action(RuntimeObservation(
+                action_index=action_index, goal_set=goal_set))
+        record = session.behavioral_trial_record(trial_id="broken-scheduler")
+        assert set(session.behavioral_trace.actions[-1].attention_ages) == set(criteria)
+        assert record["max_starvation_age"] > fairness_bound_actions(len(criteria))
+        assert record["fairness_violation_count"] > 0
     finally:
         service.close()
 
