@@ -83,6 +83,18 @@ class RuntimeSession:
         if system_one_frame_factory is not None and not callable(
                 getattr(controller, "judge", None)):
             raise TypeError("System-1 frame construction requires a DP host judge")
+        if system_one_frame_factory is not None:
+            # Fail at session startup rather than on the first decision: the
+            # semantic protocol cannot express an unknown task kind, so DP
+            # refuses to consult a provider the host has not given real task
+            # semantics for.
+            from ..control.system_one import DeliverableKindRequired, _deliverable_kind
+            try:
+                _deliverable_kind(self.policy_context, provider_enabled=True)
+            except DeliverableKindRequired as exc:
+                raise DeliverableKindRequired(
+                    f"semantic provider cannot start for task {identity.task_id!r}: {exc}"
+                ) from exc
         self._lock = RLock()
 
     def process_action(self, observation: RuntimeObservation, *,

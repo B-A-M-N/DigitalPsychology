@@ -60,21 +60,46 @@ def _semantic_criterion_ids(attention: Sequence[str], candidate: Any,
     return tuple(selected)
 
 
-def _deliverable_kind(policy_context: Mapping[str, Any]) -> str:
-    allowed = {"visual_ui", "code_behavior", "document", "architecture",
-               "test_suite", "infrastructure", "analysis"}
-    aliases = {
-        "code_change": "code_behavior", "code": "code_behavior",
-        "configuration": "code_behavior", "deployment": "infrastructure",
-        "research": "analysis", "ui": "visual_ui",
-    }
+DELIVERABLE_KINDS = ("visual_ui", "code_behavior", "document", "architecture",
+                     "test_suite", "infrastructure", "analysis")
+
+_DELIVERABLE_ALIASES = {
+    "code_change": "code_behavior", "code": "code_behavior",
+    "configuration": "code_behavior", "deployment": "infrastructure",
+    "research": "analysis", "ui": "visual_ui",
+}
+
+
+class DeliverableKindRequired(ValueError):
+    """The semantic protocol has no ``unknown`` task kind, and the host omitted it.
+
+    Defaulting to ``analysis`` silently mislabels a coding task and degrades the
+    provider's classification. The protocol offers no unknown value, so the only
+    honest options are to supply the real kind or to not consult a provider.
+    """
+
+
+def _deliverable_kind(policy_context: Mapping[str, Any], *,
+                      provider_enabled: bool = False) -> str | None:
+    """Return the host-declared deliverable kind.
+
+    With a semantic provider enabled this is mandatory. Silently labelling a
+    coding task as ``analysis`` is worse than not asking: the provider would
+    classify against task semantics the host never claimed.
+    """
+    allowed = set(DELIVERABLE_KINDS)
     for key in ("deliverable_kind", "task_kind"):
         value = policy_context.get(key)
         if isinstance(value, str):
-            normalized = aliases.get(value.strip().lower(), value.strip().lower())
+            normalized = _DELIVERABLE_ALIASES.get(value.strip().lower(),
+                                                   value.strip().lower())
             if normalized in allowed:
                 return normalized
-    return "analysis"
+    if provider_enabled:
+        raise DeliverableKindRequired(
+            "a semantic provider requires the host to declare deliverable_kind "
+            "or task_kind; DP will not inject a guessed task kind")
+    return None
 
 
 def create_system_one_frame_factory(system_one_service: Any):
@@ -223,7 +248,8 @@ def create_system_one_frame_factory(system_one_service: Any):
         ) for statework_id in csw.active_stateworks[:8])
         work_mode = ("diagnose" if behavior_state.cognitive_mode in {
             "DIAGNOSE", "REINSPECT", "RECOVER", "REPLAN"} else "delivery")
-        deliverable_kind = _deliverable_kind(policy_context or {})
+        deliverable_kind = _deliverable_kind(
+            policy_context or {}, provider_enabled=True)
         semantic_state = SemanticState(
             task={
                 "objective": objective[:1024],

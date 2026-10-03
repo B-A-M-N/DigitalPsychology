@@ -501,6 +501,8 @@ def test_runtime_host_dispatches_validated_system_one_frame_before_fast_loop(tmp
             objective_criteria=("criterion-visual",),
             cfw=CFWRuntimeAdapter(_CFWPort()), csw=_CSWPort(),
             outcome_evidence_authority=_EvidenceAuthority({}),
+            # A semantic provider requires the host to declare task semantics.
+            policy_context={"deliverable_kind": "visual_ui"},
         )
         session.process_action(RuntimeObservation(action_index=1))
         assert service.calls == [("judge", frame), ("decide", None)]

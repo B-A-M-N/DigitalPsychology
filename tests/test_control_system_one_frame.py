@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 from lib.control.service import ControlPlaneService
 from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
                                 GoalItemSnapshot, GoalSetSnapshot, StateWorkOption)
@@ -92,6 +94,8 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
             identity, "Render the requested page", ("criterion-visual",),
             BehaviorState(),
             observation, CSWBehaviorSnapshot(revision=2), (),
+            # The host must declare real task semantics; DP will not guess.
+            {"deliverable_kind": "visual_ui"},
         )
         restored = SystemOneFrame.from_mapping(frame.canonical_payload())
     finally:
@@ -129,7 +133,8 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
         factory = create_system_one_frame_factory(service)
         frame = factory(identity, "Render the requested page", ("criterion-visual",),
                         BehaviorState(revision=2), observation,
-                        CSWBehaviorSnapshot(revision=0), ())
+                        CSWBehaviorSnapshot(revision=0), (),
+                        {"deliverable_kind": "visual_ui"})
     finally:
         service.close()
 
@@ -246,7 +251,8 @@ def test_frame_factory_does_not_substitute_an_unplanned_enabled_question():
     try:
         frame = create_system_one_frame_factory(service)(
             identity, "Render the requested page", ("criterion-visual",),
-            BehaviorState(), observation, CSWBehaviorSnapshot(revision=0), ())
+            BehaviorState(), observation, CSWBehaviorSnapshot(revision=0), (),
+            {"deliverable_kind": "visual_ui"})
     finally:
         service.close()
 
@@ -281,7 +287,8 @@ def test_laya_statework_fit_contains_only_bounded_csw_eligible_choices():
         frame = create_system_one_frame_factory(service)(
             identity, "Repair the requested behavior", ("criterion-1",),
             BehaviorState(cognitive_mode="DIAGNOSE"),
-            RuntimeObservation(action_index=1), csw, ())
+            RuntimeObservation(action_index=1), csw, (),
+            {"deliverable_kind": "code_behavior"})
     finally:
         service.close()
 
@@ -320,7 +327,9 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         identity=identity, objective="Render the requested page",
         objective_criteria=("criterion-visual",), initial_goal_set=goals,
         available_frameworks=("owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"),
-        csw_authority_identity={"authority": "test-csw"}, host_capabilities={},
+        csw_authority_identity={"authority": "test-csw"},
+        # The host declares real task semantics; DP refuses to guess them.
+        host_capabilities={"policy_context": {"deliverable_kind": "visual_ui"}},
     )
     control.open_control_session(descriptor.to_dict())
     observation = RuntimeObservation(
@@ -349,3 +358,56 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
     assert {item["question_id"] for item in audited["result"]["judgment"]["answers"]} == {
         "retry_relation"}
     assert prepared["status"] == "prepared"
+
+
+# -- P1-9: DP must not invent task semantics ------------------------------
+
+def test_semantic_provider_refuses_a_guessed_deliverable_kind():
+    """A missing deliverable kind must fail closed, not default to analysis.
+
+    The semantic protocol has no ``unknown`` task kind, so defaulting would
+    mislabel a coding task and degrade the provider's classification.
+    """
+    from lib.control.system_one import (DeliverableKindRequired,
+                                        _deliverable_kind)
+    with pytest.raises(DeliverableKindRequired):
+        _deliverable_kind({}, provider_enabled=True)
+    # With no provider configured the value is simply absent, not guessed.
+    assert _deliverable_kind({}, provider_enabled=False) is None
+
+
+def test_deliverable_kind_aliases_normalize_to_real_kinds():
+    from lib.control.system_one import DeliverableKindRequired, _deliverable_kind
+    assert _deliverable_kind({"deliverable_kind": "code_change"},
+                             provider_enabled=True) == "code_behavior"
+    assert _deliverable_kind({"task_kind": "ui"},
+                             provider_enabled=True) == "visual_ui"
+    assert _deliverable_kind({"deliverable_kind": "DEPLOYMENT"},
+                             provider_enabled=True) == "infrastructure"
+    # An unrecognized value is still a missing value.
+    with pytest.raises(DeliverableKindRequired):
+        _deliverable_kind({"deliverable_kind": "interpretive-dance"},
+                          provider_enabled=True)
+
+
+def test_runtime_session_refuses_a_provider_without_task_semantics(tmp_path):
+    """The check happens at session startup, not on the first decision."""
+    from lib.control.system_one import DeliverableKindRequired
+    from lib.runtime.adapters.cfw import CFWRuntimeAdapter
+    from lib.runtime.host import RuntimeHost
+    from lib.service import DigitalPsychologyService
+    from test_runtime_host import _CFWPort, _CSWPort, _EvidenceAuthority, _identity
+
+    service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
+    try:
+        host = RuntimeHost(service=service,
+                           state_path=tmp_path / "behavior-state.sqlite3",
+                           system_one_frame_factory=lambda *args: None)
+        with pytest.raises(DeliverableKindRequired):
+            host.open_session(
+                identity=_identity(), objective="Render the requested page",
+                objective_criteria=("criterion-visual",),
+                cfw=CFWRuntimeAdapter(_CFWPort()), csw=_CSWPort(),
+                outcome_evidence_authority=_EvidenceAuthority({}))
+    finally:
+        service.close()
