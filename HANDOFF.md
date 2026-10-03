@@ -137,16 +137,46 @@ provider attestation is `INVALID_TREATMENT`.
 | CognitiveFrameWorks | **186 passed** (1 deselected) |
 | CognitiveStateWork | **31 passed** |
 
+### Pass 7 - remaining P1 code gaps
+
+**P1-7 starvation ranking (closed).** `projected_starvation_risk` was computed
+for every candidate and then omitted from the ranking key. Starvation is now a
+hard constraint: a candidate whose projected lease saturates the fairness ratio
+is excluded, so the zero-violation invariant is defended at selection time. A
+host-required mode still outranks it, because DP must act legally rather than
+refuse; in that case fairness degrades to a tiebreak ahead of cost.
+
+**P1-9 deliverable kind (closed).** DP defaulted `deliverable_kind` to
+`analysis` when the host omitted it, silently mislabeling coding tasks. The
+semantic protocol has no `unknown` value, so the field is now mandatory whenever
+a provider is enabled, and `RuntimeSession` checks it at session startup rather
+than on the first decision. Test call sites that relied on the guess now declare
+the kind that is actually true for the task under test.
+
+**P1-12 lease boundary (closed, and it was a real defect).** The convention was
+never written down and the systems disagreed by one action: CFW treated
+`expires_at_action = N` as still valid at N while CSW treated N as already
+expired. DP sends the same value to both, so a framework lease could hold a
+control one action after its StateWork was released. CSW now uses CFW's
+inclusive convention, and
+`CognitiveFrameWorks/tests/test_lease_boundary_contract.py` drives the real
+CFW overlay, the real CSW authority and DP's intervention contract across
+actions 9-13 asserting all three agree.
+
+### Suite results after Pass 7
+
+| Project | Result |
+|---|---|
+| DigitalPsychology | **181 passed** |
+| CognitiveFrameWorks | **190 passed** (1 deselected) |
+| CognitiveStateWork | **31 passed** |
+
 ### Remaining
 
 - Pass 5: close the core triad cohort (baseline, CFW, CFW+CSW, CFW+CSW+DP) with
   both external outcomes and internal behavioral metrics.
 - Pass 6: Laya arm, blocked until a pinned Laya checkpoint exists on the host.
-- P1-7 starvation is computed but not yet used as a ranking constraint.
-- P1-9 `deliverable_kind` still falls back to `analysis` when the host omits it.
 - P1-10/11/23 legacy CFW workflow helpers and the duplicate `yaml` import.
-- P1-12 lease-boundary convention is stated once in the projection, but a
-  cross-system contract test over CFW, CSW and DP at actions 9-13 is still open.
 
 ## Continuation record (2026-10-02)
 
