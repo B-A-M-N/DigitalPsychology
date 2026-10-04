@@ -18,6 +18,7 @@ class HostReconciler:
                              expire_cfw: bool = False) -> bool:
         """Advance CSW-owned DP leases even when the private DP process is down."""
         changed = False
+        self.host._last_lease_expiry_failed = False
         if expire_cfw:
             expire_controls = getattr(self.host.cfw, "expire_local_behavior_leases", None)
             if callable(expire_controls):
@@ -27,6 +28,7 @@ class HostReconciler:
                     self.host._offline_controls_expired = (
                         self.host._offline_controls_expired or cfw_changed)
                 except Exception as exc:
+                    self.host._last_lease_expiry_failed = True
                     self.host._fault = f"CFW local lease expiry failed at the host action boundary: {exc}"
                     self.host._notify_fault(self.host._fault)
                     self.host._needs_reconciliation = True
@@ -40,6 +42,7 @@ class HostReconciler:
             expire(host_action_index=host_action_index)
             after, _ = self.host._csw_snapshot()
         except Exception as exc:
+            self.host._last_lease_expiry_failed = True
             self.host._fault = f"CSW lease expiry failed at the host action boundary: {exc}"
             self.host._notify_fault(self.host._fault)
             self.host._needs_reconciliation = True

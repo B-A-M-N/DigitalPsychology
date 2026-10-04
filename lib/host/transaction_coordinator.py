@@ -75,6 +75,7 @@ class HostTransactionCoordinator:
 
     def _boundary_observation(self, boundary_kind: str, *,
                               goal_set: GoalSetSnapshot | None = None,
+                              candidate_action_index: int | None = None,
                               candidate_action: ActionCandidate | None = None,
                               candidate_preflight_result: str | None = None,
                               candidate_rejection_stage: str | None = None,
@@ -83,7 +84,9 @@ class HostTransactionCoordinator:
                               cfw_final_decision: str | None = None
                               ) -> RuntimeObservation:
         if boundary_kind in {"pre_action", "pre_action_rejected"}:
-            action_index = max(1, self.host._action_index + 1)
+            action_index = (candidate_action_index
+                            if candidate_action_index is not None
+                            else max(1, self.host._action_index + 1))
             prior = self.host._latest_observation
             return RuntimeObservation(
                 action_index=action_index, action_completed=False,

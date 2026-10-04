@@ -51,7 +51,13 @@ class HostLifecycleHooks:
             raise TypeError("pre-action boundary requires a validated ActionCandidate")
         if not set(value.affected_criterion_ids).issubset(self.host.objective_criteria):
             raise ValueError("candidate action criteria escape the control objective")
-        await self._prepare_candidate_boundary()
+        candidate_action_index = await self._prepare_candidate_boundary()
+        if candidate_action_index is None:
+            # No CFW gate may authorize an action against stale local controls
+            # when expiry or DP reconciliation did not complete.
+            return {"status": "degraded", "stage": "boundary_preparation",
+                    "decision": "block", "action_authorized": False,
+                    "reason": "candidate controls could not be reconciled"}
         cfw_connected = bool(self.host._cfw_components)
         action_request = dict(cfw_action_request) if cfw_action_request is not None else None
         preflight: Mapping[str, Any] | None = None
@@ -74,11 +80,13 @@ class HostLifecycleHooks:
                 return await self.host._record_candidate_rejection(
                     value, str(preflight.get("decision") or "block"),
                     stage="cfw_preflight", goal_set=goal_set,
+                    candidate_action_index=candidate_action_index,
                     preflight_decision=str(preflight.get("decision") or "block"),
                     candidate_gate_receipts=gate_receipts)
 
         observation = self.host._boundary_observation(
             "pre_action", goal_set=goal_set, candidate_action=value,
+            candidate_action_index=candidate_action_index,
             candidate_gate_receipts=(gate_receipts or None),
             cfw_preflight_decision=(str(preflight["decision"])
                                     if preflight is not None else None))
@@ -100,6 +108,7 @@ class HostLifecycleHooks:
         if decision != "allow":
             rejected = await self.host._record_candidate_rejection(
                 value, decision, stage="cfw_final_gate", goal_set=goal_set,
+                candidate_action_index=candidate_action_index,
                 preflight_decision=str(preflight["decision"]),
                 candidate_gate_receipts={**gate_receipts, "final": final_receipt})
             return {**rejected, "pre_action_control": dict(control)}
@@ -112,26 +121,39 @@ class HostLifecycleHooks:
         return {**control, "action_authorized": True,
                 "action_request_id": request_id}
 
-    async def _prepare_candidate_boundary(self) -> int:
+    async def _prepare_candidate_boundary(self) -> int | None:
         """Expire candidate-scoped controls before any CFW gate evaluates it."""
         async with self.host._lock:
             self.host._require_open()
-            if not self.host._remote_open or self.host._needs_reconciliation:
-                await self.host._connect_or_degrade_locked()
             action_index = max(1, self.host._action_index + 1)
-            changed = self.host._expire_local_leases(
-                action_index, expire_cfw=True)
-            if changed and self.host._remote_open:
-                await self.host._connect_or_degrade_locked()
-            return action_index
+            for _ in range(3):
+                changed = self.host._expire_local_leases(
+                    action_index, expire_cfw=True)
+                if self.host._last_lease_expiry_failed:
+                    return None
+                if (changed or self.host._needs_reconciliation
+                        or not self.host._remote_open):
+                    connected = await self.host._connect_or_degrade_locked()
+                    if (not connected or not self.host._remote_open
+                            or self.host._needs_reconciliation):
+                        return None
+                next_index = max(1, self.host._action_index + 1)
+                if next_index == action_index:
+                    return action_index
+                # Reconciliation may recover a committed boundary. Advance
+                # expiry to the newly authoritative candidate before retrying.
+                action_index = next_index
+            return None
 
     async def _record_candidate_rejection(
             self, candidate: ActionCandidate, decision: str, *, stage: str,
             goal_set: GoalSetSnapshot | None,
+            candidate_action_index: int,
             preflight_decision: str | None = None,
             candidate_gate_receipts: Mapping[str, Any]) -> Mapping[str, Any]:
         observation = self.host._boundary_observation(
             "pre_action_rejected", goal_set=goal_set,
+            candidate_action_index=candidate_action_index,
             candidate_action=candidate, candidate_preflight_result=decision,
             candidate_rejection_stage=stage,
             candidate_gate_receipts=candidate_gate_receipts,

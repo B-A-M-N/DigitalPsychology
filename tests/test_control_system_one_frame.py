@@ -7,7 +7,8 @@ import pytest
 from lib.control.service import ControlPlaneService
 from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
                                 GoalItemSnapshot, GoalSetSnapshot, StateWorkOption)
-from lib.control_protocol import ControlSessionDescriptor, ControlTickRequest
+from lib.control_protocol import (PROTOCOL_VERSION as CONTROL_PROTOCOL_VERSION,
+                                  ControlSessionDescriptor, ControlTickRequest)
 from lib.control.system_one import create_system_one_frame_factory
 from lib.runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
 from lib.runtime.store import BehaviorStateStore
@@ -386,6 +387,10 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         pinned_provider = state_store.control_session(identity.scope)[
             "provider_identity"]
         assert pinned_provider["attestation"]["model_id"] == "fixture-model"
+        execution_identity = pinned_provider["execution_identity"]
+        assert execution_identity["dp_control_implementation_version"] == CONTROL_PROTOCOL_VERSION
+        assert len(execution_identity["dp_control_implementation_hash"]) == 64
+        assert len(execution_identity["behavior_policy_contract_hash"]) == 64
         changed_attestation = dict(pinned_provider["attestation"])
         changed_attestation["model_id"] = "replacement-model"
         replacement_factory = lambda *_args, **_kwargs: None
@@ -398,6 +403,7 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         trial = control.behavioral_trial_record(
             identity.scope, trial_id="provider-pinned-trial")
         assert trial["semantic_provider_attestation"] == pinned_provider["attestation"]
+        assert trial["execution_identity"] == execution_identity
         with pytest.raises(RuntimeError, match="provider identity has changed"):
             control.open_control_session(descriptor.to_dict())
     finally:

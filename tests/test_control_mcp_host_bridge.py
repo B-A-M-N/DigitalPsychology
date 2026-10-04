@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import pytest
 
-from lib.behavior_state import (CSWBehaviorSnapshot, GoalItemSnapshot,
+from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, GoalItemSnapshot,
                                 GoalSetSnapshot, StateWorkOption)
 from lib.control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
                                   ControlTickRequest)
@@ -366,6 +366,60 @@ def test_dp_mcp_outage_keeps_host_runtime_usable():
         assert bridge.audit_projection["effective_cfw_controls"][
             "response_strategy"] == "structured"
         await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_degraded_projection_overlays_cfw_controls_on_last_committed_dp_state(tmp_path):
+    cfw = _CFWPort()
+    cfw.effective_projection = {
+        "cognitive_mode": "VERIFY",
+        "focus_criteria": ["criterion-live"],
+    }
+    bridge = _bridge(tmp_path, identity=_identity("offline-state-overlay"),
+                     goal_set=_goal_set(), cfw_port=cfw, csw_port=_CSWPort())
+    bridge._offline_controls_expired = True
+    bridge._state = BehaviorState(
+        revision=8, cognitive_mode="RECOVER", focus_criteria=("criterion-last",),
+        recovery_level=2, attention_last_seen={"criterion-last": 7})
+
+    projected, controls = bridge.projection_manager._offline_behavior_state()
+
+    assert projected.revision == 8
+    assert projected.cognitive_mode == "VERIFY"
+    assert projected.focus_criteria == ("criterion-live",)
+    assert projected.recovery_level == 2
+    assert dict(projected.attention_last_seen) == {"criterion-last": 7}
+    assert controls["cognitive_mode"] == "VERIFY"
+
+
+def test_candidate_gate_fails_closed_when_local_expiry_fails(tmp_path):
+    async def run():
+        cfw = _CFWPort()
+        bridge = _bridge(tmp_path, identity=_identity("expiry-failure"),
+                         goal_set=_goal_set(), cfw_port=cfw, csw_port=_CSWPort(),
+                         client=_in_process_client(tmp_path))
+        try:
+            assert (await bridge.open())["status"] == "ready"
+
+            def fail_expiry(_action_index):
+                raise RuntimeError("simulated lease expiry failure")
+
+            cfw.expire_local_behavior_leases = fail_expiry
+            result = await bridge.before_action_candidate(
+                ActionCandidate(
+                    action_class="file_edit", proposed_purpose="Implement the criterion",
+                    affected_criterion_ids=("criterion-visual",),
+                    action_id="candidate-expiry-failure", tool_name="apply_patch",
+                    operation="edit_file", mutating=True, reversible=True),
+                cfw_action_request={"tool_binding_id": "apply_patch",
+                                    "arguments": {"path": "view.py"}})
+
+            assert result["action_authorized"] is False
+            assert result["stage"] == "boundary_preparation"
+            assert cfw.action_gate_calls == []
+        finally:
+            await bridge.close()
 
     asyncio.run(run())
 

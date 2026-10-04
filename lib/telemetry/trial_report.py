@@ -27,6 +27,8 @@ class TrialReportMethods:
                        if isinstance(provider_identity, dict) else None)
         factory_configured = (bool(provider_identity.get("factory_configured"))
                               if isinstance(provider_identity, dict) else False)
+        execution_identity = (provider_identity.get("execution_identity")
+                              if isinstance(provider_identity, dict) else None)
         trace = BehavioralTrace(
             task_id=descriptor.identity.task_id,
             configuration=runtime_configuration(
@@ -49,6 +51,8 @@ class TrialReportMethods:
                                task_outcome_score=task_outcome_score,
                                task_completed=task_completed)
         record["protocol_version"] = PROTOCOL_VERSION
+        record["execution_identity"] = (
+            dict(execution_identity) if isinstance(execution_identity, dict) else None)
         record["cfw_preflight_rejections"] = sum(
             1 for item in transitions
             if item.get("cfw_rejection_stage") == "cfw_preflight")

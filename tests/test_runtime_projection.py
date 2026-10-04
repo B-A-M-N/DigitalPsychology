@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from lib.behavior_state import BehaviorState, CSWBehaviorSnapshot
+from dataclasses import fields, replace
+
+from lib.behavior_state import BEHAVIOR_MODES, BehaviorState, CSWBehaviorSnapshot
 from lib.runtime.projection import (ModelProjection, build_behavior_projection,
                                     cached_replace_model_projection,
+                                    CONTROL_EFFECTS, POLICY_CONTROL_FIELDS,
                                     model_projection_is_current,
                                     replace_model_projection)
 
@@ -80,8 +83,8 @@ def test_all_nonframework_behavior_controls_have_visible_projection_effects():
         "Keep working context concise",
         "Organize the response into clear sections",
         "Check claimed progress",
-        "change the approach before retrying",
-        "If the current approach is blocked",
+        "Do not repeat a failed approach",
+        "choose a materially different goal-directed step",
     ):
         assert text in tuned.model.text
     assert tuned.audit.metadata["model_controls"] == {
@@ -90,3 +93,30 @@ def test_all_nonframework_behavior_controls_have_visible_projection_effects():
         "verification_intensity": "strict", "retry_policy": "no_retry",
         "recovery_level": 2,
     }
+
+
+def test_every_policy_control_has_a_registered_consumer_and_distinct_projection():
+    assert set(CONTROL_EFFECTS) == set(POLICY_CONTROL_FIELDS)
+    assert set(POLICY_CONTROL_FIELDS).issubset(
+        {item.name for item in fields(BehaviorState)})
+    values = {
+        "cognitive_mode": sorted(BEHAVIOR_MODES),
+        "verification_intensity": ["passive", "normal", "high", "strict"],
+        "exploration_budget": ["disabled", "low", "normal", "bounded"],
+        "retry_policy": ["normal", "materially_different_only", "no_retry"],
+        "recovery_level": [0, 1, 2, 3],
+        "context_strategy": ["standard", "compact", "criterion_focused"],
+        "response_strategy": ["direct", "detailed", "structured"],
+    }
+    snapshot = CSWBehaviorSnapshot(revision=0)
+    baseline = BehaviorState()
+    for field_name, options in values.items():
+        digests = {
+            build_behavior_projection(
+                replace(baseline, **{field_name: value}), snapshot,
+                objective="", goal_set=None, cfw_connected=True,
+                csw_connected=False, outcome_evidence_connected=False,
+            ).model.semantic_digest
+            for value in options
+        }
+        assert len(digests) == len(options), field_name

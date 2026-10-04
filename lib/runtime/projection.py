@@ -3,9 +3,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from ..behavior_state import BehaviorState, CSWBehaviorSnapshot, GoalSetSnapshot
+
+
+POLICY_CONTROL_FIELDS = (
+    "cognitive_mode", "verification_intensity", "exploration_budget",
+    "retry_policy", "recovery_level", "context_strategy", "response_strategy",
+)
+
+# Every policy control has an explicit path to behavior. Response formatting
+# belongs to DP's response_strategy guidance; CFW SISPIS validates evidence and
+# calibration but does not select a competing response format.
+CONTROL_EFFECTS = MappingProxyType({
+    "cognitive_mode": "model_projection",
+    "verification_intensity": "model_projection+system_one_frame",
+    "exploration_budget": "model_projection+candidate_selection",
+    "retry_policy": "model_projection+candidate_selection+cfw_fuse",
+    "recovery_level": "model_projection+candidate_selection+cfw_recovery",
+    "context_strategy": "model_projection",
+    "response_strategy": "model_projection",
+})
 
 
 @dataclass(frozen=True)
@@ -53,7 +73,19 @@ def build_behavior_projection(state: BehaviorState,
         "Keep work tied to required criteria. Make progress on the current focus, "
         "then return to any remaining required criteria.")
 
-    lines.append(f"Current operating mode: {state.cognitive_mode.lower().replace('_', ' ')}.")
+    mode_guidance = {
+        "DELIVER": "Advance a required criterion with the next goal-linked step.",
+        "DIAGNOSE": "Inspect the blocker or uncertainty before choosing a fix.",
+        "VERIFY": "Check claimed progress against authoritative evidence before moving on.",
+        "RECOVER": "Use a materially different approach to the focused blocker.",
+        "REPLAN": "Revise the route across the remaining required work.",
+        "BLOCKED": "State the concrete blocker and identify the smallest safe recovery step.",
+        "REINSPECT": "Gather fresh evidence before relying on the prior understanding.",
+        "READY_TO_COMPLETE": "Validate the complete required work set before completion.",
+    }
+    lines.append(
+        f"Current operating mode: {state.cognitive_mode.lower().replace('_', ' ')}. "
+        + mode_guidance[state.cognitive_mode])
     exploration_guidance = {
         "disabled": "Do not explore unrelated alternatives; continue with the current goal-linked path.",
         "low": "Keep exploration small and use it only to resolve a needed uncertainty.",
@@ -74,16 +106,26 @@ def build_behavior_projection(state: BehaviorState,
     }
     lines.append(response_guidance[state.response_strategy])
 
-    if state.retry_policy in {"materially_different_only", "no_retry"}:
-        lines.append(
-            "After a failed attempt, change the approach before retrying; repeated "
-            "activity without criterion progress is not progress.")
-    if state.verification_intensity in {"high", "strict"}:
-        lines.append("Check claimed progress against the acceptance criteria and host evidence.")
-    if state.recovery_level:
-        lines.append(
-            "If the current approach is blocked, inspect the blocker and choose a "
-            "materially different goal-directed step.")
+    retry_guidance = {
+        "normal": "Retry when the next attempt has a reasonable path to criterion progress.",
+        "materially_different_only": "After a failed attempt, change the approach before retrying; repeated activity without criterion progress is not progress.",
+        "no_retry": "Do not repeat a failed approach; gather new evidence or change the plan first.",
+    }
+    lines.append(retry_guidance[state.retry_policy])
+    verification_guidance = {
+        "passive": "Record available validation without delaying the next useful step.",
+        "normal": "Use the task's usual acceptance checks to validate progress.",
+        "high": "Check claimed progress against the acceptance criteria and host evidence.",
+        "strict": "Require authoritative acceptance evidence for each claimed criterion before treating it as complete.",
+    }
+    lines.append(verification_guidance[state.verification_intensity])
+    recovery_guidance = {
+        0: "Continue the current plan while it is making measurable progress.",
+        1: "If blocked, inspect the immediate cause before changing the plan.",
+        2: "If blocked, choose a materially different goal-directed step.",
+        3: "If blocked, reset unsupported assumptions and rebuild the plan from verified evidence.",
+    }
+    lines.append(recovery_guidance[state.recovery_level])
 
     workflow_states = tuple(snapshot.workflow_states.values())
     if workflow_states:

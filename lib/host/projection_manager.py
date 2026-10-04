@@ -52,30 +52,28 @@ class HostProjectionManager:
 
     def _offline_behavior_state(self) -> tuple[Any, Mapping[str, Any] | None]:
         """Project only controls still effective in CFW after DP lease expiry."""
-        from ..behavior_state import BehaviorState
-
         if not self.host._offline_controls_expired:
             return self.host._state, None
         provider = getattr(self.host.cfw, "effective_behavior_projection", None)
         effective = provider() if callable(provider) else provider
         if not isinstance(effective, Mapping):
-            return BehaviorState(), None
-        baseline = BehaviorState()
-        local = replace(
-            baseline,
-            revision=int(effective.get("behavior_revision", baseline.revision)),
-            cognitive_mode=str(effective.get("cognitive_mode", baseline.cognitive_mode)),
-            framework_modes=dict(effective.get("framework_modes") or baseline.framework_modes),
-            focus_criteria=tuple(effective.get("focus_criteria") or ()),
-            verification_intensity=str(effective.get(
-                "verification_intensity", baseline.verification_intensity)),
-            exploration_budget=str(effective.get(
-                "exploration_budget", baseline.exploration_budget)),
-            retry_policy=str(effective.get("retry_policy", baseline.retry_policy)),
-            recovery_level=int(effective.get("recovery_level", baseline.recovery_level)),
-            context_strategy=str(effective.get("context_strategy", baseline.context_strategy)),
-            response_strategy=str(effective.get("response_strategy", baseline.response_strategy)),
-        )
+            return self.host._state, None
+        # CFW reports effective target values after its local expiry clock.
+        # Overlay those controls on DP's last committed state so unrelated
+        # leases, intervention history, and attention metadata survive an
+        # outage projection.
+        values: dict[str, Any] = {}
+        for name in (
+                "cognitive_mode", "framework_modes", "focus_criteria",
+                "verification_intensity", "exploration_budget", "retry_policy",
+                "recovery_level", "context_strategy", "response_strategy"):
+            if name in effective:
+                values[name] = effective[name]
+        if "framework_modes" in values:
+            values["framework_modes"] = dict(values["framework_modes"])
+        if "focus_criteria" in values:
+            values["focus_criteria"] = tuple(values["focus_criteria"])
+        local = replace(self.host._state, **values)
         controls = {
             key: effective[key] for key in (
                 "cognitive_mode", "framework_modes", "focus_criteria",

@@ -77,6 +77,7 @@ class HostControlBridge:
         self._fault: str | None = None
         self._needs_reconciliation = False
         self._offline_controls_expired = False
+        self._last_lease_expiry_failed = False
         self._latest_observation: RuntimeObservation | None = None
         self._pending_cfw_gate_decisions: dict[str, str] = {}
         self._latest_system_one_observation: Mapping[str, Any] | None = None
@@ -137,10 +138,12 @@ class HostControlBridge:
     async def _record_candidate_rejection(
             self, candidate: ActionCandidate, decision: str, *, stage: str,
             goal_set: GoalSetSnapshot | None,
+            candidate_action_index: int,
             preflight_decision: str | None = None,
             candidate_gate_receipts: Mapping[str, Any]) -> Mapping[str, Any]:
         return await self.lifecycle_hooks._record_candidate_rejection(
             candidate, decision, stage=stage, goal_set=goal_set,
+            candidate_action_index=candidate_action_index,
             preflight_decision=preflight_decision,
             candidate_gate_receipts=candidate_gate_receipts)
 
@@ -161,6 +164,7 @@ class HostControlBridge:
 
     def _boundary_observation(self, boundary_kind: str, *,
                               goal_set: GoalSetSnapshot | None = None,
+                              candidate_action_index: int | None = None,
                               candidate_action: ActionCandidate | None = None,
                               candidate_preflight_result: str | None = None,
                               candidate_rejection_stage: str | None = None,
@@ -170,6 +174,7 @@ class HostControlBridge:
                               ) -> RuntimeObservation:
         return self.transaction_coordinator._boundary_observation(
             boundary_kind, goal_set=goal_set, candidate_action=candidate_action,
+            candidate_action_index=candidate_action_index,
             candidate_preflight_result=candidate_preflight_result,
             candidate_rejection_stage=candidate_rejection_stage,
             candidate_gate_receipts=candidate_gate_receipts,
