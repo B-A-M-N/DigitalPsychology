@@ -60,12 +60,11 @@ def test_required_criterion_coverage_is_first_seen_order():
 def test_semantic_query_attempt_return_use_and_failure_are_separate():
     trace = BehavioralTrace()
     trace.record(_action(
-        0, semantic_attempted=True, semantic_judgment_returned=True,
-        semantic_result=True, semantic_used=False,
+        0, semantic_query_attempted=True, semantic_judgment_returned=True,
+        semantic_judgment_used=False,
     ))
     trace.record(_action(
-        1, semantic_attempted=True, semantic_query=True,
-        semantic_query_failed=True, semantic_failed=True,
+        1, semantic_query_attempted=True, semantic_query_failed=True,
     ))
 
     record = trace.to_dict(trial_id="semantic-states")
@@ -233,6 +232,38 @@ def test_private_control_mode_thrashing_uses_boundary_order_and_action_age():
     assert justified.rapid_mode_reversals == 0
 
 
+def test_private_ward_hard_safety_evidence_exempts_a_rapid_reversal():
+    from lib.behavior_state import BehavioralDecision, BehaviorState
+    from lib.telemetry.trace_builder import build_control_transition_trace
+
+    deliver = BehaviorState(revision=0, cognitive_mode="DELIVER")
+    verify = BehaviorState(revision=1, cognitive_mode="VERIFY")
+    returned = BehaviorState(revision=2, cognitive_mode="DELIVER")
+
+    def transition(sequence, prior, state, *, facts=None):
+        decision = BehavioralDecision(
+            decision_id=f"ward-{sequence}", scope="scope-ward",
+            expected_revision=prior.revision, state=state, directives=(),
+            reason="control boundary")
+        return build_control_transition_trace(
+            "scope-ward", prior, state, decision,
+            {"boundary_sequence": sequence, "host_action_index": 4,
+             "boundary_kind": "pre_action",
+             "behavioral_facts": facts or {}}, ())
+
+    trace = BehavioralTrace()
+    trace.record_control_transition(transition(1, deliver, verify))
+    ward_return = transition(2, verify, returned, facts={
+        "cfw_signal_codes": ["ward.secret_exposure"],
+        "ward_hard_safety": True,
+    })
+    trace.record_control_transition(ward_return)
+
+    assert ward_return["ward_hard_safety"] is True
+    assert ward_return["justification_class"] == "hard_safety"
+    assert trace.rapid_mode_reversals == 0
+
+
 def test_slow_reversal_is_not_thrash():
     """Returning much later is not oscillation."""
     trace = BehavioralTrace()
@@ -268,7 +299,7 @@ def test_behavior_counters_accumulate():
                           goal_drift_detected=True,
                           goal_drift_intervention_applied=True, abstained=True,
                           cfw_preflight_rejection=True, cfw_final_rejection=True,
-                          semantic_query=True, attention_rotated=True,
+                          semantic_query_attempted=True, attention_rotated=True,
                           fairness_forced_rotation=True,
                           attention_lease_started=True))
     assert trace.equivalent_retries == 1
@@ -301,15 +332,26 @@ def test_projection_churn_counts_distinct_digests():
 
 
 def test_action_trace_persists_only_canonical_semantic_fields():
-    row = _action(0, semantic_attempted=True, semantic_result=True,
-                  semantic_used=True, semantic_failed=False).to_dict()
+    row = _action(0, semantic_query_attempted=True,
+                  semantic_judgment_returned=True,
+                  semantic_judgment_used=True,
+                  semantic_query_failed=False).to_dict()
     assert row["semantic_query_attempted"] is True
     assert row["semantic_judgment_returned"] is True
     assert row["semantic_judgment_used"] is True
     assert row["semantic_query_failed"] is False
     assert not {"semantic_query", "semantic_attempted", "semantic_result",
                 "semantic_used", "semantic_failed"} & set(row)
-    assert ActionTrace.from_dict(row).semantic_used is True
+    assert ActionTrace.from_dict(row).semantic_judgment_used is True
+    legacy_row = dict(row)
+    legacy_row["semantic_attempted"] = legacy_row.pop("semantic_query_attempted")
+    legacy_row["semantic_result"] = legacy_row.pop("semantic_judgment_returned")
+    legacy_row["semantic_used"] = legacy_row.pop("semantic_judgment_used")
+    legacy_row["semantic_failed"] = legacy_row.pop("semantic_query_failed")
+    assert ActionTrace.from_dict(legacy_row).semantic_judgment_used is True
+    assert not {"semantic_query", "semantic_attempted", "semantic_result",
+                "semantic_used", "semantic_failed"} & {
+                    field.name for field in __import__("dataclasses").fields(ActionTrace)}
 
 
 def test_trace_is_bounded():

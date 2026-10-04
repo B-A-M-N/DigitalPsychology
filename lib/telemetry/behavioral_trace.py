@@ -143,12 +143,9 @@ class ActionTrace:
     goal_drift_intervention_applied: bool = False
     projection_digest: str | None = None
     material_progress_criteria: tuple[str, ...] = ()
-    semantic_query: bool = False
-    semantic_attempted: bool = False
-    semantic_result: bool = False
+    semantic_query_attempted: bool = False
     semantic_judgment_returned: bool = False
-    semantic_used: bool = False
-    semantic_failed: bool = False
+    semantic_judgment_used: bool = False
     semantic_query_failed: bool = False
     cfw_preflight_rejection: bool = False
     cfw_final_rejection: bool = False
@@ -165,19 +162,15 @@ class ActionTrace:
                            tuple(self.authoritative_evidence_classes))
         object.__setattr__(self, "material_progress_criteria",
                            tuple(self.material_progress_criteria))
-        for name in ("semantic_query", "semantic_attempted", "semantic_result",
-                     "semantic_judgment_returned", "semantic_used",
-                     "semantic_failed", "semantic_query_failed"):
+        for name in ("semantic_query_attempted", "semantic_judgment_returned",
+                     "semantic_judgment_used", "semantic_query_failed"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"action trace {name} must be a boolean")
-        semantic_returned = self.semantic_judgment_returned or self.semantic_result
-        semantic_attempted = self.semantic_attempted or self.semantic_query
-        if semantic_returned and not semantic_attempted:
+        if self.semantic_judgment_returned and not self.semantic_query_attempted:
             raise ValueError("a semantic judgment cannot return without a query")
-        if self.semantic_used and not semantic_returned:
+        if self.semantic_judgment_used and not self.semantic_judgment_returned:
             raise ValueError("a semantic judgment cannot be used without being returned")
-        if (self.semantic_query_failed
-                and not semantic_attempted):
+        if self.semantic_query_failed and not self.semantic_query_attempted:
             raise ValueError("a semantic query cannot fail without being attempted")
         if self.justification_class not in JUSTIFICATION_CLASSES:
             raise ValueError("action trace justification class is invalid")
@@ -210,10 +203,9 @@ class ActionTrace:
             "goal_drift_intervention_applied": self.goal_drift_intervention_applied,
             "projection_digest": self.projection_digest,
             "material_progress_criteria": list(self.material_progress_criteria),
-            "semantic_query_attempted": self.semantic_attempted or self.semantic_query,
-            "semantic_judgment_returned": (
-                self.semantic_judgment_returned or self.semantic_result),
-            "semantic_judgment_used": self.semantic_used,
+            "semantic_query_attempted": self.semantic_query_attempted,
+            "semantic_judgment_returned": self.semantic_judgment_returned,
+            "semantic_judgment_used": self.semantic_judgment_used,
             "semantic_query_failed": self.semantic_query_failed,
             "cfw_preflight_rejection": self.cfw_preflight_rejection,
             "cfw_final_rejection": self.cfw_final_rejection,
@@ -227,18 +219,22 @@ class ActionTrace:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ActionTrace":
         data = dict(value)
-        if "semantic_query_attempted" in data:
-            attempted = bool(data.pop("semantic_query_attempted"))
-            data.setdefault("semantic_attempted", attempted)
-            data.setdefault("semantic_query", attempted)
-        if "semantic_judgment_used" in data:
-            data.setdefault("semantic_used", bool(data.pop("semantic_judgment_used")))
-        if "semantic_judgment_returned" not in data:
-            data["semantic_judgment_returned"] = bool(data.get("semantic_result"))
-        data.setdefault("semantic_result", bool(data["semantic_judgment_returned"]))
-        if "semantic_query_failed" not in data:
-            data["semantic_query_failed"] = bool(data.get("semantic_failed"))
-        data.setdefault("semantic_failed", bool(data["semantic_query_failed"]))
+        legacy_aliases = {
+            "semantic_query_attempted": ("semantic_attempted", "semantic_query"),
+            "semantic_judgment_returned": ("semantic_result",),
+            "semantic_judgment_used": ("semantic_used",),
+            "semantic_query_failed": ("semantic_failed",),
+        }
+        for canonical, aliases in legacy_aliases.items():
+            for alias in aliases:
+                if alias not in data:
+                    continue
+                legacy_value = data.pop(alias)
+                if type(legacy_value) is not bool:
+                    raise ValueError(f"legacy action trace {alias} must be a boolean")
+                if canonical in data and data[canonical] != legacy_value:
+                    raise ValueError(f"action trace has conflicting {canonical} aliases")
+                data.setdefault(canonical, legacy_value)
         for name in ("focus_criteria", "fairness_prevented_criteria",
                      "authoritative_evidence_classes"):
             data[name] = tuple(data.get(name) or ())
@@ -497,21 +493,19 @@ class BehavioralTrace:
 
     @property
     def semantic_queries(self) -> int:
-        return sum(1 for a in self.actions if a.semantic_attempted or a.semantic_query)
+        return sum(1 for action in self.actions if action.semantic_query_attempted)
 
     @property
     def semantic_results(self) -> int:
-        return sum(1 for action in self.actions
-                   if action.semantic_judgment_returned or action.semantic_result)
+        return sum(1 for action in self.actions if action.semantic_judgment_returned)
 
     @property
     def semantic_uses(self) -> int:
-        return sum(1 for action in self.actions if action.semantic_used)
+        return sum(1 for action in self.actions if action.semantic_judgment_used)
 
     @property
     def semantic_failures(self) -> int:
-        return sum(1 for action in self.actions
-                   if action.semantic_query_failed or action.semantic_failed)
+        return sum(1 for action in self.actions if action.semantic_query_failed)
 
     def to_dict(self, *, trial_id: str, task_outcome_score: float | None = None,
                 task_completed: bool | None = None) -> dict[str, Any]:

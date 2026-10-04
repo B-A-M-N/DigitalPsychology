@@ -641,6 +641,12 @@ def test_cfw_preflight_rejection_is_reported_to_dp_without_advancing_action_inde
                          client=client)
         try:
             await bridge.open()
+            cfw.signals = []
+            for action_index in range(1, 10):
+                completed = await bridge.after_action(RuntimeObservation(
+                    action_index=action_index, goal_set=goals))
+                assert completed["status"] == "ready", completed.get("fault")
+            assert bridge._action_index == 9
             for attempt in range(3):
                 result = await bridge.before_action_candidate(
                     ActionCandidate(
@@ -658,11 +664,12 @@ def test_cfw_preflight_rejection_is_reported_to_dp_without_advancing_action_inde
                 assert result["stage"] == "cfw_preflight"
                 assert result["action_authorized"] is False
             assert cfw.action_gate_calls == ["preflight"] * 3
-            assert bridge._action_index == -1
-            assert bridge._boundary_sequence == 2
-            requests = client.prepared_requests
-            assert [request["observation"]["action_index"] for request in requests] == [1, 1, 1]
-            assert [request["boundary_sequence"] for request in requests] == [0, 1, 2]
+            assert bridge._action_index == 9
+            assert bridge._boundary_sequence == 11
+            requests = client.prepared_requests[-3:]
+            assert [request["observation"]["action_index"]
+                    for request in requests] == [10, 10, 10]
+            assert [request["boundary_sequence"] for request in requests] == [9, 10, 11]
             for attempt, request in enumerate(requests):
                 assert request["boundary_kind"] == "pre_action_rejected"
                 assert request["observation"]["candidate_preflight_result"] == \

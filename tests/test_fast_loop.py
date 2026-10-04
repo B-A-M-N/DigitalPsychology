@@ -513,3 +513,71 @@ def test_statework_directive_inherits_its_new_intervention_owner_window():
     assert statework.expires_after_actions == owner.expires_after_actions
     assert statework.expires_at_action == owner.expires_at_action
     assert statework.intervention_id == owner.intervention_id
+
+
+def test_full_intervention_target_capacity_skips_statework_preference():
+    from types import SimpleNamespace
+
+    from lib.behavior_state import MAX_TARGETS_PER_INTERVENTION
+    from lib.condition_identity import identify_condition
+    from lib.control.candidate_generator import CandidateOption
+    from lib.control.directive_builder import DirectiveBuilder
+    from lib.control.interventions import InterventionStateBuilder
+    from lib.control.policy_selector import BehaviorCandidate
+
+    scope = "tenant/app/agent/session/task/attempt"
+    csw = CSWBehaviorSnapshot(
+        revision=1, eligible_stateworks=(StateWorkOption("repair-flow"),))
+    context = FastLoopInput(
+        scope=scope, state=BehaviorState(), csw_snapshot=csw,
+        objective_criteria=("criterion-1",), host_action_index=4)
+    candidate = BehaviorCandidate.from_state(
+        BehaviorState(cognitive_mode="RECOVER"), focus_criteria=("criterion-1",),
+        statework_preferences=("repair-flow",), reason_codes=("deterministic_rule",),
+        cause="equivalent_retry", expected_effect="Reassess the failed approach.")
+    changes = (
+        ("mode", "RECOVER", "equivalent_retry", "Reassess the failed approach."),
+        ("framework:owl", "elevated", "equivalent_retry", "Inspect the failed approach."),
+        ("framework:anchor", "recovery", "equivalent_retry", "Rebuild the approach."),
+        ("framework:fuse", "constrained", "equivalent_retry", "Bound further retries."),
+        ("framework:flow", "elevated", "equivalent_retry", "Watch for operational drag."),
+        ("framework:sispis", "constrained", "equivalent_retry", "Keep output calibrated."),
+        ("framework:dox", "elevated", "equivalent_retry", "Keep the task contract visible."),
+        ("verification_intensity", "high", "equivalent_retry", "Verify the next attempt."),
+        ("exploration_budget", "low", "equivalent_retry", "Limit the search."),
+        ("retry_policy", "materially_different_only", "equivalent_retry",
+         "Do not repeat the same approach."),
+        ("recovery_level", "1", "equivalent_retry", "Use one recovery step."),
+        ("context_strategy", "compact", "equivalent_retry", "Focus on the criterion."),
+    )
+    assert len(changes) == MAX_TARGETS_PER_INTERVENTION
+    option = CandidateOption(candidate=candidate, role="RECOVER", changes=changes,
+                             deterministic_support=0.86)
+    pool = SimpleNamespace(option_for=lambda _candidate_id: option, fallback=lambda: None)
+    selection = SimpleNamespace(abstained=False, candidate=candidate)
+    digest = lambda value: __import__("hashlib").sha256(
+        repr(value).encode()).hexdigest()
+    builder = DirectiveBuilder(
+        intervention_state_builder=InterventionStateBuilder(
+            expiry_actions=3, digest=digest),
+        intervention_expiry_actions=3, digest=digest)
+
+    decision = builder.build(
+        context=context, original=context.state, working=context.state,
+        next_revision=1, next_focus=("criterion-1",),
+        attention_ids=("criterion-1",), interventions=[], outcomes=[], directives=[],
+        selection=selection, candidate_pool=pool, current_condition_ids={},
+        previously_effective=set(), triggers=set(),
+        condition_for=lambda cause, target_criteria: identify_condition(
+            cause=cause, target_criteria=target_criteria, goal_set=None,
+            csw_snapshot=csw, evidence_refs=()),
+        applies_to_attention=lambda _criteria: True,
+    )
+
+    assert decision.reason == "intervention_target_capacity_exhausted"
+    assert len(decision.state.active_interventions) == 1
+    owner = decision.state.active_interventions[0]
+    assert len(owner.targets) == MAX_TARGETS_PER_INTERVENTION
+    assert not any(target.target.startswith("statework:") for target in owner.targets)
+    assert not decision.preferred_stateworks
+    assert not any(item.operation == "prefer_statework" for item in decision.directives)
