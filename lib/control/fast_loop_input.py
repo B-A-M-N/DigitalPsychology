@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from ..behavior_state import (
-    AttentionLease, BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
-    GoalSetSnapshot, InterventionOutcome,
+    AttentionLease, BehavioralCause, BehaviorState, CSWBehaviorSnapshot,
+    FrameworkSignal, GoalSetSnapshot, InterventionOutcome,
+    group_behavioral_causes,
 )
 
 @dataclass(frozen=True)
@@ -112,3 +113,7 @@ class FastLoopInput:
         if len(encoded_policy_context.encode("utf-8")) > 8192:
             raise ValueError("policy context exceeds its byte bound")
         object.__setattr__(self, "policy_context", policy_context)
+
+    @property
+    def behavioral_causes(self) -> tuple[BehavioralCause, ...]:
+        return group_behavioral_causes(self.cfw_signals)

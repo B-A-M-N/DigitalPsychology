@@ -59,3 +59,34 @@ def test_stable_host_objective_can_be_omitted_and_bridge_reuses_current_slot():
         context, projection.model, projection.model.semantic_digest)
     assert cached is context
     assert digest == projection.model.semantic_digest
+
+
+def test_all_nonframework_behavior_controls_have_visible_projection_effects():
+    baseline = build_behavior_projection(
+        BehaviorState(), CSWBehaviorSnapshot(revision=0), objective="", goal_set=None,
+        cfw_connected=True, csw_connected=False, outcome_evidence_connected=False)
+    tuned_state = BehaviorState(
+        cognitive_mode="VERIFY", verification_intensity="strict",
+        exploration_budget="low", retry_policy="no_retry", recovery_level=2,
+        context_strategy="compact", response_strategy="structured")
+    tuned = build_behavior_projection(
+        tuned_state, CSWBehaviorSnapshot(revision=0), objective="", goal_set=None,
+        cfw_connected=True, csw_connected=False, outcome_evidence_connected=False)
+
+    assert tuned.model.semantic_digest != baseline.model.semantic_digest
+    for text in (
+        "Current operating mode: verify.",
+        "Keep exploration small",
+        "Keep working context concise",
+        "Organize the response into clear sections",
+        "Check claimed progress",
+        "change the approach before retrying",
+        "If the current approach is blocked",
+    ):
+        assert text in tuned.model.text
+    assert tuned.audit.metadata["model_controls"] == {
+        "cognitive_mode": "VERIFY", "exploration_budget": "low",
+        "context_strategy": "compact", "response_strategy": "structured",
+        "verification_intensity": "strict", "retry_policy": "no_retry",
+        "recovery_level": 2,
+    }

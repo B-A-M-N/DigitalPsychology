@@ -328,5 +328,8 @@ def test_new_directive_requires_absolute_expiry_and_legacy_decoder_is_explicit()
         values, host_action_index=4, boundary_kind="pre_action")
     post_action = BehaviorDirective.from_legacy_mapping(
         values, host_action_index=4, boundary_kind="post_action")
+    rejected_candidate = BehaviorDirective.from_legacy_mapping(
+        values, host_action_index=4, boundary_kind="pre_action_rejected")
     assert pre_action.expires_at_action == 6
+    assert rejected_candidate.expires_at_action == 6
     assert post_action.expires_at_action == 7

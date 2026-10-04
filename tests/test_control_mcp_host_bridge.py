@@ -36,15 +36,20 @@ class _CFWPort:
             "evidence_refs": [],
         }]
         self.controls: dict[str, dict] = {}
+        self.signal_ack_cursor = 0
         self._state = None
         self.preflight_decision = preflight_decision
         self.final_decision = final_decision
         self.action_gate_calls = []
+        self.preflight_fuse_modes = []
+        self.local_fuse_mode = "normal"
+        self.local_fuse_expiry = None
+        self.effective_projection = None
         self._projection = None
 
     def authority_identity(self):
         return {"adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
-                "adapter_protocol_version": "1.0.0",
+                "adapter_protocol_version": "1.2.0",
                 "behavior_projection_version": "2.0.0",
                 "scope_hash": "a" * 64, "capability_hash": "b" * 64}
 
@@ -55,20 +60,48 @@ class _CFWPort:
 
     def preflight_action(self, action):
         self.action_gate_calls.append("preflight")
+        self.preflight_fuse_modes.append(self.local_fuse_mode)
         return {"action_digest": self._action_digest(action),
-                "decision": self.preflight_decision}
+                "decision": self.preflight_decision,
+                "gate_receipt": self._gate_receipt(
+                    action, "preflight", self.preflight_decision)}
 
     def authorize_action(self, action):
         self.action_gate_calls.append("authorize")
         return {"action_digest": self._action_digest(action),
                 "action_request_id": "action-request-host-1",
-                "decision": self.final_decision}
+                "decision": self.final_decision,
+                "gate_receipt": self._gate_receipt(action, "final", self.final_decision)}
+
+    def _gate_receipt(self, action, stage, decision):
+        return {"authority_id": "test-cfw",
+                "adapter_kind": "cfw-component-runtime",
+                "adapter_protocol_version": "1.2.0", "stage": stage,
+                "action_digest": self._action_digest(action), "decision": decision,
+                "reason_codes": ["test.action_policy." + decision]}
 
     def available_component_ids(self):
         return ("owl", "anchor", "fuse", "ward", "sispis")
 
+    def expire_local_behavior_leases(self, action_index):
+        if (self.local_fuse_expiry is not None
+                and self.local_fuse_expiry < action_index):
+            self.local_fuse_mode = "normal"
+            self.local_fuse_expiry = None
+            return True
+        return False
+
     def collect_behavior_signals(self, _observation):
         return tuple(self.signals)
+
+    def peek_behavior_signals(self, *, after_cursor=None, maximum=32):
+        after = self.signal_ack_cursor if after_cursor is None else after_cursor
+        selected = self.signals[after:after + maximum] if after < len(self.signals) else []
+        return {"after_cursor": after, "next_cursor": after + len(selected),
+                "signals": [dict(item) for item in selected]}
+
+    def acknowledge_behavior_signals(self, *, through_cursor):
+        self.signal_ack_cursor = max(self.signal_ack_cursor, through_cursor)
 
     @property
     def lifecycle_revision(self):
@@ -77,6 +110,11 @@ class _CFWPort:
     @property
     def applied_behavior_projection(self):
         return dict(self._projection) if self._projection is not None else None
+
+    @property
+    def effective_behavior_projection(self):
+        value = self.effective_projection or self._projection
+        return dict(value) if value is not None else None
 
     def prepare_behavior_directives(self, directives):
         return (dict(self.controls), dict(self._projection) if self._projection else None,
@@ -129,7 +167,7 @@ class _CSWPort:
 
     def authority_identity(self):
         return {"adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-                "adapter_protocol_version": "1.0.0", "workflow_port_version": "1.1.0",
+                "adapter_protocol_version": "1.1.0", "workflow_port_version": "1.2.0",
                 "scope_hash": "b" * 64, "capability_hash": "c" * 64}
 
     def behavioral_snapshot(self, *, candidate_statework_ids=None):
@@ -218,6 +256,18 @@ class _CapturingControlClient(InProcessControlClient):
         return await super().prepare_control_tick(request)
 
 
+class _FailOncePrepareClient(InProcessControlClient):
+    def __init__(self, control_service, *, close_service=False):
+        super().__init__(control_service, close_service=close_service)
+        self.fail_next_prepare = True
+
+    async def prepare_control_tick(self, request):
+        if self.fail_next_prepare:
+            self.fail_next_prepare = False
+            raise MCPControlUnavailable("simulated pre-commit transport failure")
+        return await super().prepare_control_tick(request)
+
+
 def _client(tmp_path, *, client_type=MCPControlClient):
     env = dict(os.environ)
     env.update({
@@ -273,6 +323,19 @@ class _UnavailableControlClient:
 def test_dp_mcp_outage_keeps_host_runtime_usable():
     async def run():
         cfw = _CFWPort()
+        cfw.local_fuse_mode = "constrained"
+        cfw.local_fuse_expiry = 0
+        cfw.effective_projection = {
+            "behavior_revision": 7, "cognitive_mode": "VERIFY",
+            "framework_modes": {"owl": "normal", "anchor": "passive",
+                                "fuse": "normal", "ward": "mandatory",
+                                "flow": "off", "sispis": "normal", "dox": "off"},
+            "focus_criteria": ["criterion-visual"],
+            "verification_intensity": "strict", "exploration_budget": "low",
+            "retry_policy": "materially_different_only", "recovery_level": 1,
+            "context_strategy": "criterion_focused", "response_strategy": "structured",
+            "target_leases": [{"target": "control:response_strategy"}],
+        }
         csw = _CSWPort()
         csw.active = ("repair",)
         csw.activation_interventions["repair"] = "intervention-offline"
@@ -297,7 +360,100 @@ def test_dp_mcp_outage_keeps_host_runtime_usable():
         assert cfw.applied_behavior_projection is None
         assert csw.expiration_calls == [1]
         assert csw.active == ()
+        offline_context = await bridge.before_model_call("context after local expiry")
+        assert "Current operating mode: verify." in offline_context
+        assert "Center working context on the current focus criteria" in offline_context
+        assert bridge.audit_projection["effective_cfw_controls"][
+            "response_strategy"] == "structured"
         await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_cfw_signal_batch_retries_until_commit_then_stops_replaying(tmp_path):
+    control_client = _in_process_client(
+        tmp_path, client_type=_FailOncePrepareClient, close_service=True)
+    cfw = _CFWPort()
+    goals = _goal_set()
+    csw = _CSWPort()
+    csw.options = ()  # isolate signal-driven recovery from route preference
+    bridge = _bridge(tmp_path, identity=_identity("signal-retry-task"),
+                     goal_set=goals, cfw_port=cfw, csw_port=csw,
+                     client=control_client)
+
+    async def run():
+        try:
+            assert (await bridge.open())["status"] == "ready"
+            observation = RuntimeObservation(
+                action_index=1, goal_set=goals,
+                criterion_status={"criterion-visual": "unmet"})
+            failed = await bridge.after_action(observation)
+            assert failed["status"] == "degraded"
+            assert cfw.signal_ack_cursor == 0
+            pending = CFWRuntimeAdapter(cfw).peek_behavior_signals(
+                after_cursor=None, maximum=32, observation=observation)
+            assert len(pending.signals) == 1
+            assert pending.next_cursor == 1
+
+            committed = await bridge.after_action(observation)
+            assert committed["status"] == "ready", committed.get("fault")
+            assert cfw.signal_ack_cursor == 1
+            original_intervention_ids = {
+                item.intervention_id
+                for item in bridge.behavior_state.active_interventions
+            }
+            for action_index in range(2, 7):
+                boundary = await bridge.after_action(RuntimeObservation(
+                    action_index=action_index, goal_set=goals,
+                    criterion_status={"criterion-visual": "unmet"}))
+                assert boundary["status"] == "ready", boundary.get("fault")
+                current_ids = {item.intervention_id for item in
+                               bridge.behavior_state.active_interventions}
+                assert current_ids.issubset(original_intervention_ids), [
+                    (item.intervention_id, item.cause, item.condition_id)
+                    for item in bridge.behavior_state.active_interventions]
+
+            assert cfw.signal_ack_cursor == 1
+            remaining = CFWRuntimeAdapter(cfw).peek_behavior_signals(
+                after_cursor=None, maximum=32, observation=observation)
+            assert remaining.signals == ()
+            assert remaining.next_cursor == 1
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_expired_cfw_lease_is_removed_before_candidate_preflight(tmp_path):
+    async def run():
+        cfw = _CFWPort(preflight_decision="block")
+        cfw.signals = []
+        bridge = _bridge(tmp_path, identity=_identity("candidate-expiry"),
+                         goal_set=_goal_set(), cfw_port=cfw, csw_port=_CSWPort(),
+                         client=_in_process_client(tmp_path))
+        try:
+            assert (await bridge.open())["status"] == "ready"
+            first = await bridge.after_action(RuntimeObservation(
+                action_index=1, goal_set=_goal_set(),
+                criterion_status={"criterion-visual": "unmet"}))
+            assert first["status"] == "ready"
+            cfw.local_fuse_mode = "constrained"
+            cfw.local_fuse_expiry = 1
+
+            result = await bridge.before_action_candidate(
+                ActionCandidate(
+                    action_class="file_edit", proposed_purpose="Implement the criterion",
+                    affected_criterion_ids=("criterion-visual",),
+                    action_id="candidate-after-expiry", tool_name="apply_patch",
+                    operation="edit_file", mutating=True, reversible=True),
+                cfw_action_request={"tool_binding_id": "apply_patch",
+                                    "arguments": {"path": "view.py"}})
+
+            assert result["stage"] == "cfw_preflight"
+            assert cfw.preflight_fuse_modes == ["normal"]
+            assert bridge._action_index == 1
+        finally:
+            await bridge.close()
 
     asyncio.run(run())
 
@@ -338,8 +494,8 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
             assert trial["evidence_source"] == "internal_host_telemetry"
             assert trial["equivalent_retries"] == 1
             assert trial["model_projection_events"] == 2
-            assert trial["model_projection_updates"] == 0
-            assert trial["unique_model_projection_digests"] == 1
+            assert trial["model_projection_updates"] == 1
+            assert trial["unique_model_projection_digests"] == 2
         finally:
             await bridge.close()
 
@@ -438,6 +594,10 @@ def test_private_control_plane_persists_actions_and_boundary_transitions_separat
             assert [item["boundary_sequence"] for item in transitions] == [0, 1, 2]
             assert transitions[0]["boundary_kind"] == "pre_action_rejected"
             assert transitions[0]["cfw_rejection_stage"] == "cfw_preflight"
+            assert transitions[0]["cfw_gate_receipts"]["preflight"][
+                "authority_id"] == "test-cfw"
+            assert transitions[0]["cfw_gate_receipts"]["preflight"][
+                "reason_codes"] == ["test.action_policy.require_confirmation"]
             assert transitions[0]["justification_class"] != "hard_safety"
             assert all("basis" not in item for item in transitions)
             assert "semantic_query_attempted" in actions[-1]
@@ -674,6 +834,8 @@ def test_cfw_preflight_rejection_is_reported_to_dp_without_advancing_action_inde
                 assert request["boundary_kind"] == "pre_action_rejected"
                 assert request["observation"]["candidate_preflight_result"] == \
                     "require_confirmation"
+                assert request["observation"]["candidate_gate_receipts"][
+                    "preflight"]["adapter_protocol_version"] == "1.2.0"
                 assert request["observation"]["candidate_action"]["action_id"] == \
                     f"action-needs-confirmation-{attempt}"
                 assert any(signal["code"] ==
@@ -721,6 +883,12 @@ def test_cfw_final_gate_rejection_is_reported_to_dp_after_pre_action_tick(tmp_pa
             assert cfw.applied_behavior_projection["host_action_index"] == 1
             assert [request["observation"]["action_index"]
                     for request in client.prepared_requests] == [1, 1]
+            final_receipts = client.prepared_requests[-1]["observation"][
+                "candidate_gate_receipts"]
+            assert final_receipts["preflight"]["decision"] == "allow"
+            assert final_receipts["final"]["decision"] == "require_reinspection"
+            assert final_receipts["final"]["reason_codes"] == [
+                "test.action_policy.require_reinspection"]
         finally:
             await bridge.close()
 

@@ -12,13 +12,15 @@ import json
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from ...behavior_state import CSWBehaviorSnapshot, StateWorkOption
+from ...behavior_state import (CSWBehaviorSnapshot, StateWorkOption,
+                               StateWorkReleaseResult)
 from ..contracts import RuntimeIdentity
 
 # CSW owns workflow eligibility and composition; this names the port contract
 # DP drives so a version mismatch is caught at session startup instead of on
 # the first workflow transition.
-CSW_WORKFLOW_PORT_VERSION = "1.1.0"
+CSW_WORKFLOW_PORT_VERSION = "1.2.0"
+CSW_ADAPTER_PROTOCOL_VERSION = "1.1.0"
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,11 @@ class CSWRuntimeAdapter:
             snapshot_id=str(raw["snapshot_id"]),
             workflow_revisions=revisions,
             eligible_steps=steps,
+            dependency_retention={
+                str(row["identity"]["statework_id"]): tuple(
+                    str(item) for item in row.get("dependency_required_by") or ())
+                for row in active_rows if row.get("activation_owner") == "dependency"
+            },
         )
 
     def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot:
@@ -139,7 +146,7 @@ class CSWRuntimeAdapter:
         return {
             "adapter_kind": "csw-workflow-authority",
             "authority_id": authority_id,
-            "adapter_protocol_version": "1.0.0",
+            "adapter_protocol_version": CSW_ADAPTER_PROTOCOL_VERSION,
             # Named explicitly so a host can compare the workflow port it will
             # drive against the one CSW implements, at startup rather than on
             # the first workflow transition.
@@ -170,18 +177,28 @@ class CSWRuntimeAdapter:
     def deactivate_statework(self, statework_id: str, *,
                              expected_selection_revision: int,
                              candidate_statework_ids: Sequence[str],
-                             intervention_id: str) -> CSWBehaviorSnapshot:
+                             intervention_id: str) -> StateWorkReleaseResult:
         if statework_id not in candidate_statework_ids:
             raise ValueError("StateWork deactivation is outside the CSW candidate set")
         self._binding(statework_id)
-        self.authority.deactivate_workflow(
+        raw = self.authority.deactivate_workflow(
             workflow_scope=self.identity.csw_scope(), statework_id=statework_id,
             expected_selection_revision=expected_selection_revision,
             expected_activation_owner="digitalpsychology",
             expected_control_session_id=self.identity.scope,
             expected_intervention_id=intervention_id)
-        return self.behavioral_snapshot(
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("CSW returned a malformed StateWork release disposition")
+        disposition = raw.get("disposition")
+        required_by = raw.get("required_by") or ()
+        released_stateworks = raw.get("released_stateworks") or ()
+        snapshot = self.behavioral_snapshot(
             candidate_statework_ids=candidate_statework_ids)
+        return StateWorkReleaseResult(
+            disposition=str(disposition), statework_id=statework_id,
+            required_by=tuple(str(item) for item in required_by),
+            released_stateworks=tuple(str(item) for item in released_stateworks),
+            snapshot=snapshot)
 
     def activation_matches(self, statework_id: str, *,
                            intervention_id: str) -> bool:

@@ -28,13 +28,14 @@ class _CFWPort:
     def __init__(self):
         self.signals = [{"source": "owl", "code": "owl.approach_failed",
                          "severity": "warning", "evidence_refs": []}]
+        self.signal_ack_cursor = 0
         self.controls = {}
         self.active_statework_contexts = []
         self.projection = None
 
     def authority_identity(self):
         return {"adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
-                "adapter_protocol_version": "1.0.0",
+                "adapter_protocol_version": "1.2.0",
                 "behavior_projection_version": "2.0.0",
                 "scope_hash": "a" * 64, "capability_hash": "b" * 64}
 
@@ -43,6 +44,15 @@ class _CFWPort:
 
     def collect_behavior_signals(self, _observation):
         return tuple(self.signals)
+
+    def peek_behavior_signals(self, *, after_cursor=None, maximum=32):
+        after = self.signal_ack_cursor if after_cursor is None else after_cursor
+        selected = self.signals[after:after + maximum] if after < len(self.signals) else []
+        return {"after_cursor": after, "next_cursor": after + len(selected),
+                "signals": [dict(item) for item in selected]}
+
+    def acknowledge_behavior_signals(self, *, through_cursor):
+        self.signal_ack_cursor = max(self.signal_ack_cursor, through_cursor)
 
     def prepare_behavior_directives(self, directives):
         return (dict(self.controls), dict(self.projection) if self.projection else None,
@@ -100,7 +110,7 @@ class _CSWPort:
 
     def authority_identity(self):
         return {"adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-                "adapter_protocol_version": "1.0.0", "workflow_port_version": "1.1.0",
+                "adapter_protocol_version": "1.1.0", "workflow_port_version": "1.2.0",
                 "scope_hash": "c" * 64, "capability_hash": "d" * 64}
 
     def behavioral_snapshot(self, *, candidate_statework_ids=None):

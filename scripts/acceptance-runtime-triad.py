@@ -9,8 +9,10 @@ import sys
 
 
 DP = Path(__file__).resolve().parents[1]
-CFW = Path(os.environ.get("COGNITIVE_FRAMEWORKS_ROOT", "/home/bamn/CognitiveFrameWorks"))
-CSW = Path(os.environ.get("COGNITIVE_STATEWORK_ROOT", "/home/bamn/CognitiveStateWork"))
+CFW = Path(os.environ.get("COGNITIVE_FRAMEWORKS_ROOT",
+                          DP.parent / "CognitiveFrameWorks")).resolve()
+CSW = Path(os.environ.get("COGNITIVE_STATEWORK_ROOT",
+                          DP.parent / "CognitiveStateWork")).resolve()
 TARGET = CFW / "tests" / "test_current_cross_repo_wire_contracts.py"
 
 
@@ -20,7 +22,9 @@ def main() -> int:
         print("RUNTIME_TRIAD=BLOCKED missing=" + ", ".join(missing), file=sys.stderr)
         return 2
     env = dict(os.environ)
+    env["COGNITIVE_FRAMEWORKS_ROOT"] = str(CFW)
     env["COGNITIVE_STATEWORK_ROOT"] = str(CSW)
+    env["DIGITALPSYCHOLOGY_ROOT"] = str(DP)
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(TARGET),
          "-k", "runtime_triad_private_mcp_qualification_uses_all_three_authorities"],

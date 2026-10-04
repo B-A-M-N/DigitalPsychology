@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, Mapping
 
-from ..behavior_state import (CSWBehaviorSnapshot, FrameworkSignal,
-                              GoalSetSnapshot)
+from ..behavior_state import (BehaviorSignalBatch, CSWBehaviorSnapshot,
+                              FrameworkSignal, GoalSetSnapshot)
 from ..control_protocol import ControlSessionDescriptor
 from ..runtime.contracts import RuntimeObservation
 from ..runtime.projection import (AuditProjection,
@@ -20,11 +21,14 @@ class HostProjectionManager:
         self.host = bridge
 
     def _descriptor(self) -> ControlSessionDescriptor:
+        return self.host._session_descriptor
+
+    def _create_descriptor(self) -> ControlSessionDescriptor:
         return ControlSessionDescriptor(
             identity=self.host.identity,
             objective=self.host.objective,
             objective_criteria=self.host.objective_criteria,
-            initial_goal_set=self.host.goal_set,
+            initial_goal_set=self.host.initial_goal_set,
             available_frameworks=self.host._cfw_components,
             cfw_authority_identity=self.host._cfw_authority_identity(),
             csw_authority_identity=self.host._csw_identity,
@@ -45,6 +49,40 @@ class HostProjectionManager:
         enriched, self.host._last_model_projection_digest = cached_replace_model_projection(
             context, projection, self.host._last_model_projection_digest)
         return enriched
+
+    def _offline_behavior_state(self) -> tuple[Any, Mapping[str, Any] | None]:
+        """Project only controls still effective in CFW after DP lease expiry."""
+        from ..behavior_state import BehaviorState
+
+        if not self.host._offline_controls_expired:
+            return self.host._state, None
+        provider = getattr(self.host.cfw, "effective_behavior_projection", None)
+        effective = provider() if callable(provider) else provider
+        if not isinstance(effective, Mapping):
+            return BehaviorState(), None
+        baseline = BehaviorState()
+        local = replace(
+            baseline,
+            revision=int(effective.get("behavior_revision", baseline.revision)),
+            cognitive_mode=str(effective.get("cognitive_mode", baseline.cognitive_mode)),
+            framework_modes=dict(effective.get("framework_modes") or baseline.framework_modes),
+            focus_criteria=tuple(effective.get("focus_criteria") or ()),
+            verification_intensity=str(effective.get(
+                "verification_intensity", baseline.verification_intensity)),
+            exploration_budget=str(effective.get(
+                "exploration_budget", baseline.exploration_budget)),
+            retry_policy=str(effective.get("retry_policy", baseline.retry_policy)),
+            recovery_level=int(effective.get("recovery_level", baseline.recovery_level)),
+            context_strategy=str(effective.get("context_strategy", baseline.context_strategy)),
+            response_strategy=str(effective.get("response_strategy", baseline.response_strategy)),
+        )
+        controls = {
+            key: effective[key] for key in (
+                "cognitive_mode", "framework_modes", "focus_criteria",
+                "verification_intensity", "exploration_budget", "retry_policy",
+                "recovery_level", "context_strategy", "response_strategy",
+                "target_leases") if key in effective}
+        return local, controls
 
     def _record_system_one_observation(self, prepared: Mapping[str, Any], *,
                                        tick_status: str) -> None:
@@ -107,9 +145,18 @@ class HostProjectionManager:
         return snapshot, candidates
 
     def _cfw_signals(self, observation: RuntimeObservation) -> tuple[FrameworkSignal, ...]:
+        return self._cfw_signal_batch(observation).signals
+
+    def _cfw_signal_batch(self, observation: RuntimeObservation) -> BehaviorSignalBatch:
         if self.host.cfw is None:
-            return ()
-        return tuple(self.host.cfw.collect_behavior_signals(observation))
+            return BehaviorSignalBatch(after_cursor=0, next_cursor=0)
+        return self.host.cfw.peek_behavior_signals(
+            after_cursor=None, maximum=32, observation=observation)
+
+    def _acknowledge_cfw_signals(self, through_cursor: int) -> None:
+        if self.host.cfw is None or through_cursor <= 0:
+            return
+        self.host.cfw.acknowledge_behavior_signals(through_cursor=through_cursor)
 
     def _current_cfw_revision(self) -> int:
         if not self.host._cfw_components:

@@ -46,6 +46,7 @@ class HostControlBridge:
         self.identity = identity
         self.objective = objective
         self.objective_criteria = tuple(objective_criteria)
+        self.initial_goal_set = initial_goal_set
         self.goal_set = initial_goal_set
         self.cfw = cfw
         self.csw = csw
@@ -82,6 +83,7 @@ class HostControlBridge:
         self._audit_projection = AuditProjection(metadata={})
         self._last_model_projection_digest: str | None = None
         self._lock = asyncio.Lock()
+        self._session_descriptor = self.projection_manager._create_descriptor()
 
     @property
     def fault(self) -> str | None:
@@ -135,10 +137,12 @@ class HostControlBridge:
     async def _record_candidate_rejection(
             self, candidate: ActionCandidate, decision: str, *, stage: str,
             goal_set: GoalSetSnapshot | None,
-            preflight_decision: str | None = None) -> Mapping[str, Any]:
+            preflight_decision: str | None = None,
+            candidate_gate_receipts: Mapping[str, Any]) -> Mapping[str, Any]:
         return await self.lifecycle_hooks._record_candidate_rejection(
             candidate, decision, stage=stage, goal_set=goal_set,
-            preflight_decision=preflight_decision)
+            preflight_decision=preflight_decision,
+            candidate_gate_receipts=candidate_gate_receipts)
 
     async def observe_boundary(self, boundary_kind: str, *,
                                observation: RuntimeObservation | None = None,
@@ -160,6 +164,7 @@ class HostControlBridge:
                               candidate_action: ActionCandidate | None = None,
                               candidate_preflight_result: str | None = None,
                               candidate_rejection_stage: str | None = None,
+                              candidate_gate_receipts: Mapping[str, Any] | None = None,
                               cfw_preflight_decision: str | None = None,
                               cfw_final_decision: str | None = None
                               ) -> RuntimeObservation:
@@ -167,6 +172,7 @@ class HostControlBridge:
             boundary_kind, goal_set=goal_set, candidate_action=candidate_action,
             candidate_preflight_result=candidate_preflight_result,
             candidate_rejection_stage=candidate_rejection_stage,
+            candidate_gate_receipts=candidate_gate_receipts,
             cfw_preflight_decision=cfw_preflight_decision,
             cfw_final_decision=cfw_final_decision)
 
@@ -247,6 +253,12 @@ class HostControlBridge:
 
     def _cfw_signals(self, observation: RuntimeObservation) -> tuple[FrameworkSignal, ...]:
         return self.projection_manager._cfw_signals(observation)
+
+    def _cfw_signal_batch(self, observation: RuntimeObservation):
+        return self.projection_manager._cfw_signal_batch(observation)
+
+    def _acknowledge_cfw_signals(self, through_cursor: int) -> None:
+        return self.projection_manager._acknowledge_cfw_signals(through_cursor)
 
     def _current_cfw_revision(self) -> int:
         return self.projection_manager._current_cfw_revision()

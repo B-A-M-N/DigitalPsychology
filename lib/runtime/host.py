@@ -123,7 +123,7 @@ class RuntimeHost:
             if not isinstance(cfw_identity, Mapping) or not required.issubset(cfw_identity):
                 raise ValueError("CFW did not advertise its complete authority identity")
             if (cfw_identity["adapter_kind"] != "cfw-component-runtime"
-                    or cfw_identity["adapter_protocol_version"] != "1.0.0"):
+                    or cfw_identity["adapter_protocol_version"] != "1.2.0"):
                 raise ValueError("CFW adapter identity or protocol version is incompatible")
         cfw_version = _declared(cfw, "behavior_projection_version")
         if not isinstance(cfw, NullCFWComponentPort) and cfw_version is None:
@@ -140,7 +140,7 @@ class RuntimeHost:
             if not isinstance(csw_identity, Mapping) or not required.issubset(csw_identity):
                 raise ValueError("CSW did not advertise its complete authority identity")
             if (csw_identity["adapter_kind"] != "csw-workflow-authority"
-                    or csw_identity["adapter_protocol_version"] != "1.0.0"):
+                    or csw_identity["adapter_protocol_version"] != "1.1.0"):
                 raise ValueError("CSW adapter identity or protocol version is incompatible")
         csw_version = _declared(csw, "workflow_port_version")
         if not isinstance(csw, NullCSWWorkflowPort) and csw_version is None:

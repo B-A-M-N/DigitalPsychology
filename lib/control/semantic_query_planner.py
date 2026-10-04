@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from ..behavior_state import FrameworkSignal
+from ..behavior_state import FrameworkSignal, group_behavioral_causes
 from ..runtime.contracts import RuntimeObservation
 from .policy_ambiguity import PolicyAmbiguity
 
@@ -59,11 +59,13 @@ class SemanticQueryPlanner:
     def plan(self, observation: RuntimeObservation, *,
              cfw_signals: Sequence[FrameworkSignal] = (),
              policy_ambiguity: PolicyAmbiguity | None = None) -> SemanticQueryPlan:
-        signals = tuple(signal for signal in cfw_signals if signal.active)
-        if any(signal.source.lower() == "ward" and signal.severity == "critical"
-               for signal in signals):
+        causes = group_behavioral_causes(cfw_signals)
+        if any(cause.hard_authority for cause in causes):
             return self._skip("hard CFW authority already resolves this boundary")
-        codes = tuple((signal.source + "." + signal.code).lower() for signal in signals)
+        codes = tuple((source + "." + code).lower()
+                      for cause in causes
+                      for source in cause.sources
+                      for code in cause.codes)
         retry_signal = any(any(token in code for token in (
             "retry", "repeat", "same_approach", "approach_failed", "equivalent"))
                                for code in codes)
@@ -145,6 +147,17 @@ class SemanticQueryPlanner:
                 or question_dimension not in policy_ambiguity.unresolved_dimensions
                 or voi < self.minimum_value_of_information):
             return self._skip(reason)
+        if retry_signal:
+            retry_causes = [cause for cause in causes if any(
+                token in f"{source}.{code}".lower()
+                for source in cause.sources for code in cause.codes
+                for token in ("retry", "repeat", "same_approach",
+                              "approach_failed", "equivalent"))]
+            if retry_causes:
+                corroborating = sum(max(len(cause.signal_ids), len(cause.codes))
+                                     for cause in retry_causes)
+                reason = (f"{len(retry_causes)} CFW retry cause(s) warrant one bounded query; "
+                          f"{corroborating} signal(s) are corroborating observations")
         return SemanticQueryPlan(question, reason, voi)
 
     @staticmethod

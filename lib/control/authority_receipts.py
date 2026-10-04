@@ -34,6 +34,13 @@ def validate_applied_authorities(decision: BehavioralDecision,
                 raise ValueError("CSW activation target was already active")
             expected_active.add(directive.target)
             csw_changes += 1
+    retained = dict(request.csw_snapshot.dependency_retention)
+    for statework_id, required_by in retained.items():
+        if statework_id not in original_active:
+            raise ValueError("CSW dependency retention names a workflow outside the basis")
+        if not set(required_by).issubset(expected_active):
+            raise ValueError("CSW retained a prerequisite without its active dependents")
+        expected_active.add(statework_id)
     if set(request.csw_snapshot.active_stateworks) != expected_active:
         raise ValueError("CSW post-application state does not match DP requests")
     expected_revision = int(basis["csw_selection_revision"]) + csw_changes

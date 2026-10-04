@@ -24,8 +24,8 @@ def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
                         support_action_threshold: int,
                         semantic_threshold: float) -> DetectedConditions:
     """Derive bounded triggers from host facts and calibrated semantic advice."""
-    active_signals = tuple(signal for signal in context.cfw_signals if signal.active)
-    signal_codes = tuple(signal.code for signal in active_signals)
+    causes = context.behavioral_causes
+    signal_codes = tuple(code for cause in causes for code in cause.codes)
     codes = set(normalized_behavior_codes(context.active_trigger_codes, signal_codes))
     attention_ids = (context.attention_lease.criterion_ids
                      if context.attention_lease is not None
@@ -55,17 +55,20 @@ def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
         task_complete = False
 
     scoped_retry_signal = any(
-        "equivalent_retry" in normalized_behavior_codes((), (signal.code,))
-        and (signal.criterion_id in attention_ids or not multi_item_task)
-        for signal in active_signals)
+        "equivalent_retry" in normalized_behavior_codes((), cause.codes)
+        and (set(cause.criterion_ids).intersection(attention_ids)
+             or not cause.criterion_ids and not multi_item_task)
+        for cause in causes)
     scoped_support_signal = any(
-        signal.active and signal.code == "support_work_budget_exceeded"
-        and (signal.criterion_id in attention_ids or not multi_item_task)
-        for signal in active_signals)
+        "support_work_budget_exceeded" in cause.codes
+        and (set(cause.criterion_ids).intersection(attention_ids)
+             or not cause.criterion_ids and not multi_item_task)
+        for cause in causes)
     scoped_drift_signal = any(
-        "goal_drift" in normalized_behavior_codes((), (signal.code,))
-        and (signal.criterion_id in attention_ids or not multi_item_task)
-        for signal in active_signals)
+        "goal_drift" in normalized_behavior_codes((), cause.codes)
+        and (set(cause.criterion_ids).intersection(attention_ids)
+             or not cause.criterion_ids and not multi_item_task)
+        for cause in causes)
     unscoped_retry = ("equivalent_retry" in context.active_trigger_codes
                       and not multi_item_task)
     unscoped_support = ("support_work_budget_exceeded" in context.active_trigger_codes

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from ..behavior_state import (BehaviorDirective, BehaviorState,
@@ -178,6 +179,7 @@ class RuntimeObservation:
     active_trigger_codes: tuple[str, ...] = ()
     approach_epoch: str = ""
     candidate_action: ActionCandidate | None = None
+    candidate_gate_receipts: Mapping[str, Any] | None = None
     candidate_preflight_result: str | None = None
     candidate_rejection_stage: str | None = None
     cfw_preflight_decision: str | None = None
@@ -205,6 +207,49 @@ class RuntimeObservation:
             raise ValueError("candidate_action must be a validated ActionCandidate")
         if self.candidate_action is not None and self.action_completed:
             raise ValueError("candidate_action is valid only at a pre-action boundary")
+        receipts = self.candidate_gate_receipts
+        normalized_receipts = None
+        if receipts is not None:
+            if (self.candidate_action is None or not isinstance(receipts, Mapping)
+                    or set(receipts) not in ({"preflight"}, {"preflight", "final"})):
+                raise ValueError("candidate gate receipts must name preflight and optional final gates")
+            normalized_receipts = {}
+            gate_decisions = {
+                "allow", "block", "require_confirmation", "require_reinspection",
+                "require_recovery", "require_changed_hypothesis", "require_goal_reanchor",
+            }
+            digests = set()
+            for stage, raw_receipt in receipts.items():
+                if not isinstance(raw_receipt, Mapping):
+                    raise ValueError("candidate gate receipt must be an object")
+                receipt = dict(raw_receipt)
+                expected = {"authority_id", "adapter_kind", "adapter_protocol_version",
+                            "stage", "action_digest", "decision", "reason_codes"}
+                if set(receipt) != expected or receipt["stage"] != stage:
+                    raise ValueError("candidate gate receipt fields or stage are invalid")
+                if (not isinstance(receipt["authority_id"], str)
+                        or not receipt["authority_id"] or len(receipt["authority_id"]) > 256
+                        or receipt["adapter_kind"] != "cfw-component-runtime"
+                        or receipt["adapter_protocol_version"] != "1.2.0"
+                        or receipt["decision"] not in gate_decisions):
+                    raise ValueError("candidate gate receipt authority or decision is invalid")
+                digest = receipt["action_digest"]
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(char not in "0123456789abcdef" for char in digest)):
+                    raise ValueError("candidate gate receipt action digest is invalid")
+                reasons = receipt["reason_codes"]
+                if (not isinstance(reasons, (tuple, list)) or not 1 <= len(reasons) <= 8
+                        or len(reasons) != len(set(reasons))
+                        or any(not isinstance(item, str) or not item or len(item) > 128
+                               for item in reasons)):
+                    raise ValueError("candidate gate receipt reason codes are invalid")
+                digests.add(digest)
+                normalized_receipts[stage] = MappingProxyType({
+                    **receipt, "reason_codes": tuple(reasons)})
+            if len(digests) != 1:
+                raise ValueError("candidate gate receipts do not refer to the same action")
+            normalized_receipts = MappingProxyType(normalized_receipts)
+            object.__setattr__(self, "candidate_gate_receipts", normalized_receipts)
         if self.candidate_preflight_result is not None and (
                 self.candidate_action is None
                 or self.candidate_preflight_result not in {
@@ -220,6 +265,24 @@ class RuntimeObservation:
         if (self.candidate_preflight_result is not None
                 and self.candidate_rejection_stage is None):
             raise ValueError("candidate rejection must identify its authoritative CFW gate")
+        if self.candidate_preflight_result is not None:
+            required_receipts = ({"preflight"} if self.candidate_rejection_stage == "cfw_preflight"
+                                 else {"preflight", "final"})
+            if set(normalized_receipts or {}) != required_receipts:
+                raise ValueError("candidate rejection gate receipts do not match the rejection stage")
+            selected_stage = ("preflight" if self.candidate_rejection_stage == "cfw_preflight"
+                              else "final")
+            if normalized_receipts[selected_stage]["decision"] != self.candidate_preflight_result:
+                raise ValueError("candidate rejection differs from the CFW gate receipt")
+            if normalized_receipts["preflight"]["decision"] != self.cfw_preflight_decision:
+                raise ValueError("candidate preflight decision differs from its gate receipt")
+            if (selected_stage == "final"
+                    and normalized_receipts["final"]["decision"] != self.cfw_final_decision):
+                raise ValueError("candidate final decision differs from its gate receipt")
+        elif normalized_receipts is not None:
+            if set(normalized_receipts) != {"preflight"} or (
+                    normalized_receipts["preflight"]["decision"] != "allow"):
+                raise ValueError("accepted candidate must carry one allowing preflight receipt")
         gate_decisions = {
             "allow", "block", "require_confirmation", "require_reinspection",
             "require_recovery", "require_changed_hypothesis", "require_goal_reanchor",

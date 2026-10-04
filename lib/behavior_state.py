@@ -730,7 +730,7 @@ class BehaviorDirective:
             duration = data.get("expires_after_actions")
             if type(duration) is not int or not 1 <= duration <= 64:
                 raise ValueError("legacy directive duration is invalid")
-            starts_at_candidate = boundary_kind == "pre_action"
+            starts_at_candidate = boundary_kind in {"pre_action", "pre_action_rejected"}
             start = host_action_index if starts_at_candidate else host_action_index + 1
             data["expires_at_action"] = start + duration - 1
         return cls(**data)
@@ -768,6 +768,7 @@ class CSWBehaviorSnapshot:
     snapshot_id: str = ""
     workflow_revisions: Mapping[str, int] = field(default_factory=dict)
     eligible_steps: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    dependency_retention: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, int) or self.revision < 0:
@@ -803,6 +804,19 @@ class CSWBehaviorSnapshot:
             key = _text(statework_id, "workflow ID", limit=128)
             step_map[key] = _ids(steps, "eligible step IDs", limit=64)
         object.__setattr__(self, "eligible_steps", MappingProxyType(step_map))
+        retention = {}
+        if (not isinstance(self.dependency_retention, Mapping)
+                or len(self.dependency_retention) > 16):
+            raise ValueError("dependency retention metadata exceeds its bound")
+        for statework_id, required_by in self.dependency_retention.items():
+            key = _text(statework_id, "retained StateWork ID", limit=128)
+            dependents = _ids(required_by, "dependency required_by", limit=16)
+            if (key not in self.active_stateworks or not dependents
+                    or key in dependents
+                    or not set(dependents).issubset(set(self.active_stateworks))):
+                raise ValueError("dependency retention metadata is inconsistent")
+            retention[key] = dependents
+        object.__setattr__(self, "dependency_retention", MappingProxyType(retention))
 
     def to_dict(self) -> dict[str, Any]:
         return {"revision": self.revision, "snapshot_id": self.snapshot_id,
@@ -811,7 +825,42 @@ class CSWBehaviorSnapshot:
                 "workflow_states": dict(self.workflow_states),
                 "workflow_revisions": dict(self.workflow_revisions),
                 "eligible_steps": {key: list(value)
-                                    for key, value in self.eligible_steps.items()}}
+                                    for key, value in self.eligible_steps.items()},
+                "dependency_retention": {key: list(value)
+                                         for key, value in
+                                         self.dependency_retention.items()}}
+
+
+@dataclass(frozen=True)
+class StateWorkReleaseResult:
+    """Typed CSW disposition for an owner release request."""
+
+    disposition: str
+    statework_id: str
+    required_by: tuple[str, ...]
+    released_stateworks: tuple[str, ...]
+    snapshot: CSWBehaviorSnapshot
+
+    def __post_init__(self) -> None:
+        if self.disposition not in {
+                "released", "already_inactive", "retained_required", "owner_mismatch"}:
+            raise ValueError("unsupported CSW StateWork release disposition")
+        _text(self.statework_id, "statework_id", limit=128)
+        object.__setattr__(self, "required_by", _ids(
+            self.required_by, "required_by", limit=16))
+        object.__setattr__(self, "released_stateworks", _ids(
+            self.released_stateworks, "released_stateworks", limit=16))
+        if not isinstance(self.snapshot, CSWBehaviorSnapshot):
+            raise ValueError("StateWork release requires an authoritative CSW snapshot")
+        active = set(self.snapshot.active_stateworks)
+        if self.disposition == "retained_required":
+            if self.statework_id not in active or not self.required_by:
+                raise ValueError("retained release must identify active dependents")
+        elif self.disposition in {"released", "already_inactive"}:
+            if self.statework_id in active:
+                raise ValueError("released StateWork remains active in the snapshot")
+        elif self.disposition == "owner_mismatch" and not self.statework_id in active:
+            raise ValueError("owner mismatch result must preserve the active workflow")
 
 
 @dataclass(frozen=True)
@@ -822,6 +871,11 @@ class FrameworkSignal:
     severity: str = "warning"
     criterion_id: str | None = None
     evidence_refs: tuple[str, ...] = ()
+    signal_id: str | None = None
+    cause_id: str | None = None
+    required_action: str | None = None
+    scope: str | None = None
+    subject_ref: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.source, "signal source", limit=64)
@@ -830,8 +884,124 @@ class FrameworkSignal:
             raise ValueError("unsupported signal severity")
         if self.criterion_id is not None:
             _text(self.criterion_id, "criterion_id", limit=128)
+        for name, limit in (("signal_id", 128), ("cause_id", 128),
+                            ("required_action", 64), ("scope", 128),
+                            ("subject_ref", 256)):
+            value = getattr(self, name)
+            if value is not None:
+                _text(value, name, limit=limit)
         object.__setattr__(self, "evidence_refs",
                            _ids(self.evidence_refs, "evidence_refs", limit=8))
+
+
+@dataclass(frozen=True)
+class BehavioralCause:
+    """One underlying behavioral cause with corroborating CFW observations."""
+
+    cause_id: str
+    signal_ids: tuple[str, ...]
+    sources: tuple[str, ...]
+    codes: tuple[str, ...]
+    required_actions: tuple[str, ...] = ()
+    criterion_ids: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    scopes: tuple[str, ...] = ()
+    subject_refs: tuple[str, ...] = ()
+    severities: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _text(self.cause_id, "cause_id", limit=128)
+        for name, values, limit, item_limit in (
+                ("signal_ids", self.signal_ids, 32, 128),
+                ("sources", self.sources, 32, 64),
+                ("codes", self.codes, 32, 128),
+                ("required_actions", self.required_actions, 16, 64),
+                ("criterion_ids", self.criterion_ids, 32, 128),
+                ("evidence_refs", self.evidence_refs, 256, 256),
+                ("scopes", self.scopes, 32, 128),
+                ("subject_refs", self.subject_refs, 32, 256)):
+            object.__setattr__(self, name,
+                               _ids(values, name, limit=limit,
+                                    item_limit=item_limit))
+        severities = _ids(self.severities, "severities", limit=3, item_limit=16)
+        if not set(severities).issubset({"info", "warning", "critical"}):
+            raise ValueError("behavioral cause contains an unsupported severity")
+        object.__setattr__(self, "severities", severities)
+
+    @property
+    def hard_authority(self) -> bool:
+        return "critical" in self.severities or "ward" in self.sources
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"cause_id": self.cause_id,
+                "signal_ids": list(self.signal_ids),
+                "sources": list(self.sources), "codes": list(self.codes),
+                "required_actions": list(self.required_actions),
+                "criterion_ids": list(self.criterion_ids),
+                "evidence_refs": list(self.evidence_refs),
+                "scopes": list(self.scopes), "subject_refs": list(self.subject_refs),
+                "severities": list(self.severities)}
+
+
+def group_behavioral_causes(
+        signals: Any) -> tuple[BehavioralCause, ...]:
+    """Deduplicate simultaneous framework observations by their causal identity.
+
+    Signals without a cause ID remain independent. Their signal ID, when
+    available, supplies stable identity; otherwise their bounded position in
+    this tick prevents unrelated legacy signals from collapsing together.
+    """
+    groups: dict[str, dict[str, list[str]]] = {}
+    for index, signal in enumerate(tuple(signals)):
+        if not isinstance(signal, FrameworkSignal) or not signal.active:
+            continue
+        cause_id = (signal.cause_id or
+                    (f"signal:{signal.signal_id}" if signal.signal_id else
+                     f"unattributed:{index}:{signal.source[:40]}:{signal.code[:64]}"))
+        values = groups.setdefault(cause_id, {
+            "signal_ids": [], "sources": [], "codes": [],
+            "required_actions": [], "criterion_ids": [], "evidence_refs": [],
+            "scopes": [], "subject_refs": [], "severities": [],
+        })
+        for name, value in (
+                ("signal_ids", signal.signal_id), ("sources", signal.source),
+                ("codes", signal.code), ("required_actions", signal.required_action),
+                ("criterion_ids", signal.criterion_id),
+                ("evidence_refs", None), ("scopes", signal.scope),
+                ("subject_refs", signal.subject_ref),
+                ("severities", signal.severity)):
+            if value and value not in values[name]:
+                values[name].append(value)
+        for ref in signal.evidence_refs:
+            if ref not in values["evidence_refs"]:
+                values["evidence_refs"].append(ref)
+    return tuple(BehavioralCause(cause_id=cause_id, **{
+        name: tuple(values[name]) for name in (
+            "signal_ids", "sources", "codes", "required_actions",
+            "criterion_ids", "evidence_refs", "scopes", "subject_refs",
+            "severities")}) for cause_id, values in groups.items())
+
+
+@dataclass(frozen=True)
+class BehaviorSignalBatch:
+    """Monotonic, retryable CFW signal delivery snapshot."""
+
+    after_cursor: int
+    next_cursor: int
+    signals: tuple[FrameworkSignal, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (type(self.after_cursor) is not int or self.after_cursor < 0
+                or type(self.next_cursor) is not int
+                or self.next_cursor < self.after_cursor):
+            raise ValueError("behavior signal batch cursor is malformed")
+        signals = tuple(self.signals)
+        if len(signals) > 32 or any(not isinstance(item, FrameworkSignal)
+                                    for item in signals):
+            raise ValueError("behavior signal batch exceeds its bounded contract")
+        if self.next_cursor - self.after_cursor != len(signals):
+            raise ValueError("behavior signal batch cursor does not match its contents")
+        object.__setattr__(self, "signals", signals)
 
 
 @dataclass(frozen=True)
@@ -870,6 +1040,9 @@ class BehavioralDecision:
 __all__ = [
     "BEHAVIOR_MODES", "INTERVENTION_ATTRIBUTIONS", "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
     "BehavioralDecision", "CSWBehaviorSnapshot", "FrameworkSignal",
+    "BehavioralCause", "group_behavioral_causes",
+    "StateWorkReleaseResult",
+    "BehaviorSignalBatch",
     "AttentionLease", "ModeLease", "GoalItemSnapshot", "GoalSetSnapshot",
     "InterventionOutcome", "InterventionTarget", "StateWorkOption",
     "TaskSetOutcome",

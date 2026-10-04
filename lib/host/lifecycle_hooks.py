@@ -51,9 +51,11 @@ class HostLifecycleHooks:
             raise TypeError("pre-action boundary requires a validated ActionCandidate")
         if not set(value.affected_criterion_ids).issubset(self.host.objective_criteria):
             raise ValueError("candidate action criteria escape the control objective")
+        await self._prepare_candidate_boundary()
         cfw_connected = bool(self.host._cfw_components)
         action_request = dict(cfw_action_request) if cfw_action_request is not None else None
-        preflight: Mapping[str, str] | None = None
+        preflight: Mapping[str, Any] | None = None
+        gate_receipts: dict[str, Mapping[str, Any]] = {}
         self.host._pending_cfw_gate_decisions.clear()
         if cfw_connected:
             if action_request is None:
@@ -66,14 +68,18 @@ class HostLifecycleHooks:
             preflight = preflight_action(action_request)
             if not isinstance(preflight, Mapping):
                 raise RuntimeError("CFW preflight returned a malformed host receipt")
+            gate_receipts["preflight"] = self._validated_gate_receipt(
+                preflight.get("gate_receipt"), "preflight")
             if preflight.get("decision") != "allow":
                 return await self.host._record_candidate_rejection(
                     value, str(preflight.get("decision") or "block"),
                     stage="cfw_preflight", goal_set=goal_set,
-                    preflight_decision=str(preflight.get("decision") or "block"))
+                    preflight_decision=str(preflight.get("decision") or "block"),
+                    candidate_gate_receipts=gate_receipts)
 
         observation = self.host._boundary_observation(
             "pre_action", goal_set=goal_set, candidate_action=value,
+            candidate_gate_receipts=(gate_receipts or None),
             cfw_preflight_decision=(str(preflight["decision"])
                                     if preflight is not None else None))
         control = await self.host._control_boundary(
@@ -86,11 +92,16 @@ class HostLifecycleHooks:
             raise RuntimeError("CFW final action gate returned a malformed host receipt")
         if authorization.get("action_digest") != preflight.get("action_digest"):
             raise RuntimeError("CFW action changed between preflight and the final gate")
+        final_receipt = self._validated_gate_receipt(
+            authorization.get("gate_receipt"), "final")
+        if final_receipt["action_digest"] != preflight.get("action_digest"):
+            raise RuntimeError("CFW final gate receipt refers to another action")
         decision = str(authorization.get("decision") or "block")
         if decision != "allow":
             rejected = await self.host._record_candidate_rejection(
                 value, decision, stage="cfw_final_gate", goal_set=goal_set,
-                preflight_decision=str(preflight["decision"]))
+                preflight_decision=str(preflight["decision"]),
+                candidate_gate_receipts={**gate_receipts, "final": final_receipt})
             return {**rejected, "pre_action_control": dict(control)}
         request_id = authorization.get("action_request_id")
         if not isinstance(request_id, str) or not request_id:
@@ -101,14 +112,29 @@ class HostLifecycleHooks:
         return {**control, "action_authorized": True,
                 "action_request_id": request_id}
 
+    async def _prepare_candidate_boundary(self) -> int:
+        """Expire candidate-scoped controls before any CFW gate evaluates it."""
+        async with self.host._lock:
+            self.host._require_open()
+            if not self.host._remote_open or self.host._needs_reconciliation:
+                await self.host._connect_or_degrade_locked()
+            action_index = max(1, self.host._action_index + 1)
+            changed = self.host._expire_local_leases(
+                action_index, expire_cfw=True)
+            if changed and self.host._remote_open:
+                await self.host._connect_or_degrade_locked()
+            return action_index
+
     async def _record_candidate_rejection(
             self, candidate: ActionCandidate, decision: str, *, stage: str,
             goal_set: GoalSetSnapshot | None,
-            preflight_decision: str | None = None) -> Mapping[str, Any]:
+            preflight_decision: str | None = None,
+            candidate_gate_receipts: Mapping[str, Any]) -> Mapping[str, Any]:
         observation = self.host._boundary_observation(
             "pre_action_rejected", goal_set=goal_set,
             candidate_action=candidate, candidate_preflight_result=decision,
             candidate_rejection_stage=stage,
+            candidate_gate_receipts=candidate_gate_receipts,
             cfw_preflight_decision=preflight_decision or (
                 decision if stage == "cfw_preflight" else "allow"),
             cfw_final_decision=(decision if stage == "cfw_final_gate" else None))
@@ -116,6 +142,20 @@ class HostLifecycleHooks:
             "pre_action_rejected", observation, goal_set=goal_set)
         return {"status": "rejected", "stage": stage, "decision": decision,
                 "action_authorized": False, "control": dict(control)}
+
+    def _validated_gate_receipt(self, value: Any, stage: str) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping) or value.get("stage") != stage:
+            raise RuntimeError("CFW action gate omitted its stage receipt")
+        identity = self.host._cfw_authority_identity()
+        receipt = dict(value)
+        if set(receipt) != {"authority_id", "adapter_kind", "adapter_protocol_version",
+                            "stage", "action_digest", "decision", "reason_codes"}:
+            raise RuntimeError("CFW action gate receipt fields are invalid")
+        if (receipt.get("authority_id") != identity.get("authority_id")
+                or receipt.get("adapter_kind") != identity.get("adapter_kind")
+                or receipt.get("adapter_protocol_version") != "1.2.0"):
+            raise RuntimeError("CFW action gate receipt authority differs from the session")
+        return receipt
 
     async def observe_boundary(self, boundary_kind: str, *,
                                observation: RuntimeObservation | None = None,
@@ -135,8 +175,8 @@ class HostLifecycleHooks:
         async with self.host._lock:
             self.host._require_open()
             snapshot, _ = self.host._csw_snapshot()
-            projection_state = (BehaviorState() if self.host._offline_controls_expired
-                                else self.host._state)
+            projection_state, local_controls = (
+                self.host.projection_manager._offline_behavior_state())
             projection = build_behavior_projection(
                 projection_state, snapshot, objective=self.host.objective,
                 goal_set=self.host.goal_set,
@@ -149,6 +189,7 @@ class HostLifecycleHooks:
             if self.host._offline_controls_expired:
                 audit["offline_controls_expired"] = True
                 audit["committed_behavior_revision"] = self.host._state.revision
+                audit["effective_cfw_controls"] = local_controls
             if self.host._latest_system_one_observation is not None:
                 audit["system_one"] = deepcopy(
                     dict(self.host._latest_system_one_observation))
@@ -168,8 +209,8 @@ class HostLifecycleHooks:
         async with self.host._lock:
             self.host._require_open()
             snapshot, _ = self.host._csw_snapshot()
-            projection_state = (BehaviorState() if self.host._offline_controls_expired
-                                else self.host._state)
+            projection_state, local_controls = (
+                self.host.projection_manager._offline_behavior_state())
             projection = build_behavior_projection(
                 projection_state, snapshot, objective=self.host.objective,
                 goal_set=self.host.goal_set,
@@ -182,6 +223,7 @@ class HostLifecycleHooks:
             if self.host._offline_controls_expired:
                 audit["offline_controls_expired"] = True
                 audit["committed_behavior_revision"] = self.host._state.revision
+                audit["effective_cfw_controls"] = local_controls
             if self.host._latest_system_one_observation is not None:
                 audit["system_one"] = deepcopy(
                     dict(self.host._latest_system_one_observation))
@@ -220,6 +262,10 @@ class HostLifecycleHooks:
 
     async def _connect_or_degrade_locked(self, *,
                                          host_action_index: int | None = None) -> bool:
+        local_expiry_changed = False
+        if host_action_index is not None:
+            local_expiry_changed = self.host._expire_local_leases(
+                host_action_index, expire_cfw=True)
         try:
             start = getattr(self.host.client, "start", None)
             if callable(start):
@@ -234,11 +280,8 @@ class HostLifecycleHooks:
                 self.host._boundary_sequence = int(response.get("boundary_sequence", -1))
                 self.host._remote_open = True
                 self.host._needs_reconciliation = True
-            if self.host._needs_reconciliation:
+            if self.host._needs_reconciliation or local_expiry_changed:
                 await self.host._reconcile_locked()
-            if host_action_index is not None and self.host._remote_open:
-                if self.host._expire_local_leases(host_action_index):
-                    await self.host._reconcile_locked()
             return not self.host._needs_reconciliation
         except Exception as exc:
             if not self.host._transport_failure(exc):

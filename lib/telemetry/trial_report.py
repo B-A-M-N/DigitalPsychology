@@ -12,7 +12,7 @@ class TrialReportMethods:
                                 task_completed: bool | None = None) -> dict[str, Any]:
         """Return persisted action metrics plus separately stored control transitions."""
         from ..telemetry.behavioral_trace import (
-            ActionTrace, BehavioralTrace, provider_attestation, provider_status,
+            ActionTrace, BehavioralTrace, provider_status,
             runtime_configuration,
         )
 
@@ -22,7 +22,11 @@ class TrialReportMethods:
         descriptor = ControlSessionDescriptor.from_mapping(stored["descriptor"])
         if descriptor.control_session_id != control_session_id:
             raise RuntimeError("persisted control session identity is inconsistent")
-        attestation = provider_attestation(self.engine.system_one_frame_factory)
+        provider_identity = stored.get("provider_identity")
+        attestation = (provider_identity.get("attestation")
+                       if isinstance(provider_identity, dict) else None)
+        factory_configured = (bool(provider_identity.get("factory_configured"))
+                              if isinstance(provider_identity, dict) else False)
         trace = BehavioralTrace(
             task_id=descriptor.identity.task_id,
             configuration=runtime_configuration(
@@ -31,7 +35,7 @@ class TrialReportMethods:
                 attestation=attestation),
             semantic_provider_status=provider_status(
                 attestation,
-                factory_configured=self.engine.system_one_frame_factory is not None),
+                factory_configured=factory_configured),
             semantic_model_hash=(attestation.get("model_content_hash")
                                  if attestation else None),
             semantic_provider_attestation=attestation,

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from ...behavior_state import FrameworkSignal
+from ...behavior_state import BehaviorSignalBatch, FrameworkSignal
 from ..contracts import RuntimeObservation
 
 
@@ -33,20 +33,19 @@ class CFWRuntimeAdapter:
             raise ValueError("CFW returned malformed component capability IDs")
         return values
 
-    def preflight_action(self, action: Mapping[str, Any]) -> Mapping[str, str]:
+    def preflight_action(self, action: Mapping[str, Any]) -> Mapping[str, Any]:
         if not isinstance(action, Mapping):
             raise TypeError("CFW action preflight requires the host's original action request")
         result = self.component_port.preflight_action(action)
         return self._validate_action_gate_result(result, final=False)
 
-    def authorize_action(self, action: Mapping[str, Any]) -> Mapping[str, str]:
+    def authorize_action(self, action: Mapping[str, Any]) -> Mapping[str, Any]:
         if not isinstance(action, Mapping):
             raise TypeError("CFW final action gate requires the host's original action request")
         result = self.component_port.authorize_action(action)
         return self._validate_action_gate_result(result, final=True)
 
-    @staticmethod
-    def _validate_action_gate_result(value: Any, *, final: bool) -> dict[str, str]:
+    def _validate_action_gate_result(self, value: Any, *, final: bool) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             raise RuntimeError("CFW action gate returned a malformed receipt")
         action_digest = value.get("action_digest")
@@ -58,7 +57,25 @@ class CFWRuntimeAdapter:
                     "require_recovery", "require_changed_hypothesis",
                     "require_goal_reanchor"}):
             raise RuntimeError("CFW action gate receipt is outside its contract")
-        result = {"action_digest": action_digest, "decision": str(decision)}
+        receipt = value.get("gate_receipt")
+        stage = "final" if final else "preflight"
+        identity = self.authority_identity()
+        if not isinstance(receipt, Mapping) or receipt.get("stage") != stage:
+            raise RuntimeError("CFW action gate omitted its authority receipt")
+        if (identity is None
+                or receipt.get("authority_id") != identity.get("authority_id")
+                or receipt.get("adapter_kind") != identity.get("adapter_kind")
+                or receipt.get("adapter_protocol_version") != "1.2.0"
+                or receipt.get("action_digest") != action_digest
+                or receipt.get("decision") != decision):
+            raise RuntimeError("CFW action gate authority receipt is inconsistent")
+        reasons = receipt.get("reason_codes")
+        if (not isinstance(reasons, (tuple, list)) or not 1 <= len(reasons) <= 8
+                or any(not isinstance(item, str) or not item or len(item) > 128
+                       for item in reasons)):
+            raise RuntimeError("CFW action gate reason codes are malformed")
+        result = {"action_digest": action_digest, "decision": str(decision),
+                  "gate_receipt": dict(receipt)}
         if final:
             request_id = value.get("action_request_id")
             if not isinstance(request_id, str) or not request_id:
@@ -94,17 +111,60 @@ class CFWRuntimeAdapter:
             raise RuntimeError("CFW returned a malformed applied behavior projection")
         return dict(value)
 
+    def effective_behavior_projection(self) -> Mapping[str, Any] | None:
+        """Return target leases after CFW applies its local expiry clock."""
+        raw = getattr(self.component_port, "effective_behavior_projection", None)
+        value = raw() if callable(raw) else raw
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise RuntimeError("CFW returned a malformed effective behavior projection")
+        return dict(value)
+
     def collect_behavior_signals(self, observation: RuntimeObservation
                                  ) -> tuple[FrameworkSignal, ...]:
-        raw = self.component_port.collect_behavior_signals(observation)
+        return self.peek_behavior_signals(
+            after_cursor=None, maximum=32, observation=observation).signals
+
+    def peek_behavior_signals(self, *, after_cursor: int | None,
+                              maximum: int = 32,
+                              observation: RuntimeObservation | None = None
+                              ) -> BehaviorSignalBatch:
+        peek = getattr(self.component_port, "peek_behavior_signals", None)
+        if not callable(peek):
+            raise RuntimeError("CFW port does not expose retryable behavioral signals")
+        raw = peek(after_cursor=after_cursor, maximum=maximum)
+        if not isinstance(raw, Mapping):
+            raise ValueError("CFW signal batch is malformed")
+        after = raw.get("after_cursor")
+        next_cursor = raw.get("next_cursor")
+        values = raw.get("signals")
+        if (type(after) is not int or type(next_cursor) is not int
+                or not isinstance(values, Sequence) or len(values) > maximum):
+            raise ValueError("CFW signal batch cursor or signal sequence is malformed")
+        signals = self._normalize_signals(values, observation)
+        return BehaviorSignalBatch(after, next_cursor, signals)
+
+    def acknowledge_behavior_signals(self, *, through_cursor: int) -> None:
+        acknowledge = getattr(self.component_port, "acknowledge_behavior_signals", None)
+        if not callable(acknowledge):
+            raise RuntimeError("CFW port does not expose behavioral-signal acknowledgement")
+        acknowledge(through_cursor=through_cursor)
+
+    def _normalize_signals(self, raw: Sequence[Any],
+                           observation: RuntimeObservation | None = None
+                           ) -> tuple[FrameworkSignal, ...]:
         if not isinstance(raw, Sequence) or len(raw) > 32:
             raise ValueError("CFW signal port exceeded its bounded contract")
+        goal_set = getattr(observation, "goal_set", None)
+        objective_criteria = ({item.criterion_id for item in goal_set.items}
+                              if goal_set is not None else set())
         result = []
         for item in raw:
             if not isinstance(item, Mapping):
                 raise ValueError("CFW signal port returned a non-object signal")
             source = str(item.get("source") or "cfw")
-            raw_code = str(item.get("code") or "")
+            raw_code = str(item.get("code") or item.get("signal_type") or "")
             code = _TRIGGER_CODES.get(raw_code, raw_code)
             severity = _SEVERITIES.get(str(item.get("severity") or "medium"))
             if severity is None:
@@ -113,13 +173,25 @@ class CFWRuntimeAdapter:
             refs = item.get("evidence_refs") or ()
             if not isinstance(active, bool) or not isinstance(refs, (tuple, list)):
                 raise ValueError("CFW signal activity or evidence references are malformed")
+            criterion_id = item.get("criterion_id")
+            subject_ref = item.get("subject_ref")
+            if criterion_id is None and subject_ref in objective_criteria:
+                criterion_id = subject_ref
             result.append(FrameworkSignal(
                 source=source, code=code,
                 active=active,
                 severity=severity,
-                criterion_id=(str(item["criterion_id"])
-                              if item.get("criterion_id") is not None else None),
+                criterion_id=(str(criterion_id) if criterion_id is not None else None),
                 evidence_refs=tuple(refs[:8]),
+                signal_id=(str(item["signal_id"])
+                           if item.get("signal_id") is not None else None),
+                cause_id=(str(item["cause_id"])
+                          if item.get("cause_id") is not None else None),
+                required_action=(str(item["required_action"])
+                                 if item.get("required_action") is not None else None),
+                scope=(str(item["scope"])
+                       if item.get("scope") is not None else None),
+                subject_ref=(str(subject_ref) if subject_ref is not None else None),
             ))
         return tuple(result)
 

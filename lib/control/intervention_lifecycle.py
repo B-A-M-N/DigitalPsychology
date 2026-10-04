@@ -187,9 +187,7 @@ class InterventionLifecycle:
         hard_mode_interrupt = bool(
             contradiction or task_complete or runnable_count == 0
             or context.regression_observed or adverse_outcome
-            or any(signal.active and (
-                signal.severity == "critical" or signal.source.lower() == "ward")
-                for signal in context.cfw_signals))
+            or any(cause.hard_authority for cause in context.behavioral_causes))
         mode_hold = _mode_lease_holds(
             original, context, material_progress=focused_progress,
             hard_interrupt=hard_mode_interrupt)

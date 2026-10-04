@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 from .behavioral_trace import JUSTIFICATION_CLASSES
 
@@ -28,6 +29,7 @@ class ControlTransitionTrace:
     ward_hard_safety: bool = False
     cfw_preflight_decision: str | None = None
     cfw_final_decision: str | None = None
+    cfw_gate_receipts: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for name in ("control_session_id", "boundary_kind", "prior_mode",
@@ -72,6 +74,10 @@ class ControlTransitionTrace:
                     "require_recovery", "require_changed_hypothesis",
                     "require_goal_reanchor"}:
                 raise ValueError(f"control transition {name} is invalid")
+        if self.cfw_gate_receipts is not None:
+            if set(self.cfw_gate_receipts) not in ({"preflight"}, {"preflight", "final"}):
+                raise ValueError("control transition gate receipts are invalid")
+            object.__setattr__(self, "cfw_gate_receipts", dict(self.cfw_gate_receipts))
         object.__setattr__(self, "transition_causes", causes)
 
     def to_dict(self) -> dict[str, object]:
@@ -96,6 +102,8 @@ class ControlTransitionTrace:
             "ward_hard_safety": self.ward_hard_safety,
             "cfw_preflight_decision": self.cfw_preflight_decision,
             "cfw_final_decision": self.cfw_final_decision,
+            "cfw_gate_receipts": (dict(self.cfw_gate_receipts)
+                                  if self.cfw_gate_receipts is not None else None),
         }
 
 

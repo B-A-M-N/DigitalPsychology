@@ -47,6 +47,12 @@ revision, directives, CSW-eligible StateWork preferences, and independently
 assessed intervention outcomes. DP persists its behavior revision separately
 from the CSW selection and workflow revisions.
 
+CFW signal delivery uses a bounded cursor batch. DP commits the consumed cursor
+with the prepared control tick and acknowledges CFW only after that commit; a
+restart therefore replays any batch whose DP transaction did not finish.
+Signals retain cause, action, scope, and subject metadata so related signals
+can be grouped without losing the originating event.
+
 The fast loop compares at most two configurations per tick: continuation of
 the current configuration and the one bounded change proposed by the existing
 deterministic rules. Host/operator requirements, mandatory WARD, available CFW
@@ -76,6 +82,13 @@ required criterion is host-verified. Prompt projection includes aggregate
 counts, the current attention lease, the next ready criteria, and the oldest
 starved criterion rather than injecting an unbounded criterion list.
 
+`before_model_call()` consumes the current cognitive mode, exploration budget,
+context strategy, response strategy, verification intensity, retry policy, and
+recovery level as task-language guidance. Its private audit projection records
+the behavior revision, all seven `model_controls`, and the guidance digest, so
+hosts can verify which controls reached the model without exposing bookkeeping
+in the prompt.
+
 The runtime's decision, directive application, and outcome assessment methods
 are trusted-host APIs. They are not registered as agent-facing MCP tools. DP
 persists its decision with compare-and-swap and keeps WARD mandatory. CFW
@@ -93,6 +106,10 @@ A StateWork activated as part of a temporary DP intervention is leased to that
 intervention. When the intervention is assessed, withdrawn, or expires, DP
 emits a typed release directive; the host deactivates it through CSW's
 revisioned API and compensates if the rest of the decision cannot be committed.
+CSW may return the typed `retained_required` disposition when an active
+workflow still depends on that StateWork. The retained dependency remains in
+the authoritative snapshot until its dependents close; DP does not record it
+as released.
 
 ## Intervention lifecycle
 
@@ -161,6 +178,12 @@ The wire formats are versioned in
 `digital_psychology/schemas/behavior-state-v1.schema.json` and
 `digital_psychology/schemas/behavioral-decision-v1.schema.json`.
 
+Each open control session freezes its initial `ControlSessionDescriptor` and
+the attested System-1 provider identity. Reconnects use that persisted binding;
+a changed provider cannot silently take over an existing session. Older
+sessions without a provider record remain unbound rather than inheriting the
+current process configuration.
+
 ## Integration boundaries
 
 DP owns cross-system behavioral orchestration. CFW retains its own task and
@@ -168,3 +191,7 @@ action enforcement, but exposes a typed DP component adapter for bounded
 signals, reversible behavior directives, and context projection. CSW retains
 the only authority over active StateWorks and their transitions. These ports
 compose through public APIs; they do not replace or patch CFW runtime objects.
+CFW preflight and final-gate receipts travel with the candidate observation and
+transition trace. Each receipt identifies the CFW authority, adapter protocol,
+stage, action digest, decision, and reason codes, allowing a rejected candidate
+to be attributed to the gate that made the decision.

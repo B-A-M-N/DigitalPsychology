@@ -11,11 +11,15 @@ from .outcomes import HostOutcomeFact
 from .runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
 
 
-PROTOCOL_VERSION = "1.4.0"
+PROTOCOL_VERSION = "1.7.0"
 MAX_CONTROL_PAYLOAD_BYTES = 131_072
 CONTROL_BOUNDARY_KINDS = frozenset({
     "task_start", "pre_model_call", "pre_action", "pre_action_rejected", "post_action",
     "validator", "workflow", "operator", "pre_completion",
+})
+CANDIDATE_ACTION_BOUNDARIES = frozenset({"pre_action", "pre_action_rejected"})
+ACTION_INDEX_BOUNDARIES = frozenset({
+    "pre_action", "pre_action_rejected", "post_action",
 })
 
 
@@ -50,7 +54,7 @@ def parse_csw_snapshot(value: Any) -> CSWBehaviorSnapshot:
     data = dict(_mapping(value, "csw_snapshot"))
     expected = {"revision", "active_stateworks", "eligible_stateworks",
                 "workflow_states", "snapshot_id", "workflow_revisions",
-                "eligible_steps"}
+                "eligible_steps", "dependency_retention"}
     if set(data) != expected:
         raise ValueError("CSW snapshot fields are invalid")
     options = _sequence(data["eligible_stateworks"], "eligible_stateworks", maximum=32)
@@ -65,6 +69,8 @@ def parse_csw_snapshot(value: Any) -> CSWBehaviorSnapshot:
         workflow_revisions=dict(data["workflow_revisions"]),
         eligible_steps={key: tuple(steps) for key, steps in
                         dict(data["eligible_steps"]).items()},
+        dependency_retention={key: tuple(ids) for key, ids in
+                              dict(data["dependency_retention"]).items()},
     )
 
 
@@ -188,6 +194,7 @@ class ControlTickRequest:
     goal_set: GoalSetSnapshot
     cfw_signals: tuple[FrameworkSignal, ...]
     csw_snapshot: CSWBehaviorSnapshot
+    cfw_signal_cursor: int = 0
     outcome_facts: tuple[HostOutcomeFact, ...] = ()
     boundary_kind: str | None = None
     boundary_sequence: int = 0
@@ -203,6 +210,8 @@ class ControlTickRequest:
             raise ValueError("control boundary kind is unsupported")
         if (type(self.boundary_sequence) is not int or self.boundary_sequence < 0):
             raise ValueError("boundary_sequence must be a non-negative integer")
+        if type(self.cfw_signal_cursor) is not int or self.cfw_signal_cursor < 0:
+            raise ValueError("cfw_signal_cursor must be a non-negative integer")
         if (type(self.expected_behavior_revision) is not int
                 or self.expected_behavior_revision < 0):
             raise ValueError("expected_behavior_revision must be non-negative")
@@ -226,7 +235,7 @@ class ControlTickRequest:
             raise ValueError("observation is invalid")
         if self.observation.action_completed != (kind == "post_action"):
             raise ValueError("only post_action boundaries confirm a completed host action")
-        candidate_boundary = kind in {"pre_action", "pre_action_rejected"}
+        candidate_boundary = kind in CANDIDATE_ACTION_BOUNDARIES
         if candidate_boundary != (self.observation.candidate_action is not None):
             raise ValueError("candidate boundaries require exactly one action candidate")
         rejected = kind == "pre_action_rejected"
@@ -252,7 +261,8 @@ class ControlTickRequest:
         expected = {"protocol_version", "control_session_id", "tick_id",
                     "expected_behavior_revision", "cfw_lifecycle_revision",
                     "observation", "goal_set", "cfw_signals", "csw_snapshot",
-                    "outcome_facts", "boundary_kind", "boundary_sequence"}
+                    "cfw_signal_cursor", "outcome_facts", "boundary_kind",
+                    "boundary_sequence"}
         if set(data) != expected or data["protocol_version"] != PROTOCOL_VERSION:
             raise ValueError("control tick protocol version or fields are invalid")
         goal_set = parse_goal_set(data["goal_set"])
@@ -275,6 +285,7 @@ class ControlTickRequest:
             observation=observation, goal_set=goal_set,
             cfw_signals=tuple(FrameworkSignal(**dict(item)) for item in signals),
             csw_snapshot=parse_csw_snapshot(data["csw_snapshot"]),
+            cfw_signal_cursor=data["cfw_signal_cursor"],
             outcome_facts=tuple(HostOutcomeFact(**dict(item)) for item in outcome_facts),
             boundary_kind=data["boundary_kind"],
             boundary_sequence=data["boundary_sequence"],
@@ -307,6 +318,10 @@ class ControlTickRequest:
                 "approach_epoch": self.observation.approach_epoch,
                 "candidate_action": (self.observation.candidate_action.to_dict()
                                      if self.observation.candidate_action else None),
+                "candidate_gate_receipts": (
+                    {stage: {**dict(receipt), "reason_codes": list(receipt["reason_codes"])}
+                     for stage, receipt in self.observation.candidate_gate_receipts.items()}
+                    if self.observation.candidate_gate_receipts is not None else None),
                 "candidate_preflight_result": self.observation.candidate_preflight_result,
                 "candidate_rejection_stage": self.observation.candidate_rejection_stage,
                 "cfw_preflight_decision": self.observation.cfw_preflight_decision,
@@ -316,8 +331,14 @@ class ControlTickRequest:
             "cfw_signals": [{"source": item.source, "code": item.code,
                               "active": item.active, "severity": item.severity,
                               "criterion_id": item.criterion_id,
-                              "evidence_refs": list(item.evidence_refs)}
+                              "evidence_refs": list(item.evidence_refs),
+                              "signal_id": item.signal_id,
+                              "cause_id": item.cause_id,
+                              "required_action": item.required_action,
+                              "scope": item.scope,
+                              "subject_ref": item.subject_ref}
                              for item in self.cfw_signals],
+            "cfw_signal_cursor": self.cfw_signal_cursor,
             "csw_snapshot": self.csw_snapshot.to_dict(),
             "outcome_facts": [item.__dict__ for item in self.outcome_facts],
         }

@@ -357,12 +357,12 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         available_frameworks=("owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"),
         cfw_authority_identity={
             "adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
-            "adapter_protocol_version": "1.0.0",
+            "adapter_protocol_version": "1.2.0",
             "behavior_projection_version": "2.0.0",
             "scope_hash": "a" * 64, "capability_hash": "b" * 64},
         csw_authority_identity={
             "adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-            "adapter_protocol_version": "1.0.0", "workflow_port_version": "1.1.0",
+            "adapter_protocol_version": "1.1.0", "workflow_port_version": "1.2.0",
             "scope_hash": "b" * 64, "capability_hash": "c" * 64},
         # The host declares real task semantics; DP refuses to guess them.
         host_capabilities={"cfw_connected": True, "csw_connected": True,
@@ -378,17 +378,37 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         expected_behavior_revision=1, cfw_lifecycle_revision=2,
         observation=observation, goal_set=goals,
         cfw_signals=(FrameworkSignal(
-            source="owl", code="owl.approach_failed", severity="critical",
+            source="owl", code="owl.approach_failed", severity="warning",
             criterion_id="criterion-visual"),),
         csw_snapshot=csw)
     try:
         prepared = control.prepare_control_tick(request.to_dict())
+        pinned_provider = state_store.control_session(identity.scope)[
+            "provider_identity"]
+        assert pinned_provider["attestation"]["model_id"] == "fixture-model"
+        changed_attestation = dict(pinned_provider["attestation"])
+        changed_attestation["model_id"] = "replacement-model"
+        replacement_factory = lambda *_args, **_kwargs: None
+        replacement_factory.system_one_attestation = {
+            **changed_attestation,
+            "model_content_hash": "d" * 64,
+            "capability_digest": "e" * 64,
+        }
+        control.engine.system_one_frame_factory = replacement_factory
+        trial = control.behavioral_trial_record(
+            identity.scope, trial_id="provider-pinned-trial")
+        assert trial["semantic_provider_attestation"] == pinned_provider["attestation"]
+        with pytest.raises(RuntimeError, match="provider identity has changed"):
+            control.open_control_session(descriptor.to_dict())
     finally:
         control.close()
 
     audited = prepared["basis"]["system_one"]
     frame = audited["frame"]
-    assert frame["state"]["situation"]["blockers"] == ["owl.approach_failed"]
+    blockers = frame["state"]["situation"]["blockers"]
+    assert len(blockers) == 1
+    assert blockers[0].startswith("cfw_cause=unattributed:0:owl:owl.approach_failed")
+    assert "codes=owl.approach_failed" in blockers[0]
     assert frame["state"]["task"]["active_statework"] == "repair"
     assert frame["state"]["workflows"][0]["current_state"] == "INSPECTING"
     assert audited["result"]["status"] == "shadow"

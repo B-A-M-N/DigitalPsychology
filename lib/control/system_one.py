@@ -5,7 +5,8 @@ import hashlib
 from typing import Any, Mapping, Sequence
 
 from ..behavior_state import (BehaviorState, CSWBehaviorSnapshot,
-                              FrameworkSignal, GoalSetSnapshot)
+                              FrameworkSignal, GoalSetSnapshot,
+                              group_behavioral_causes)
 from .candidate_generator import BehaviorCandidateGenerator, CandidateConditions
 from .semantic_query_planner import SemanticQueryPlanner
 from .statework_selector import (eligible_statework_descriptions,
@@ -129,8 +130,10 @@ def create_system_one_frame_factory(system_one_service: Any):
               cfw_signals: Sequence[FrameworkSignal],
               policy_context: Mapping[str, Any] | None = None) -> SystemOneFrame | None:
         signals = tuple(signal for signal in cfw_signals if signal.active)
-        signal_codes = tuple((signal.source + "." + signal.code).lower()
-                             for signal in signals)
+        causes = group_behavioral_causes(signals)
+        signal_codes = tuple((source + "." + code).lower()
+                             for cause in causes for source in cause.sources
+                             for code in cause.codes)
         retry_signal = any(any(token in code for token in (
             "retry", "repeat", "same_approach", "approach_failed", "equivalent"))
                                for code in signal_codes)
@@ -178,7 +181,8 @@ def create_system_one_frame_factory(system_one_service: Any):
                 retry_ambiguity=retry_ambiguous,
                 action_relation_uncertain=candidate_action_uncertain,
                 progress_relation_uncertain=progress_ambiguous,
-                trigger_codes=tuple(signal.code for signal in signals),
+                trigger_codes=tuple(dict.fromkeys(
+                    code for cause in causes for code in cause.codes)),
             ),
             csw_snapshot=csw,
             available_frameworks=("owl", "anchor", "fuse", "ward", "flow",
@@ -268,8 +272,16 @@ def create_system_one_frame_factory(system_one_service: Any):
             },
             situation={
                 "current_state": behavior_state.cognitive_mode,
-                "blockers": [signal.code for signal in cfw_signals
-                             if signal.active and signal.severity == "critical"][:8],
+                "blockers": [
+                    (f"cfw_cause={cause.cause_id[:48]};"
+                     f"src={','.join(cause.sources)[:40]};"
+                     f"codes={','.join(cause.codes)[:56]};"
+                     f"actions={','.join(cause.required_actions)[:32]};"
+                     f"criteria={','.join(cause.criterion_ids)[:32]};"
+                     f"refs={','.join(cause.evidence_refs)[:24]};"
+                     f"scope={','.join(cause.scopes)[:20]};"
+                     f"subject={','.join(cause.subject_refs)[:20]}")[:256]
+                    for cause in causes[:8]],
                 "actions_since_goal_progress": observation.actions_since_goal_progress,
                 "actions_since_artifact_change": observation.actions_since_artifact_change,
                 "verification_actions_since_artifact_change": (

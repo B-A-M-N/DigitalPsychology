@@ -91,6 +91,7 @@ def build_control_transition_trace(scope: str, prior_state: BehaviorState,
             if (facts.get("cfw_final_decision")
                 or (stage == "cfw_final_gate"
                     and facts.get("candidate_preflight_result"))) else None),
+        cfw_gate_receipts=facts.get("candidate_gate_receipts"),
     ).to_dict()
 
 def build_committed_action_trace(descriptor: ControlSessionDescriptor,

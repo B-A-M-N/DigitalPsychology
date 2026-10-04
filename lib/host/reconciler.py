@@ -84,6 +84,10 @@ class HostReconciler:
             self.host._boundary_sequence = int(response.get("boundary_sequence", -1))
             self.host.goal_set = self.host._reported_goal_set(response)
         if not response.get("pending_decisions"):
+            committed_signal_cursor = response.get("committed_cfw_signal_cursor", 0)
+            if type(committed_signal_cursor) is not int or committed_signal_cursor < 0:
+                raise RuntimeError("DP reconciliation returned an invalid CFW signal cursor")
+            self.host._acknowledge_cfw_signals(committed_signal_cursor)
             actual = self.host.actuator.applied_behavior_projection()
             expected = build_cfw_behavior_projection(
                 self.host._state,
@@ -117,6 +121,12 @@ class HostReconciler:
             elif directive["operation"] == "prefer_statework":
                 expected_active.add(directive["target"])
         snapshot, candidates = self.host._csw_snapshot()
+        for retained_id, required_by in snapshot.dependency_retention.items():
+            if (retained_id not in set(basis.get("csw_active_stateworks") or ())
+                    or not set(required_by).issubset(expected_active)):
+                raise RuntimeError(
+                    "CSW dependency retention does not match the pending DP decision")
+            expected_active.add(retained_id)
         actual_cfw = self.host.actuator.applied_behavior_projection()
         expected_cfw = build_cfw_behavior_projection(
             candidate, host_action_index=int(basis.get(

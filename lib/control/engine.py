@@ -14,7 +14,9 @@ from ..outcomes import (HostOutcomeFact, InterventionEvaluationFrame,
 from ..runtime.contracts import RuntimeIdentity
 from ..runtime.store import RuntimeStateRecord
 from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
-from ..control_protocol import (ControlSessionDescriptor, ControlTickRequest)
+from ..control_protocol import (ACTION_INDEX_BOUNDARIES,
+                                CANDIDATE_ACTION_BOUNDARIES,
+                                ControlSessionDescriptor, ControlTickRequest)
 
 
 class _ProvidedOutcomeFacts(OutcomeEvidenceAuthority):
@@ -70,7 +72,7 @@ class ControlDecisionEngine:
         if goal_set.revision < descriptor.initial_goal_set.revision:
             raise ValueError("host goal-set revision moved backwards")
         boundary_kind = request.boundary_kind
-        if boundary_kind in {"pre_action", "pre_action_rejected", "post_action"}:
+        if boundary_kind in ACTION_INDEX_BOUNDARIES:
             expected_candidate_index = max(1, record.action_index + 1)
             if request.observation.action_index != expected_candidate_index:
                 raise ValueError("action boundary must use the next sequential candidate index")
@@ -84,7 +86,11 @@ class ControlDecisionEngine:
                 or request.observation.candidate_preflight_result is None
                 or request.outcome_facts):
             raise ValueError("rejected-candidate control requires its CFW gate result")
-        if (boundary_kind not in {"pre_action", "pre_action_rejected"}
+        if (request.observation.candidate_action is not None
+                and descriptor.host_capabilities.get("cfw_connected")
+                and request.observation.candidate_gate_receipts is None):
+            raise ValueError("CFW-connected candidate boundary requires its gate receipt")
+        if (boundary_kind not in CANDIDATE_ACTION_BOUNDARIES
                 and request.observation.candidate_action is not None):
             raise ValueError("candidate actions are accepted only at pre-action boundaries")
         if not set(request.observation.criterion_status).issubset(goal_ids):

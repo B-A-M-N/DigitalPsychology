@@ -75,7 +75,7 @@ def test_non_action_control_boundary_does_not_age_an_intervention():
         available_frameworks=("owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"),
         cfw_authority_identity={
             "adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
-            "adapter_protocol_version": "1.0.0",
+            "adapter_protocol_version": "1.2.0",
             "behavior_projection_version": "2.0.0",
             "scope_hash": "a" * 64, "capability_hash": "b" * 64},
         csw_authority_identity={},

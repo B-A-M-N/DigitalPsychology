@@ -6,7 +6,9 @@ import uuid
 from typing import Any, Mapping, Sequence
 
 from ..behavior_state import FrameworkSignal, GoalSetSnapshot
-from ..control_protocol import (CONTROL_BOUNDARY_KINDS, ControlAbortRequest,
+from ..control_protocol import (ACTION_INDEX_BOUNDARIES,
+                                CANDIDATE_ACTION_BOUNDARIES,
+                                CONTROL_BOUNDARY_KINDS, ControlAbortRequest,
                                 ControlCommitRequest, ControlTickRequest)
 from ..outcomes import HostOutcomeFact
 from ..runtime.contracts import ActionCandidate, RuntimeObservation
@@ -32,7 +34,7 @@ class HostTransactionCoordinator:
                     boundary_kind, goal_set=goal_set)
             if not isinstance(observation, RuntimeObservation):
                 raise TypeError("host control-boundary observation is malformed")
-            is_pre_action = boundary_kind in {"pre_action", "pre_action_rejected"}
+            is_pre_action = boundary_kind in CANDIDATE_ACTION_BOUNDARIES
             if observation.action_completed != (boundary_kind == "post_action"):
                 raise ValueError("only post-action boundaries confirm a completed host action")
             if is_pre_action != (observation.candidate_action is not None):
@@ -43,26 +45,21 @@ class HostTransactionCoordinator:
             if ((boundary_kind == "pre_action_rejected")
                     != (observation.candidate_rejection_stage is not None)):
                 raise ValueError("rejected candidate boundary must identify the CFW gate stage")
+            if boundary_kind == "post_action":
+                changed = self.host._expire_local_leases(
+                    observation.action_index, expire_cfw=True)
+                if changed and self.host._remote_open:
+                    await self.host._connect_or_degrade_locked()
             if not self.host._remote_open or self.host._needs_reconciliation:
-                if not await self.host._connect_or_degrade_locked(
-                        host_action_index=(observation.action_index
-                                           if boundary_kind in {"pre_action", "post_action"}
-                                           else None)):
-                    if boundary_kind in {"pre_action", "post_action"}:
-                        self.host._expire_local_leases(
-                            observation.action_index, expire_cfw=True)
+                if not await self.host._connect_or_degrade_locked():
                     return self.host._status()
-            if (boundary_kind in {"pre_action", "post_action"}
-                    and self.host._expire_local_leases(
-                        observation.action_index, expire_cfw=True)):
-                await self.host._reconcile_locked()
             goals = goal_set or observation.goal_set or self.host.goal_set
             if not isinstance(goals, GoalSetSnapshot):
                 raise ValueError("host must provide a complete goal-set snapshot")
             if goals.revision < self.host.goal_set.revision:
                 raise ValueError("host goal-set revision moved backwards")
             observation = replace(observation, goal_set=goals)
-            if boundary_kind in {"pre_action", "pre_action_rejected", "post_action"}:
+            if boundary_kind in ACTION_INDEX_BOUNDARIES:
                 expected_candidate_index = max(1, self.host._action_index + 1)
                 if observation.action_index != expected_candidate_index:
                     raise ValueError(
@@ -81,6 +78,7 @@ class HostTransactionCoordinator:
                               candidate_action: ActionCandidate | None = None,
                               candidate_preflight_result: str | None = None,
                               candidate_rejection_stage: str | None = None,
+                              candidate_gate_receipts: Mapping[str, Any] | None = None,
                               cfw_preflight_decision: str | None = None,
                               cfw_final_decision: str | None = None
                               ) -> RuntimeObservation:
@@ -102,6 +100,7 @@ class HostTransactionCoordinator:
                                 and candidate_action.approach_epoch else
                                 prior.approach_epoch if prior else ""),
                 candidate_action=candidate_action,
+                candidate_gate_receipts=candidate_gate_receipts,
                 candidate_preflight_result=candidate_preflight_result,
                 candidate_rejection_stage=candidate_rejection_stage,
                 cfw_preflight_decision=cfw_preflight_decision,
@@ -122,6 +121,7 @@ class HostTransactionCoordinator:
             active_trigger_codes=(prior.active_trigger_codes if prior else ()),
             approach_epoch=prior.approach_epoch if prior else "",
             candidate_action=candidate_action,
+            candidate_gate_receipts=candidate_gate_receipts,
             candidate_preflight_result=candidate_preflight_result,
             candidate_rejection_stage=candidate_rejection_stage,
             cfw_preflight_decision=cfw_preflight_decision,
@@ -135,7 +135,8 @@ class HostTransactionCoordinator:
                                  ) -> Mapping[str, Any]:
         snapshot, _candidates = self.host._csw_snapshot()
         self.host._boundary_sequence += 1
-        cfw_signals = list(self.host._cfw_signals(observation))
+        cfw_signal_batch = self.host._cfw_signal_batch(observation)
+        cfw_signals = list(cfw_signal_batch.signals)
         if observation.candidate_preflight_result is not None:
             cfw_signals = cfw_signals[:31]
             # A criterion-free diagnostic/support candidate is legal, so the
@@ -158,6 +159,7 @@ class HostTransactionCoordinator:
             goal_set=goals,
             cfw_signals=tuple(cfw_signals),
             csw_snapshot=snapshot,
+            cfw_signal_cursor=cfw_signal_batch.next_cursor,
             outcome_facts=tuple(outcome_facts),
             boundary_kind=boundary_kind,
             boundary_sequence=self.host._boundary_sequence,
@@ -167,9 +169,6 @@ class HostTransactionCoordinator:
         except Exception as exc:
             if self.host._transport_failure(exc):
                 self.host._needs_reconciliation = True
-                if boundary_kind in {"pre_action", "post_action"}:
-                    self.host._expire_local_leases(
-                        observation.action_index, expire_cfw=True)
                 return self.host._degraded("DP control prepare unavailable", exc)
             raise
         if prepared.get("status") == "committed":
@@ -179,6 +178,12 @@ class HostTransactionCoordinator:
             self.host._accept_committed(result, goals)
             self.host._record_system_one_observation(prepared, tick_status="committed")
             self.host._offline_controls_expired = False
+            try:
+                self.host._acknowledge_cfw_signals(cfw_signal_batch.next_cursor)
+            except Exception as exc:
+                self.host._needs_reconciliation = True
+                return self.host._degraded(
+                    "CFW signal acknowledgement failed; reconciliation required", exc)
             return self.host._status(result)
         if prepared.get("status") == "aborted":
             raise RuntimeError("DP returned an aborted control tick for a new action")
@@ -241,4 +246,10 @@ class HostTransactionCoordinator:
         self.host._offline_controls_expired = False
         self.host._fault = None
         self.host._needs_reconciliation = False
+        try:
+            self.host._acknowledge_cfw_signals(cfw_signal_batch.next_cursor)
+        except Exception as exc:
+            self.host._needs_reconciliation = True
+            return self.host._degraded(
+                "CFW signal acknowledgement failed; reconciliation required", exc)
         return self.host._status(result)

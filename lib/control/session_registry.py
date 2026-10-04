@@ -12,7 +12,14 @@ class SessionRegistryMethods:
         descriptor = ControlSessionDescriptor.from_mapping(raw)
         self._validate_session_capabilities(descriptor)
         scope = descriptor.control_session_id
-        self.state_store.register_control_session(scope, descriptor.to_dict())
+        from ..telemetry.behavioral_trace import provider_attestation
+        factory = self.engine.system_one_frame_factory
+        provider_identity = {
+            "factory_configured": factory is not None,
+            "attestation": provider_attestation(factory),
+        }
+        self.state_store.register_control_session(
+            scope, descriptor.to_dict(), provider_identity=provider_identity)
         record = self.state_store.load(scope)
         return {
             "protocol_version": PROTOCOL_VERSION,
@@ -42,7 +49,7 @@ class SessionRegistryMethods:
             if (descriptor.cfw_authority_identity.get("adapter_kind")
                     != "cfw-component-runtime"
                     or descriptor.cfw_authority_identity.get(
-                        "adapter_protocol_version") != "1.0.0"):
+                        "adapter_protocol_version") != "1.2.0"):
                 raise ValueError("CFW adapter identity or protocol version is incompatible")
             actual = descriptor.cfw_authority_identity.get(
                 "behavior_projection_version")
@@ -54,7 +61,7 @@ class SessionRegistryMethods:
             if (descriptor.csw_authority_identity.get("adapter_kind")
                     != "csw-workflow-authority"
                     or descriptor.csw_authority_identity.get(
-                        "adapter_protocol_version") != "1.0.0"):
+                        "adapter_protocol_version") != "1.1.0"):
                 raise ValueError("CSW adapter identity or protocol version is incompatible")
             actual = descriptor.csw_authority_identity.get("workflow_port_version")
             if actual != CSW_WORKFLOW_PORT_VERSION:

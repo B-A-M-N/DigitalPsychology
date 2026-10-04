@@ -66,6 +66,10 @@ class BehaviorStateStore:
                     descriptor_json TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('open', 'closed'))
                 );
+                CREATE TABLE IF NOT EXISTS control_session_provider_identity (
+                    scope TEXT PRIMARY KEY,
+                    provider_identity_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS control_ticks (
                     scope TEXT NOT NULL,
                     tick_id TEXT NOT NULL,
@@ -336,8 +340,11 @@ class BehaviorStateStore:
                     raise RuntimeError("prepared control tick changed during commit")
             database.commit()
 
-    def register_control_session(self, scope: str, descriptor: Mapping[str, Any]) -> None:
+    def register_control_session(self, scope: str, descriptor: Mapping[str, Any], *,
+                                  provider_identity: Mapping[str, Any] | None = None) -> None:
         encoded = json.dumps(dict(descriptor), sort_keys=True, separators=(",", ":"))
+        encoded_provider = json.dumps(
+            dict(provider_identity or {}), sort_keys=True, separators=(",", ":"))
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             row = database.execute(
@@ -354,6 +361,18 @@ class BehaviorStateStore:
                 database.execute(
                     "INSERT INTO control_sessions(scope, descriptor_json, status) "
                     "VALUES (?, ?, 'open')", (scope, encoded))
+                database.execute(
+                    "INSERT INTO control_session_provider_identity(scope, provider_identity_json) "
+                    "VALUES (?, ?)", (scope, encoded_provider))
+            if row is not None:
+                provider_row = database.execute(
+                    "SELECT provider_identity_json FROM control_session_provider_identity "
+                    "WHERE scope=?", (scope,)).fetchone()
+                # Legacy sessions have no provider pin. Keep them explicitly
+                # unbound rather than claiming the current process was original.
+                if provider_row is not None and provider_row[0] != encoded_provider:
+                    database.rollback()
+                    raise RuntimeError("control session provider identity has changed")
             database.commit()
 
     def control_session(self, scope: str) -> Mapping[str, Any] | None:
@@ -361,9 +380,14 @@ class BehaviorStateStore:
             row = database.execute(
                 "SELECT descriptor_json, status FROM control_sessions WHERE scope=?",
                 (scope,)).fetchone()
+            provider_row = database.execute(
+                "SELECT provider_identity_json FROM control_session_provider_identity "
+                "WHERE scope=?", (scope,)).fetchone()
         if row is None:
             return None
-        return {"descriptor": json.loads(row[0]), "status": str(row[1])}
+        return {"descriptor": json.loads(row[0]), "status": str(row[1]),
+                "provider_identity": (json.loads(provider_row[0])
+                                      if provider_row is not None else None)}
 
     def prepare_control_tick(self, scope: str, *, tick_id: str,
                              request_digest: str, basis: Mapping[str, Any],

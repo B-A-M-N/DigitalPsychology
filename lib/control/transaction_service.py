@@ -6,7 +6,8 @@ import json
 from typing import Any, Mapping, Sequence
 
 from ..behavior_state import (BehaviorDirective, BehaviorState, BehavioralDecision,
-                              CSWBehaviorSnapshot, InterventionOutcome)
+                              CSWBehaviorSnapshot, InterventionOutcome,
+                              group_behavioral_causes)
 from ..outcomes import InterventionEventContext
 from ..runtime.projection import (build_behavior_projection,
                                   project_behavior_context)
@@ -102,12 +103,19 @@ class ControlTransactionMethods:
             "boundary_sequence": request.boundary_sequence,
             "goal_set_revision": request.goal_set.revision,
             "cfw_lifecycle_revision": request.cfw_lifecycle_revision,
+            "cfw_signal_cursor": request.cfw_signal_cursor,
+            "cfw_signal_causes": [cause.to_dict()
+                                  for cause in group_behavioral_causes(
+                                      request.cfw_signals)],
             "csw_selection_revision": request.csw_snapshot.revision,
             "csw_snapshot_id": request.csw_snapshot.snapshot_id,
             "csw_active_stateworks": list(request.csw_snapshot.active_stateworks),
             "csw_eligible_stateworks": [
                 item.statework_id for item in request.csw_snapshot.eligible_stateworks],
             "csw_workflow_revisions": dict(request.csw_snapshot.workflow_revisions),
+            "csw_dependency_retention": {
+                key: list(value)
+                for key, value in request.csw_snapshot.dependency_retention.items()},
             "goal_set": request.goal_set.to_dict(),
             "attention_fairness_bound_actions": preparation.fairness_bound_actions,
             "attention_starvation_prevented": list(preparation.starvation_prevented),
@@ -121,6 +129,10 @@ class ControlTransactionMethods:
                 "equivalent_retry_count": request.observation.equivalent_retry_count,
                 "candidate_preflight_result": request.observation.candidate_preflight_result,
                 "candidate_rejection_stage": request.observation.candidate_rejection_stage,
+                "candidate_gate_receipts": (
+                    {stage: {**dict(receipt), "reason_codes": list(receipt["reason_codes"])}
+                     for stage, receipt in request.observation.candidate_gate_receipts.items()}
+                    if request.observation.candidate_gate_receipts is not None else None),
                 "cfw_preflight_decision": request.observation.cfw_preflight_decision,
                 "cfw_final_decision": request.observation.cfw_final_decision,
                 "evidence_refs": list(request.observation.evidence_refs),
@@ -371,6 +383,8 @@ class ControlTransactionMethods:
                 latest_basis.get("cfw_projection_action_index", max(0, record.action_index))
                 if latest_basis else max(0, record.action_index)),
             "boundary_sequence": self.state_store.latest_boundary_sequence(scope),
+            "committed_cfw_signal_cursor": int(
+                latest_basis.get("cfw_signal_cursor", 0) if latest_basis else 0),
             "goal_set": latest_goal_set.to_dict(),
             "cfw_lifecycle_revision": data["cfw_lifecycle_revision"],
             "csw_snapshot": csw.to_dict(),

@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from ..behavior_state import BehaviorState, CSWBehaviorSnapshot
+from ..behavior_state import (BehaviorState, CSWBehaviorSnapshot,
+                              StateWorkReleaseResult)
 from ..lease_window import intervention_expiry
 from ..runtime.cfw_projection import build_cfw_behavior_projection
 
@@ -101,14 +102,29 @@ class ControlActuator:
                         **directive,
                         "expires_at_action": self._directive_expiry(directive),
                     }))
-                    snapshot = self.csw.deactivate_statework(
+                    release_result = self.csw.deactivate_statework(
                         statework_id,
                         expected_selection_revision=snapshot.revision,
                         candidate_statework_ids=candidate_ids,
                         intervention_id=intervention_id,
                     )
-                    if statework_id in snapshot.active_stateworks:
-                        raise RuntimeError("CSW did not confirm StateWork release")
+                    if isinstance(release_result, StateWorkReleaseResult):
+                        snapshot = release_result.snapshot
+                        if release_result.disposition == "owner_mismatch":
+                            raise RuntimeError(
+                                "CSW rejected StateWork release ownership")
+                        if release_result.disposition == "retained_required":
+                            if (statework_id not in snapshot.active_stateworks
+                                    or not set(release_result.required_by).issubset(
+                                        snapshot.active_stateworks)):
+                                raise RuntimeError(
+                                    "CSW retained StateWork without an active dependent")
+                        elif statework_id in snapshot.active_stateworks:
+                            raise RuntimeError("CSW did not confirm StateWork release")
+                    else:
+                        snapshot = release_result
+                        if statework_id in snapshot.active_stateworks:
+                            raise RuntimeError("CSW did not confirm StateWork release")
                 else:
                     eligible = {item.statework_id for item in snapshot.eligible_stateworks}
                     if directive.get("value") != "preferred" or statework_id not in eligible:

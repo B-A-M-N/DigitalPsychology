@@ -53,6 +53,27 @@ def build_behavior_projection(state: BehaviorState,
         "Keep work tied to required criteria. Make progress on the current focus, "
         "then return to any remaining required criteria.")
 
+    lines.append(f"Current operating mode: {state.cognitive_mode.lower().replace('_', ' ')}.")
+    exploration_guidance = {
+        "disabled": "Do not explore unrelated alternatives; continue with the current goal-linked path.",
+        "low": "Keep exploration small and use it only to resolve a needed uncertainty.",
+        "normal": "Explore when it can reduce uncertainty or unblock a required criterion.",
+        "bounded": "Compare only a few goal-linked alternatives before choosing a next step.",
+    }
+    lines.append(exploration_guidance[state.exploration_budget])
+    context_guidance = {
+        "standard": "Use the relevant task context when planning the next step.",
+        "compact": "Keep working context concise and retain only details needed for the next step.",
+        "criterion_focused": "Center working context on the current focus criteria and their evidence.",
+    }
+    lines.append(context_guidance[state.context_strategy])
+    response_guidance = {
+        "direct": "Keep the response direct and focused on the requested result.",
+        "detailed": "Explain the result and the evidence behind it with useful detail.",
+        "structured": "Organize the response into clear sections or steps when useful.",
+    }
+    lines.append(response_guidance[state.response_strategy])
+
     if state.retry_policy in {"materially_different_only", "no_retry"}:
         lines.append(
             "After a failed attempt, change the approach before retrying; repeated "
@@ -78,6 +99,15 @@ def build_behavior_projection(state: BehaviorState,
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     audit = {
         "behavior_revision": state.revision,
+        "model_controls": {
+            "cognitive_mode": state.cognitive_mode,
+            "exploration_budget": state.exploration_budget,
+            "context_strategy": state.context_strategy,
+            "response_strategy": state.response_strategy,
+            "verification_intensity": state.verification_intensity,
+            "retry_policy": state.retry_policy,
+            "recovery_level": state.recovery_level,
+        },
         "goal_set_revision": goal_set.revision if goal_set is not None else None,
         "goal_set_counts": dict(counts),
         "attention_lease": (state.attention_lease.to_dict()
