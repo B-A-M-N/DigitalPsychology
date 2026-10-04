@@ -5,8 +5,9 @@ from dataclasses import replace
 from typing import Any, Callable, Mapping
 
 from ..behavior_state import (
-    BehaviorDirective, BehaviorIntervention, BehaviorState, BehavioralDecision,
-    InterventionOutcome, InterventionTarget, ModeLease,
+    MAX_ACTIVE_INTERVENTIONS, MAX_TARGETS_PER_INTERVENTION, BehaviorDirective,
+    BehaviorIntervention, BehaviorState, BehavioralDecision, InterventionOutcome,
+    InterventionTarget, ModeLease,
 )
 from .fast_loop_input import FastLoopInput
 from .interventions import InterventionStateBuilder, _mode_exit_condition
@@ -57,6 +58,8 @@ class DirectiveBuilder:
                                       | {current_condition_ids[cause]
                                          for cause in previously_effective & triggers})
             grouped: dict[str, list[tuple[str, str, str, str]]] = {}
+            intervention_capacity_exhausted = False
+            target_capacity_exhausted = False
             for target, value, cause, effect in proposed:
                 if (target.startswith("framework:")
                         and target.split(":", 1)[1].lower()
@@ -73,6 +76,12 @@ class DirectiveBuilder:
                 target_criteria = tuple(next_focus or attention_ids)[:8]
                 condition = condition_for(cause, target_criteria)
                 if condition.condition_id in existing_condition_ids:
+                    continue
+                if len(interventions) >= MAX_ACTIVE_INTERVENTIONS:
+                    intervention_capacity_exhausted = True
+                    continue
+                if len(target_values) > MAX_TARGETS_PER_INTERVENTION:
+                    target_capacity_exhausted = True
                     continue
                 expected_effect = target_values[0][3]
                 expiry = 1 if cause == "progress_observed" else self.intervention_expiry_actions
@@ -134,7 +143,7 @@ class DirectiveBuilder:
                 attention_lease=context.attention_lease,
                 attention_last_seen=context.attention_last_seen,
                 active_stateworks=context.csw_snapshot.active_stateworks,
-                active_interventions=tuple(interventions[-16:]),
+                active_interventions=tuple(interventions),
                 intervention_history=tuple(
                     (list(original.intervention_history) + outcomes)[-32:]),
                 # WARD's hard floor is invariant in BehaviorState.
@@ -155,23 +164,31 @@ class DirectiveBuilder:
                                   if item.intervention_id not in prior_intervention_ids), None)
                 if new_owner is not None:
                     intervention = new_owner
-                    updated = replace(
-                        intervention,
-                        targets=intervention.targets + (InterventionTarget(
-                            target=f"statework:{preference[0]}",
-                            previous_value="unselected", applied_value="preferred"),))
-                    interventions = [updated if item.intervention_id == updated.intervention_id
-                                     else item for item in working.active_interventions]
-                    working = replace(working, active_interventions=tuple(interventions[-16:]))
+                    if len(intervention.targets) >= MAX_TARGETS_PER_INTERVENTION:
+                        target_capacity_exhausted = True
+                        preference = ()
+                    else:
+                        updated = replace(
+                            intervention,
+                            targets=intervention.targets + (InterventionTarget(
+                                target=f"statework:{preference[0]}",
+                                previous_value="unselected", applied_value="preferred"),))
+                        interventions = [updated if item.intervention_id == updated.intervention_id
+                                         else item for item in working.active_interventions]
+                        working = replace(working, active_interventions=tuple(interventions))
                 elif working.active_interventions:
                     # Do not overlap a new workflow-selection intervention with a
                     # still-evaluating behavior change. Reconsider after its
                     # evidence window closes.
                     preference = ()
                 else:
+                    if len(interventions) >= MAX_ACTIVE_INTERVENTIONS:
+                        intervention_capacity_exhausted = True
+                        preference = ()
+                if preference and new_owner is None and not working.active_interventions:
                     condition = condition_for(
                         "statework_fit", tuple(next_focus or attention_ids)[:8])
-                    window = lease_window(
+                    statework_window = lease_window(
                         "PRE_ACTION" if context.pre_action else "POST_ACTION",
                         context.host_action_index, 1)
                     intervention = self.intervention_state_builder.new_intervention(
@@ -179,10 +196,10 @@ class DirectiveBuilder:
                         expected_effect="Use the eligible StateWork that best fits the current behavioral mode; CSW validates and commits it.",
                         targets=((f"statework:{preference[0]}", "unselected", "preferred"),),
                         expiry=1,
-                        expires_at_action=window.expires_at_action,
+                        expires_at_action=statework_window.expires_at_action,
                         target_criteria=tuple(next_focus or attention_ids),
                         baseline_criterion_status=context.criterion_status,
-                        baseline_action_index=max(0, window.effective_from_action - 1),
+                        baseline_action_index=max(0, statework_window.effective_from_action - 1),
                         concurrent_intervention_ids=tuple(
                             item.intervention_id for item in interventions),
                         baseline_goal_set=context.goal_set,
@@ -190,20 +207,31 @@ class DirectiveBuilder:
                         condition_id=condition.condition_id,
                         condition_basis_digest=condition.condition_basis_digest)
                     interventions = list(working.active_interventions) + [intervention]
+                    working = replace(working, active_interventions=tuple(interventions))
                 if preference:
+                    owner = intervention
+                    owner_expiry = owner.expires_at_action
+                    if owner_expiry is None:
+                        raise RuntimeError("StateWork owner has no absolute lease expiry")
                     directive = BehaviorDirective(
                         directive_id="dir-" + self.digest({
                             "intervention": intervention.intervention_id,
                             "statework": preference[0]})[:24],
                         operation="prefer_statework", target=preference[0], value="preferred",
                         cause=intervention.cause, expected_effect=intervention.expected_effect,
-                                scope=context.scope, expires_after_actions=1,
-                                intervention_id=intervention.intervention_id,
-                                expires_at_action=window.expires_at_action)
+                        scope=context.scope,
+                        expires_after_actions=owner.expires_after_actions,
+                        intervention_id=owner.intervention_id,
+                        expires_at_action=owner_expiry)
                     directives.append(directive)
-                    working = replace(working, active_interventions=tuple(interventions[-16:]))
+                    working = replace(working, active_interventions=tuple(interventions))
             else:
                 preference = ()
+
+            if intervention_capacity_exhausted:
+                reason = "intervention_capacity_exhausted"
+            elif target_capacity_exhausted:
+                reason = "intervention_target_capacity_exhausted"
 
             decision_id = "decision-" + self.digest({
                 "scope": context.scope, "revision": original.revision,

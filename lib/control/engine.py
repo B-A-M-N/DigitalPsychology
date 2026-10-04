@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from ..attention import schedule_attention
-from ..behavior_state import (BehaviorIntervention, BehavioralDecision,
+from ..behavior_state import (BehaviorIntervention, BehaviorState, BehavioralDecision,
                               CSWBehaviorSnapshot, FrameworkSignal,
                               GoalSetSnapshot, InterventionOutcome)
 from ..fast_loop import FastLoopInput
@@ -70,12 +70,10 @@ class ControlDecisionEngine:
         if goal_set.revision < descriptor.initial_goal_set.revision:
             raise ValueError("host goal-set revision moved backwards")
         boundary_kind = request.boundary_kind
-        if boundary_kind in {"pre_action", "post_action"}:
-            if request.observation.action_index <= record.action_index:
-                raise ValueError("action boundaries must advance the completed action index")
-        elif boundary_kind == "pre_action_rejected":
-            if request.observation.action_index != max(0, record.action_index):
-                raise ValueError("rejected candidates must retain the completed action index")
+        if boundary_kind in {"pre_action", "pre_action_rejected", "post_action"}:
+            expected_candidate_index = max(1, record.action_index + 1)
+            if request.observation.action_index != expected_candidate_index:
+                raise ValueError("action boundary must use the next sequential candidate index")
         elif request.observation.action_index != max(0, record.action_index):
             raise ValueError("non-action boundary must refer to the current action index")
         if boundary_kind == "pre_action" and (
@@ -188,7 +186,8 @@ class ControlDecisionEngine:
             raise RuntimeError("DP controller returned a stale behavior revision")
         if decision.state.attention_lease != attention.lease:
             raise RuntimeError("DP controller did not apply the host attention lease")
-        self._validate_directives(descriptor, request.csw_snapshot, decision)
+        self._validate_directives(descriptor, request.csw_snapshot, decision,
+                                  prior_state=record.state)
         return DecisionPreparation(
             decision, system_one_frame, system_one_result,
             system_one_query_attempted, system_one_judgment_returned,
@@ -270,13 +269,24 @@ class ControlDecisionEngine:
     @staticmethod
     def _validate_directives(descriptor: ControlSessionDescriptor,
                              snapshot: CSWBehaviorSnapshot,
-                             decision: BehavioralDecision) -> None:
+                             decision: BehavioralDecision, *,
+                             prior_state: BehaviorState | None = None) -> None:
         if len(decision.preferred_stateworks) > 1:
             raise ValueError("DP may request at most one CSW StateWork activation")
         eligible = {item.statework_id for item in snapshot.eligible_stateworks}
         active = set(snapshot.active_stateworks)
         framework_ids = set(descriptor.available_frameworks)
+        owners = {
+            item.intervention_id: item
+            for state in (prior_state, decision.state) if state is not None
+            for item in state.active_interventions
+        }
         for directive in decision.directives:
+            owner = owners.get(directive.intervention_id)
+            if owner is None:
+                raise ValueError("DP directive has no live or closing intervention owner")
+            if directive.expires_at_action != owner.expires_at_action:
+                raise ValueError("DP directive expiry differs from its intervention owner")
             if directive.operation in {"prefer_statework", "release_statework"}:
                 if directive.operation == "prefer_statework":
                     if directive.target not in eligible or directive.value != "preferred":

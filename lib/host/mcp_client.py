@@ -22,6 +22,7 @@ from ..control_protocol import PROTOCOL_VERSION
 _CONTROL_TOOLS = frozenset({
     "open_control_session", "prepare_control_tick", "commit_control_tick",
     "abort_control_tick", "reconcile_control_session", "close_control_session",
+    "read_behavioral_trial_record",
 })
 
 
@@ -119,6 +120,14 @@ class MCPControlClient:
 
     async def close_control_session(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return await self._call("close_control_session", {"request": dict(request)})
+
+    async def behavioral_trial_record(self, control_session_id: str, *,
+                                      trial_id: str) -> dict[str, Any]:
+        return await self._call("read_behavioral_trial_record", {"request": {
+            "protocol_version": PROTOCOL_VERSION,
+            "control_session_id": control_session_id,
+            "trial_id": trial_id,
+        }})
 
     async def _call(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         if name not in _CONTROL_TOOLS:

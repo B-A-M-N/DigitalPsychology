@@ -541,7 +541,7 @@ class BehaviorStateStore:
         with self._connect() as database:
             row = database.execute(
                 "SELECT basis_json FROM control_ticks WHERE scope=? AND status='committed' "
-                "ORDER BY created_at DESC LIMIT 1", (scope,)).fetchone()
+                "ORDER BY boundary_sequence DESC LIMIT 1", (scope,)).fetchone()
         return json.loads(row[0]) if row is not None else None
 
     def latest_boundary_sequence(self, scope: str) -> int:

@@ -63,6 +63,8 @@ class HostReconciler:
             raise RuntimeError("DP reconciliation returned malformed pending decisions")
         self.host._state = BehaviorState.from_mapping(response["behavior_state"])
         self.host._action_index = int(response["host_action_index"])
+        self.host._cfw_projection_action_index = int(response.get(
+            "cfw_projection_action_index", max(0, self.host._action_index)))
         self.host._boundary_sequence = int(response.get("boundary_sequence", -1))
         self.host.goal_set = self.host._reported_goal_set(response)
         unresolved = False
@@ -77,13 +79,15 @@ class HostReconciler:
             })
             self.host._state = BehaviorState.from_mapping(response["behavior_state"])
             self.host._action_index = int(response["host_action_index"])
+            self.host._cfw_projection_action_index = int(response.get(
+                "cfw_projection_action_index", max(0, self.host._action_index)))
             self.host._boundary_sequence = int(response.get("boundary_sequence", -1))
             self.host.goal_set = self.host._reported_goal_set(response)
         if not response.get("pending_decisions"):
             actual = self.host.actuator.applied_behavior_projection()
             expected = build_cfw_behavior_projection(
                 self.host._state,
-                host_action_index=max(0, self.host._action_index)).to_dict()
+                host_action_index=self.host._cfw_projection_action_index).to_dict()
             if self.host._cfw_components and not self.host._same_cfw_projection(
                     actual, expected):
                 self.host.actuator.synchronize_behavior_projection(expected)
@@ -115,7 +119,8 @@ class HostReconciler:
         snapshot, candidates = self.host._csw_snapshot()
         actual_cfw = self.host.actuator.applied_behavior_projection()
         expected_cfw = build_cfw_behavior_projection(
-            candidate, host_action_index=int(basis["host_action_index"])).to_dict()
+            candidate, host_action_index=int(basis.get(
+                "cfw_projection_action_index", basis["host_action_index"]))).to_dict()
         cfw_matches = (not self.host._cfw_components or (
             self.host._same_cfw_projection(actual_cfw, expected_cfw)
             and self.host._current_cfw_revision() == int(candidate["revision"])))
@@ -184,7 +189,7 @@ class HostReconciler:
             try:
                 committed_projection = build_cfw_behavior_projection(
                     committed_state,
-                    host_action_index=max(0, self.host._action_index)).to_dict()
+                    host_action_index=self.host._cfw_projection_action_index).to_dict()
                 self.host.actuator.restore_behavior_projection(
                     committed_projection,
                     expected_current_revision=self.host._current_cfw_revision(),
@@ -223,6 +228,9 @@ class HostReconciler:
             raise RuntimeError("DP did not commit the host control decision")
         self.host._state = BehaviorState.from_mapping(result["behavior_state"])
         self.host._action_index = int(result["host_action_index"])
+        self.host._cfw_projection_action_index = int(result.get(
+            "cfw_projection_action_index", result.get(
+                "candidate_action_index", max(0, self.host._action_index))))
         self.host._boundary_sequence = int(result.get(
             "boundary_sequence", self.host._boundary_sequence))
         self.host.goal_set = goal_set

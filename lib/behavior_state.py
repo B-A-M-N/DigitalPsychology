@@ -692,7 +692,7 @@ class BehaviorDirective:
     scope: str
     expires_after_actions: int
     intervention_id: str
-    expires_at_action: int | None = None
+    expires_at_action: int
 
     def __post_init__(self) -> None:
         for name in ("directive_id", "target", "cause", "scope", "intervention_id"):
@@ -704,9 +704,7 @@ class BehaviorDirective:
             raise ValueError("unsupported behavior directive operation")
         if not 1 <= self.expires_after_actions <= 64:
             raise ValueError("directive expiry must be between one and 64 actions")
-        if (self.expires_at_action is not None
-                and (type(self.expires_at_action) is not int
-                     or self.expires_at_action < 0)):
+        if type(self.expires_at_action) is not int or self.expires_at_action < 0:
             raise ValueError("directive absolute expiry must be a non-negative action index")
         if self.operation == "set_framework" and self.target.lower() == "ward" \
                 and self.value != "mandatory":
@@ -719,6 +717,23 @@ class BehaviorDirective:
                 "expires_after_actions": self.expires_after_actions,
                 "intervention_id": self.intervention_id,
                 "expires_at_action": self.expires_at_action}
+
+    @classmethod
+    def from_legacy_mapping(cls, value: Mapping[str, Any], *,
+                            host_action_index: int,
+                            boundary_kind: str) -> "BehaviorDirective":
+        """Decode a persisted pre-absolute-expiry directive during migration."""
+        data = dict(value)
+        if data.get("expires_at_action") is None:
+            if type(host_action_index) is not int or host_action_index < 0:
+                raise ValueError("legacy directive action index is invalid")
+            duration = data.get("expires_after_actions")
+            if type(duration) is not int or not 1 <= duration <= 64:
+                raise ValueError("legacy directive duration is invalid")
+            starts_at_candidate = boundary_kind == "pre_action"
+            start = host_action_index if starts_at_candidate else host_action_index + 1
+            data["expires_at_action"] = start + duration - 1
+        return cls(**data)
 
 
 @dataclass(frozen=True)

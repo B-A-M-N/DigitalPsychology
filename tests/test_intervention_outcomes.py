@@ -275,6 +275,7 @@ def test_host_application_and_assessment_are_persisted_as_authenticated_events(t
         cause=intervention.cause, expected_effect=intervention.expected_effect,
         scope=SCOPE, expires_after_actions=3,
         intervention_id=intervention.intervention_id,
+        expires_at_action=3,
     )
     context = InterventionEventContext(
         namespace_id="tenant-a", application_id="assistant",
@@ -310,3 +311,22 @@ def test_host_application_and_assessment_are_persisted_as_authenticated_events(t
     assert assessed["payload"]["behavior_intervention_goal_progress"] is True
     assert assessed["evidence_refs"] == ["criterion"]
     assert {row[0] for row in authenticated} >= {applied_event_id, outcome_event_id}
+
+
+def test_new_directive_requires_absolute_expiry_and_legacy_decoder_is_explicit():
+    values = {
+        "directive_id": "dir-expiry", "operation": "set_mode",
+        "target": "mode", "value": "RECOVER", "cause": "equivalent_retry",
+        "expected_effect": "Change behavior for a bounded action window.",
+        "scope": SCOPE, "expires_after_actions": 3,
+        "intervention_id": "intervention-expiry",
+    }
+    with pytest.raises(TypeError, match="expires_at_action"):
+        BehaviorDirective(**values)
+
+    pre_action = BehaviorDirective.from_legacy_mapping(
+        values, host_action_index=4, boundary_kind="pre_action")
+    post_action = BehaviorDirective.from_legacy_mapping(
+        values, host_action_index=4, boundary_kind="post_action")
+    assert pre_action.expires_at_action == 6
+    assert post_action.expires_at_action == 7

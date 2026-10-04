@@ -68,6 +68,7 @@ class HostControlBridge:
         self._csw_identity = dict(csw_authority_identity or self._authority_identity())
         self._state = BehaviorState()
         self._action_index = -1
+        self._cfw_projection_action_index = 0
         self._boundary_sequence = -1
         self._opened = False
         self._remote_open = False

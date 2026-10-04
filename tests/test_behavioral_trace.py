@@ -78,7 +78,7 @@ def test_semantic_query_attempt_return_use_and_failure_are_separate():
 def test_private_transition_trace_records_semantic_and_drift_outcomes():
     from lib.behavior_state import (BehaviorDirective, BehavioralDecision,
                                     BehaviorState)
-    from lib.control.service import ControlPlaneService
+    from lib.telemetry.trace_builder import build_control_transition_trace
 
     prior = BehaviorState(revision=0)
     state = BehaviorState(revision=1)
@@ -86,7 +86,7 @@ def test_private_transition_trace_records_semantic_and_drift_outcomes():
         directive_id="drift-fix", operation="set_mode", target="mode",
         value="VERIFY", cause="goal_drift", expected_effect="reanchor goal",
         scope="scope-1", expires_after_actions=2,
-        intervention_id="intervention-1")
+        intervention_id="intervention-1", expires_at_action=2)
     decision = BehavioralDecision(
         decision_id="decision-1", scope="scope-1", expected_revision=0,
         state=state, directives=(directive,), reason="goal drift detected")
@@ -95,10 +95,13 @@ def test_private_transition_trace_records_semantic_and_drift_outcomes():
         "boundary_kind": "pre_action", "semantic_query_attempted": True,
         "semantic_judgment_returned": True, "semantic_judgment_used": False,
         "semantic_query_failed": False,
-        "behavioral_facts": {"active_trigger_codes": ["semantic_goal_drift"]},
+        "behavioral_facts": {
+            "active_trigger_codes": ["semantic_goal_drift"],
+            "candidate_rejection_stage": "cfw_final_gate",
+        },
     }
 
-    trace = ControlPlaneService._control_transition_trace(
+    trace = build_control_transition_trace(
         "scope-1", prior, state, decision, basis, ("drift-fix",))
 
     assert trace["semantic_query_attempted"] is True
@@ -107,6 +110,65 @@ def test_private_transition_trace_records_semantic_and_drift_outcomes():
     assert trace["semantic_query_failed"] is False
     assert trace["goal_drift_detected"] is True
     assert trace["goal_drift_intervention_applied"] is True
+    assert trace["ward_hard_safety"] is False
+    assert trace["justification_class"] == "heuristic"
+
+
+def test_private_cfw_signal_codes_normalize_retry_drift_and_hard_safety():
+    from lib.behavior_state import BehavioralDecision, BehaviorState
+    from lib.telemetry.trace_builder import build_control_transition_trace
+
+    prior = BehaviorState(revision=0)
+    state = BehaviorState(revision=1)
+    decision = BehavioralDecision(
+        decision_id="signals", scope="scope-1", expected_revision=0,
+        state=state, directives=(), reason="signal observed")
+
+    def transition(code, *, ward=False):
+        return build_control_transition_trace(
+            "scope-1", prior, state, decision,
+            {"boundary_sequence": 0, "host_action_index": 1,
+             "boundary_kind": "pre_action", "behavioral_facts": {
+                 "cfw_signal_codes": [code], "ward_hard_safety": ward,
+                 "candidate_rejection_stage": "cfw_final_gate"}}, ())
+
+    retry = transition("owl.approach_failed")
+    drift = transition("owl.constraint_drift")
+    ward = transition("ward.secret_exposure", ward=True)
+    assert retry["justification_class"] == "heuristic"
+    assert drift["goal_drift_detected"] is True
+    assert drift["ward_hard_safety"] is False
+    assert ward["justification_class"] == "hard_safety"
+
+
+def test_material_progress_requires_a_criterion_revision_delta():
+    from lib.behavior_state import GoalItemSnapshot, GoalSetSnapshot
+    from lib.telemetry.material_progress import material_progress_delta
+
+    before = GoalSetSnapshot(revision=4, items=(
+        GoalItemSnapshot(criterion_id="a", material_progress_revision=2),
+        GoalItemSnapshot(criterion_id="b", material_progress_revision=1),
+    ))
+    after = GoalSetSnapshot(revision=5, items=(
+        GoalItemSnapshot(criterion_id="a", material_progress_revision=2),
+        GoalItemSnapshot(criterion_id="b", material_progress_revision=3),
+    ))
+    assert material_progress_delta(before, after) == ("b",)
+
+
+def test_private_dwell_uses_all_boundaries_and_allows_zero_action_dwell():
+    trace = BehavioralTrace()
+    trace.record_control_transition({
+        "boundary_sequence": 7, "host_action_index": 10,
+        "prior_mode": "DELIVER", "resulting_mode": "VERIFY",
+        "justification_class": "heuristic"})
+    trace.record_control_transition({
+        "boundary_sequence": 8, "host_action_index": 10,
+        "prior_mode": "VERIFY", "resulting_mode": "DELIVER",
+        "justification_class": "heuristic"})
+    record = trace.to_dict(trial_id="same-action-mode-flip")
+    assert record["median_mode_dwell_actions"] == 0.0
+    assert record["median_mode_dwell_boundaries"] == 1.0
 
 
 # -- mode thrash --------------------------------------------------------
@@ -236,6 +298,18 @@ def test_projection_churn_counts_distinct_digests():
     # Three real replacements, two of which changed the projected guidance.
     assert trace.projection_updates == 4
     assert trace.unique_projection_digests == 3
+
+
+def test_action_trace_persists_only_canonical_semantic_fields():
+    row = _action(0, semantic_attempted=True, semantic_result=True,
+                  semantic_used=True, semantic_failed=False).to_dict()
+    assert row["semantic_query_attempted"] is True
+    assert row["semantic_judgment_returned"] is True
+    assert row["semantic_judgment_used"] is True
+    assert row["semantic_query_failed"] is False
+    assert not {"semantic_query", "semantic_attempted", "semantic_result",
+                "semantic_used", "semantic_failed"} & set(row)
+    assert ActionTrace.from_dict(row).semantic_used is True
 
 
 def test_trace_is_bounded():

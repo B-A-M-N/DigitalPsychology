@@ -18,7 +18,7 @@
   "$defs": {
     "directive": {
       "type": "object", "additionalProperties": false,
-      "required": ["directive_id", "operation", "target", "value", "cause", "expected_effect", "scope", "expires_after_actions", "intervention_id"],
+      "required": ["directive_id", "operation", "target", "value", "cause", "expected_effect", "scope", "expires_after_actions", "intervention_id", "expires_at_action"],
       "properties": {
         "directive_id": {"type": "string", "minLength": 1, "maxLength": 128},
         "operation": {"enum": ["set_mode", "set_framework", "set_control", "prefer_statework", "release_statework"]},
@@ -29,7 +29,7 @@
         "scope": {"type": "string", "minLength": 1, "maxLength": 256},
         "expires_after_actions": {"type": "integer", "minimum": 1, "maximum": 64},
         "intervention_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "expires_at_action": {"type": ["integer", "null"], "minimum": 0}
+        "expires_at_action": {"type": "integer", "minimum": 0}
       }
     },
     "outcome": {

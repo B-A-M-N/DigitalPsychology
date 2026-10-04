@@ -24,6 +24,8 @@ class ControlTransitionTrace:
     goal_drift_detected: bool
     goal_drift_intervention_applied: bool
     cfw_rejection_stage: str | None
+    model_projection_digest: str | None = None
+    ward_hard_safety: bool = False
     cfw_preflight_decision: str | None = None
     cfw_final_decision: str | None = None
 
@@ -44,7 +46,8 @@ class ControlTransitionTrace:
             raise ValueError("control transition causes must be bounded text")
         for name in ("semantic_query_attempted", "semantic_judgment_returned",
                      "semantic_judgment_used", "semantic_query_failed",
-                     "goal_drift_detected", "goal_drift_intervention_applied"):
+                     "goal_drift_detected", "goal_drift_intervention_applied",
+                     "ward_hard_safety"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"control transition {name} must be a boolean")
         if self.semantic_judgment_returned and not self.semantic_query_attempted:
@@ -58,6 +61,10 @@ class ControlTransitionTrace:
             raise ValueError("control transition CFW rejection stage is invalid")
         if self.justification_class not in JUSTIFICATION_CLASSES:
             raise ValueError("control transition justification class is invalid")
+        if (self.model_projection_digest is not None
+                and (not isinstance(self.model_projection_digest, str)
+                     or len(self.model_projection_digest) != 64)):
+            raise ValueError("control transition projection digest is invalid")
         for name in ("cfw_preflight_decision", "cfw_final_decision"):
             decision = getattr(self, name)
             if decision is not None and decision not in {
@@ -85,6 +92,8 @@ class ControlTransitionTrace:
             "goal_drift_detected": self.goal_drift_detected,
             "goal_drift_intervention_applied": self.goal_drift_intervention_applied,
             "cfw_rejection_stage": self.cfw_rejection_stage,
+            "model_projection_digest": self.model_projection_digest,
+            "ward_hard_safety": self.ward_hard_safety,
             "cfw_preflight_decision": self.cfw_preflight_decision,
             "cfw_final_decision": self.cfw_final_decision,
         }

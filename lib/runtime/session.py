@@ -132,6 +132,7 @@ class RuntimeSession:
             if unknown:
                 raise ValueError(f"host criteria escape the runtime objective: {sorted(unknown)}")
             goal_set = self._goal_set(observation)
+            previous_goal_set = self._latest_goal_set
             if goal_set is not None:
                 goal_ids = {item.criterion_id for item in goal_set.items}
                 if goal_ids != set(self.objective_criteria):
@@ -337,6 +338,7 @@ class RuntimeSession:
                 self._record_behavioral_trace(
                     decision.state, attention=attention,
                     prior_state=record.state, goal_set=goal_set,
+                    previous_goal_set=previous_goal_set,
                     csw_snapshot=updated_snapshot,
                     observation=observation, decision=decision,
                     cfw_signals=signals,
@@ -414,6 +416,7 @@ class RuntimeSession:
     def _record_behavioral_trace(self, state: BehaviorState, *, attention: Any,
                                  prior_state: BehaviorState,
                                  goal_set: GoalSetSnapshot | None,
+                                 previous_goal_set: GoalSetSnapshot | None,
                                  csw_snapshot: CSWBehaviorSnapshot,
                                  observation: RuntimeObservation,
                                  decision: BehavioralDecision,
@@ -467,12 +470,15 @@ class RuntimeSession:
                 self.policy_context.get("host_has_stable_objective_context")),
         )
         projection_digest = model_projection.model.semantic_digest
-        retry = "equivalent_retry" in observation.active_trigger_codes
-        drift_detected = (
-            "goal_drift" in observation.active_trigger_codes
-            or "semantic_goal_drift" in observation.active_trigger_codes
-            or any(signal.active and signal.code in {
-                "goal_drift", "semantic_goal_drift"} for signal in cfw_signals))
+        from ..telemetry.material_progress import (
+            material_progress_delta, normalized_behavior_codes)
+        material_criteria = material_progress_delta(previous_goal_set, goal_set)
+        behavior_codes = normalized_behavior_codes(
+            observation.active_trigger_codes,
+            (signal.code for signal in cfw_signals if signal.active))
+        retry = "equivalent_retry" in behavior_codes
+        drift_detected = bool(
+            behavior_codes & {"goal_drift", "semantic_goal_drift"})
         applied_ids = set(applied_directives)
         drift_applied = any(
             item.directive_id in applied_ids
@@ -481,7 +487,7 @@ class RuntimeSession:
         justification = classify_justification(
             csw_transition=(prior_state.active_stateworks != state.active_stateworks),
             deterministic_host_fact=observation.regression_observed,
-            material_progress=observation.progress_made,
+            material_progress=bool(material_criteria),
             semantic_advisory=semantic_used,
             heuristic=bool(observation.active_trigger_codes or cfw_signals
                            or applied_directives),
@@ -507,6 +513,7 @@ class RuntimeSession:
                 goal_drift_detected=drift_detected,
                 goal_drift_intervention_applied=drift_applied,
                 projection_digest=projection_digest,
+                material_progress_criteria=material_criteria,
                 semantic_query=semantic_attempted,
                 semantic_attempted=semantic_attempted,
                 semantic_result=semantic_judgment_returned,

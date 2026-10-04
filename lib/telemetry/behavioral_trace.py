@@ -142,6 +142,7 @@ class ActionTrace:
     goal_drift_detected: bool = False
     goal_drift_intervention_applied: bool = False
     projection_digest: str | None = None
+    material_progress_criteria: tuple[str, ...] = ()
     semantic_query: bool = False
     semantic_attempted: bool = False
     semantic_result: bool = False
@@ -162,18 +163,21 @@ class ActionTrace:
                            tuple(self.fairness_prevented_criteria))
         object.__setattr__(self, "authoritative_evidence_classes",
                            tuple(self.authoritative_evidence_classes))
+        object.__setattr__(self, "material_progress_criteria",
+                           tuple(self.material_progress_criteria))
         for name in ("semantic_query", "semantic_attempted", "semantic_result",
                      "semantic_judgment_returned", "semantic_used",
                      "semantic_failed", "semantic_query_failed"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"action trace {name} must be a boolean")
-        if self.semantic_judgment_returned and not (
-                self.semantic_attempted or self.semantic_query):
+        semantic_returned = self.semantic_judgment_returned or self.semantic_result
+        semantic_attempted = self.semantic_attempted or self.semantic_query
+        if semantic_returned and not semantic_attempted:
             raise ValueError("a semantic judgment cannot return without a query")
-        if self.semantic_used and not self.semantic_judgment_returned:
+        if self.semantic_used and not semantic_returned:
             raise ValueError("a semantic judgment cannot be used without being returned")
         if (self.semantic_query_failed
-                and not (self.semantic_attempted or self.semantic_query)):
+                and not semantic_attempted):
             raise ValueError("a semantic query cannot fail without being attempted")
         if self.justification_class not in JUSTIFICATION_CLASSES:
             raise ValueError("action trace justification class is invalid")
@@ -205,12 +209,11 @@ class ActionTrace:
             "goal_drift_detected": self.goal_drift_detected,
             "goal_drift_intervention_applied": self.goal_drift_intervention_applied,
             "projection_digest": self.projection_digest,
-            "semantic_query": self.semantic_query,
-            "semantic_attempted": self.semantic_attempted,
-            "semantic_result": self.semantic_result,
-            "semantic_judgment_returned": self.semantic_judgment_returned,
-            "semantic_used": self.semantic_used,
-            "semantic_failed": self.semantic_failed,
+            "material_progress_criteria": list(self.material_progress_criteria),
+            "semantic_query_attempted": self.semantic_attempted or self.semantic_query,
+            "semantic_judgment_returned": (
+                self.semantic_judgment_returned or self.semantic_result),
+            "semantic_judgment_used": self.semantic_used,
             "semantic_query_failed": self.semantic_query_failed,
             "cfw_preflight_rejection": self.cfw_preflight_rejection,
             "cfw_final_rejection": self.cfw_final_rejection,
@@ -224,14 +227,24 @@ class ActionTrace:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ActionTrace":
         data = dict(value)
+        if "semantic_query_attempted" in data:
+            attempted = bool(data.pop("semantic_query_attempted"))
+            data.setdefault("semantic_attempted", attempted)
+            data.setdefault("semantic_query", attempted)
+        if "semantic_judgment_used" in data:
+            data.setdefault("semantic_used", bool(data.pop("semantic_judgment_used")))
         if "semantic_judgment_returned" not in data:
             data["semantic_judgment_returned"] = bool(data.get("semantic_result"))
+        data.setdefault("semantic_result", bool(data["semantic_judgment_returned"]))
         if "semantic_query_failed" not in data:
             data["semantic_query_failed"] = bool(data.get("semantic_failed"))
+        data.setdefault("semantic_failed", bool(data["semantic_query_failed"]))
         for name in ("focus_criteria", "fairness_prevented_criteria",
                      "authoritative_evidence_classes"):
             data[name] = tuple(data.get(name) or ())
         data["attention_ages"] = dict(data.get("attention_ages") or {})
+        data["material_progress_criteria"] = tuple(
+            data.get("material_progress_criteria") or ())
         return cls(**data)
 
     @property
@@ -259,6 +272,7 @@ class BehavioralTrace:
     _mode_history: list[tuple[int, str, str, str]] = field(default_factory=list)
     _control_mode_transitions: list[tuple[int, int, str, str, str]] = field(
         default_factory=list)
+    _control_projection_digests: list[tuple[int, str]] = field(default_factory=list)
 
     def record(self, action: ActionTrace, *, mode_cause: str = "mode_transition") -> None:
         if len(self.actions) >= _MAX_TRACE_ACTIONS:
@@ -292,6 +306,9 @@ class BehavioralTrace:
             raise ValueError("control transition sequence must increase")
         self._control_mode_transitions.append(
             (sequence, action_index, prior_mode, resulting_mode, justification))
+        digest = transition.get("model_projection_digest")
+        if transition.get("boundary_kind") == "pre_model_call" and digest:
+            self._control_projection_digests.append((sequence, str(digest)))
 
     # -- starvation ---------------------------------------------------------
 
@@ -409,10 +426,27 @@ class BehavioralTrace:
     @property
     def median_mode_dwell_actions(self) -> float | None:
         """Median committed actions spent in each mode before the next change."""
+        if self._control_mode_transitions:
+            changes = [item for item in self._control_mode_transitions
+                       if item[2] != item[3]]
+            return self._median_delta([item[1] for item in changes])
         if len(self._mode_history) < 2:
             return None
         boundaries = [entry[0] for entry in self._mode_history]
-        dwells = [b - a for a, b in zip(boundaries, boundaries[1:])]
+        return self._median_delta(boundaries)
+
+    @property
+    def median_mode_dwell_boundaries(self) -> float | None:
+        """Median boundary events spent in each mode before the next change."""
+        if not self._control_mode_transitions:
+            return None
+        changes = [item for item in self._control_mode_transitions
+                   if item[2] != item[3]]
+        return self._median_delta([item[0] for item in changes])
+
+    @staticmethod
+    def _median_delta(values: list[int]) -> float | None:
+        dwells = [b - a for a, b in zip(values, values[1:])]
         if not dwells:
             return None
         ordered = sorted(dwells)
@@ -503,6 +537,7 @@ class BehavioralTrace:
             "mode_transitions": self.mode_transitions,
             "rapid_mode_reversals": self.rapid_mode_reversals,
             "median_mode_dwell_actions": self.median_mode_dwell_actions,
+            "median_mode_dwell_boundaries": self.median_mode_dwell_boundaries,
 
             "equivalent_retries": self.equivalent_retries,
             "goal_drift_detections": self.goal_drift_detections,

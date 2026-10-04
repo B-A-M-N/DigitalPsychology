@@ -62,12 +62,11 @@ class HostTransactionCoordinator:
             if goals.revision < self.host.goal_set.revision:
                 raise ValueError("host goal-set revision moved backwards")
             observation = replace(observation, goal_set=goals)
-            if boundary_kind in {"pre_action", "post_action"}:
-                if observation.action_index <= self.host._action_index:
-                    raise ValueError("action boundary index must advance DP action state")
-            elif boundary_kind == "pre_action_rejected":
-                if observation.action_index != max(0, self.host._action_index):
-                    raise ValueError("rejected candidates cannot advance the host action index")
+            if boundary_kind in {"pre_action", "pre_action_rejected", "post_action"}:
+                expected_candidate_index = max(1, self.host._action_index + 1)
+                if observation.action_index != expected_candidate_index:
+                    raise ValueError(
+                        "candidate action index must be the next sequential action")
             elif observation.action_index != max(0, self.host._action_index):
                 raise ValueError("non-action boundary must refer to the current DP action index")
             result = await self.host._apply_tick_locked(
@@ -85,7 +84,7 @@ class HostTransactionCoordinator:
                               cfw_preflight_decision: str | None = None,
                               cfw_final_decision: str | None = None
                               ) -> RuntimeObservation:
-        if boundary_kind == "pre_action":
+        if boundary_kind in {"pre_action", "pre_action_rejected"}:
             action_index = max(1, self.host._action_index + 1)
             prior = self.host._latest_observation
             return RuntimeObservation(
@@ -103,6 +102,8 @@ class HostTransactionCoordinator:
                                 and candidate_action.approach_epoch else
                                 prior.approach_epoch if prior else ""),
                 candidate_action=candidate_action,
+                candidate_preflight_result=candidate_preflight_result,
+                candidate_rejection_stage=candidate_rejection_stage,
                 cfw_preflight_decision=cfw_preflight_decision,
                 cfw_final_decision=cfw_final_decision,
             )

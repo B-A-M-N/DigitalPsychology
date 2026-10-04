@@ -9,9 +9,10 @@ from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
 from lib.attention import schedule_attention
-from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
-                                GoalItemSnapshot, GoalSetSnapshot, ModeLease,
-                                StateWorkOption)
+from lib.behavior_state import (MAX_ACTIVE_INTERVENTIONS, BehaviorIntervention,
+                                BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
+                                GoalItemSnapshot, GoalSetSnapshot, InterventionTarget,
+                                ModeLease, StateWorkOption)
 from lib.fast_loop import BehavioralController, FastLoopInput
 from lib.mcp_server import DigitalPsychologyService
 
@@ -49,6 +50,45 @@ def test_repeated_equivalent_work_creates_bounded_recovery_and_legal_statework_p
     }
     assert any(target.target == "statework:repair-flow"
                for target in decision.state.active_interventions[0].targets)
+
+
+def test_cfw_only_retry_and_drift_codes_drive_fast_loop_conditions():
+    """OWL/FUSE codes reach the same retry/drift decisions as normalized host codes."""
+    from lib.control.detectors import evaluate_conditions
+    from lib.control.semantic_assessment import SemanticAssessment
+
+    controller = BehavioralController()
+    goals = GoalSetSnapshot(revision=0, items=(
+        GoalItemSnapshot("criterion-1"), GoalItemSnapshot("criterion-2")))
+    from lib.behavior_state import AttentionLease
+    common = dict(
+        scope="tenant/app/agent/session/task/attempt", state=BehaviorState(),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0),
+        objective_criteria=("criterion-1", "criterion-2"), goal_set=goals,
+        attention_lease=AttentionLease(
+            lease_id="retry-focus", criterion_ids=("criterion-1",),
+            issued_revision=0, goal_set_revision=0, start_action=0))
+    retry = FastLoopInput(**common, cfw_signals=(FrameworkSignal(
+        source="owl", code="owl.approach_failed", criterion_id="criterion-1"),))
+    retry_conditions = evaluate_conditions(
+        retry, SemanticAssessment(), retry_threshold=2, support_action_threshold=4,
+        semantic_threshold=0.8)
+    assert retry_conditions.retry is True
+    assert "equivalent_retry" in retry_conditions.trigger_codes
+    retry_decision = controller.decide(retry)
+    assert any(item.cause == "equivalent_retry"
+               for item in retry_decision.state.active_interventions)
+
+    drift = FastLoopInput(**common, cfw_signals=(FrameworkSignal(
+        source="owl", code="owl.constraint_drift", criterion_id="criterion-1"),))
+    drift_conditions = evaluate_conditions(
+        drift, SemanticAssessment(), retry_threshold=2, support_action_threshold=4,
+        semantic_threshold=0.8)
+    assert drift_conditions.drift is True
+    assert "goal_drift" in drift_conditions.trigger_codes
+    drift_decision = controller.decide(drift)
+    assert any(item.cause == "goal_drift"
+               for item in drift_decision.state.active_interventions)
 
 
 def test_mode_lease_blocks_weak_mode_oscillation_but_hard_contradiction_interrupts():
@@ -379,3 +419,97 @@ def test_1000_intervention_soak_keeps_history_and_hot_path_bounded():
     assert saw_outcome
     assert elapsed[-1] < 1.0
     assert elapsed[949] < 0.2
+
+
+def test_intervention_capacity_preserves_every_live_owner_and_skips_statework():
+    controller = BehavioralController()
+    original = BehaviorState(active_interventions=tuple(
+        BehaviorIntervention(
+            intervention_id=f"live-{index}", cause="equivalent_retry",
+            expected_effect="Keep the existing causal record intact.",
+            start_revision=0, scope="tenant/app/agent/session/task/attempt",
+            expires_after_actions=6, actions_elapsed=0,
+            targets=(InterventionTarget(
+                target="retry_policy", previous_value="normal",
+                applied_value="materially_different_only"),),
+            expires_at_action=100, target_criteria=("criterion-1",),
+            condition_id=f"condition-{index}",
+            condition_basis_digest=f"digest-{index}",
+        ) for index in range(MAX_ACTIVE_INTERVENTIONS)))
+    decision = controller.decide(FastLoopInput(
+        scope="tenant/app/agent/session/task/attempt", state=original,
+        csw_snapshot=CSWBehaviorSnapshot(
+            revision=1, eligible_stateworks=(StateWorkOption("repair-flow"),)),
+        objective_criteria=("criterion-1",), equivalent_retry_count=3,
+        host_action_index=1,
+    ))
+
+    assert decision.reason == "intervention_capacity_exhausted"
+    assert tuple(item.intervention_id for item in decision.state.active_interventions) == \
+        tuple(item.intervention_id for item in original.active_interventions)
+    assert decision.preferred_stateworks == ()
+    assert not any(item.operation == "prefer_statework" for item in decision.directives)
+    assert all(item.targets == original.active_interventions[index].targets
+               for index, item in enumerate(decision.state.active_interventions))
+
+
+def test_statework_directive_inherits_its_new_intervention_owner_window():
+    from types import SimpleNamespace
+
+    from lib.condition_identity import identify_condition
+    from lib.control.candidate_generator import CandidateOption
+    from lib.control.directive_builder import DirectiveBuilder
+    from lib.control.interventions import InterventionStateBuilder
+    from lib.control.policy_selector import BehaviorCandidate
+
+    scope = "tenant/app/agent/session/task/attempt"
+    context = FastLoopInput(
+        scope=scope, state=BehaviorState(),
+        csw_snapshot=CSWBehaviorSnapshot(revision=1),
+        objective_criteria=("criterion-1",), host_action_index=4,
+    )
+    after = BehaviorState(cognitive_mode="RECOVER",
+                          retry_policy="materially_different_only")
+    candidate = BehaviorCandidate.from_state(
+        after, focus_criteria=("criterion-1",),
+        statework_preferences=("repair-flow",), reason_codes=("deterministic_rule",),
+        cause="equivalent_retry", expected_effect="Reassess the failed approach.")
+    option = CandidateOption(
+        candidate=candidate, role="RECOVER",
+        changes=(
+            ("mode", "RECOVER", "equivalent_retry", "Reassess the failed approach."),
+            ("retry_policy", "materially_different_only", "progress_observed",
+             "Preserve the verified progress window."),
+        ), deterministic_support=0.86)
+    pool = SimpleNamespace(option_for=lambda _candidate_id: option, fallback=lambda: None)
+    selection = SimpleNamespace(abstained=False, candidate=candidate)
+    conditions = context.csw_snapshot
+    builder = DirectiveBuilder(
+        intervention_state_builder=InterventionStateBuilder(
+            expiry_actions=3, digest=lambda value: __import__("hashlib").sha256(
+                repr(value).encode()).hexdigest()),
+        intervention_expiry_actions=3,
+        digest=lambda value: __import__("hashlib").sha256(
+            repr(value).encode()).hexdigest(),
+    )
+
+    decision = builder.build(
+        context=context, original=context.state, working=context.state,
+        next_revision=1, next_focus=("criterion-1",),
+        attention_ids=("criterion-1",), interventions=[], outcomes=[], directives=[],
+        selection=selection, candidate_pool=pool, current_condition_ids={},
+        previously_effective=set(), triggers=set(),
+        condition_for=lambda cause, target_criteria: identify_condition(
+            cause=cause, target_criteria=target_criteria, goal_set=None,
+            csw_snapshot=conditions, evidence_refs=()),
+        applies_to_attention=lambda _criteria: True,
+    )
+
+    owners = {item.intervention_id: item for item in decision.state.active_interventions}
+    statework = next(item for item in decision.directives
+                     if item.operation == "prefer_statework")
+    owner = owners[statework.intervention_id]
+    assert owner.expires_after_actions == 3
+    assert statework.expires_after_actions == owner.expires_after_actions
+    assert statework.expires_at_action == owner.expires_at_action
+    assert statework.intervention_id == owner.intervention_id

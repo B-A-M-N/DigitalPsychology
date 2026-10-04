@@ -18,6 +18,7 @@ class InProcessControlClient:
         required = (
             "open_control_session", "prepare_control_tick", "commit_control_tick",
             "abort_control_tick", "reconcile_control_session", "close_control_session",
+            "behavioral_trial_record",
         )
         missing = [name for name in required
                    if not callable(getattr(control_service, name, None))]
@@ -54,12 +55,24 @@ class InProcessControlClient:
     async def close_control_session(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return self._call("close_control_session", request)
 
+    async def behavioral_trial_record(self, control_session_id: str, *,
+                                      trial_id: str) -> dict[str, Any]:
+        response = self.control_service.behavioral_trial_record(
+            control_session_id, trial_id=trial_id)
+        if not isinstance(response, Mapping):
+            raise RuntimeError("in-process control service returned a malformed result")
+        return self._validated(response)
+
     def _call(self, method: str, value: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             raise TypeError("in-process control request must be a mapping")
         response = getattr(self.control_service, method)(dict(value))
         if not isinstance(response, Mapping):
             raise RuntimeError("in-process control service returned a malformed result")
+        return self._validated(response)
+
+    @staticmethod
+    def _validated(response: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(response)
         if result.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError("DigitalPsychology control protocol version mismatch")

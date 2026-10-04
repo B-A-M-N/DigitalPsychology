@@ -22,6 +22,7 @@ from lib.system_one_backends import DisabledSystemOneBackend
 from lib.system_one_service import SystemOneService
 from lib.runtime import (ActionCandidate, CFWRuntimeAdapter, RuntimeIdentity,
                          RuntimeObservation)
+from lib.runtime.cfw_projection import build_cfw_behavior_projection
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -308,7 +309,8 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
         cfw = _CFWPort()
         csw = _CSWPort()
         goals = _goal_set()
-        bridge = _bridge(tmp_path, identity=_identity(), goal_set=goals,
+        identity = _identity()
+        bridge = _bridge(tmp_path, identity=identity, goal_set=goals,
                          cfw_port=cfw, csw_port=csw)
         try:
             opened = await bridge.open()
@@ -322,11 +324,22 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
             assert result["behavior_state"]["cognitive_mode"] == "RECOVER"
             assert csw.active == ("repair",)
             assert cfw.lifecycle_revision == 1
-            assert cfw.applied_behavior_projection["source_revision"] == 1
+            assert cfw.applied_behavior_projection["behavior_revision"] == 1
             assert cfw.controls
             context = await bridge.before_model_call("base host context")
             assert "CURRENT BEHAVIOR GUIDANCE" in context
             assert "base host context" in context
+            second_context = await bridge.before_model_call("second model call")
+            assert "second model call" in second_context
+            trial = await bridge.client.behavioral_trial_record(
+                identity.scope, trial_id="private-stdio-trial")
+            assert trial["protocol_version"] == PROTOCOL_VERSION
+            assert trial["trial_id"] == "private-stdio-trial"
+            assert trial["evidence_source"] == "internal_host_telemetry"
+            assert trial["equivalent_retries"] == 1
+            assert trial["model_projection_events"] == 2
+            assert trial["model_projection_updates"] == 0
+            assert trial["unique_model_projection_digests"] == 1
         finally:
             await bridge.close()
 
@@ -425,12 +438,59 @@ def test_private_control_plane_persists_actions_and_boundary_transitions_separat
             assert [item["boundary_sequence"] for item in transitions] == [0, 1, 2]
             assert transitions[0]["boundary_kind"] == "pre_action_rejected"
             assert transitions[0]["cfw_rejection_stage"] == "cfw_preflight"
+            assert transitions[0]["justification_class"] != "hard_safety"
             assert all("basis" not in item for item in transitions)
+            assert "semantic_query_attempted" in actions[-1]
+            assert "semantic_query" not in actions[-1]
+            assert "semantic_attempted" not in actions[-1]
         finally:
             await bridge.close()
             control.close()
 
     asyncio.run(run())
+
+
+def test_host_rejects_nonsequential_candidate_and_completed_action_indices(tmp_path):
+    async def run():
+        goals = _goal_set()
+        bridge = _bridge(tmp_path, identity=_identity("sequential-index"),
+                         goal_set=goals, cfw_port=_CFWPort(), csw_port=_CSWPort(),
+                         client=_in_process_client(tmp_path))
+        try:
+            await bridge.open()
+            candidate = ActionCandidate(
+                action_class="read", proposed_purpose="inspect source",
+                affected_criterion_ids=("criterion-visual",),
+                action_id="candidate-25", tool_name="read", operation="inspect",
+                mutating=False, reversible=True)
+            bad_candidate = RuntimeObservation(
+                action_index=25, action_completed=False, goal_set=goals,
+                candidate_action=candidate)
+            with pytest.raises(ValueError, match="next sequential action"):
+                await bridge._control_boundary("pre_action", observation=bad_candidate)
+            bad_completion = RuntimeObservation(action_index=25, goal_set=goals)
+            with pytest.raises(ValueError, match="next sequential action"):
+                await bridge.after_action(bad_completion, goal_set=goals)
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_validator_evidence_is_allowed_without_marking_an_action_complete():
+    evidence = RuntimeObservation(
+        action_index=2, action_completed=False,
+        evidence_refs=("validator:criterion-visual:revision-1",))
+    assert evidence.action_completed is False
+
+    candidate = ActionCandidate(
+        action_class="read", proposed_purpose="inspect source",
+        affected_criterion_ids=("criterion-visual",), action_id="candidate-evidence",
+        tool_name="read", operation="inspect", mutating=False, reversible=True)
+    with pytest.raises(ValueError, match="candidate observations cannot claim action outcomes"):
+        RuntimeObservation(action_index=3, action_completed=False,
+                           candidate_action=candidate,
+                           evidence_refs=("validator:criterion-visual:revision-1",))
 
 
 @pytest.mark.skipif(not _MCP_STDIO_AVAILABLE,
@@ -581,33 +641,38 @@ def test_cfw_preflight_rejection_is_reported_to_dp_without_advancing_action_inde
                          client=client)
         try:
             await bridge.open()
-            result = await bridge.before_action_candidate(
-                ActionCandidate(
-                    action_class="external_write",
-                    proposed_purpose="Apply the requested change",
-                    affected_criterion_ids=("criterion-visual",),
-                    action_id="action-needs-confirmation", tool_name="deploy",
-                    operation="publish", mutating=True, reversible=False,
-                    external=True,
-                ),
-                cfw_action_request={
-                    "tool_binding_id": "deploy", "arguments": {"target": "prod"}},
-            )
-            assert result["status"] == "rejected"
-            assert result["stage"] == "cfw_preflight"
-            assert result["action_authorized"] is False
-            assert cfw.action_gate_calls == ["preflight"]
+            for attempt in range(3):
+                result = await bridge.before_action_candidate(
+                    ActionCandidate(
+                        action_class="external_write",
+                        proposed_purpose="Apply the requested change",
+                        affected_criterion_ids=("criterion-visual",),
+                        action_id=f"action-needs-confirmation-{attempt}",
+                        tool_name="deploy", operation="publish",
+                        mutating=True, reversible=False, external=True,
+                    ),
+                    cfw_action_request={
+                        "tool_binding_id": "deploy", "arguments": {"target": "prod"}},
+                )
+                assert result["status"] == "rejected"
+                assert result["stage"] == "cfw_preflight"
+                assert result["action_authorized"] is False
+            assert cfw.action_gate_calls == ["preflight"] * 3
             assert bridge._action_index == -1
-            assert bridge._boundary_sequence == 0
-            request = client.prepared_requests[-1]
-            assert request["boundary_kind"] == "pre_action_rejected"
-            assert request["observation"]["candidate_preflight_result"] == "require_confirmation"
-            assert request["observation"]["candidate_action"]["action_id"] == \
-                "action-needs-confirmation"
-            assert any(signal["code"] ==
-                       "candidate_rejected.require_confirmation"
-                       for signal in request["cfw_signals"])
-            assert "prod" not in json.dumps(request)
+            assert bridge._boundary_sequence == 2
+            requests = client.prepared_requests
+            assert [request["observation"]["action_index"] for request in requests] == [1, 1, 1]
+            assert [request["boundary_sequence"] for request in requests] == [0, 1, 2]
+            for attempt, request in enumerate(requests):
+                assert request["boundary_kind"] == "pre_action_rejected"
+                assert request["observation"]["candidate_preflight_result"] == \
+                    "require_confirmation"
+                assert request["observation"]["candidate_action"]["action_id"] == \
+                    f"action-needs-confirmation-{attempt}"
+                assert any(signal["code"] ==
+                           "candidate_rejected.require_confirmation"
+                           for signal in request["cfw_signals"])
+                assert "prod" not in json.dumps(request)
         finally:
             await bridge.close()
 
@@ -618,9 +683,11 @@ def test_cfw_final_gate_rejection_is_reported_to_dp_after_pre_action_tick(tmp_pa
     async def run():
         cfw = _CFWPort(final_decision="require_reinspection")
         goals = _goal_set()
+        client = _in_process_client(
+            tmp_path, client_type=_CapturingControlClient, close_service=True)
         bridge = _bridge(tmp_path, identity=_identity("final-rejection-task"),
                          goal_set=goals, cfw_port=cfw, csw_port=_CSWPort(),
-                         client=_in_process_client(tmp_path))
+                         client=client)
         try:
             await bridge.open()
             result = await bridge.before_action_candidate(
@@ -643,8 +710,58 @@ def test_cfw_final_gate_rejection_is_reported_to_dp_after_pre_action_tick(tmp_pa
             assert cfw.action_gate_calls == ["preflight", "authorize"]
             assert bridge._action_index == -1
             assert bridge._boundary_sequence == 1
+            assert bridge._cfw_projection_action_index == 1
+            assert cfw.applied_behavior_projection["host_action_index"] == 1
+            assert [request["observation"]["action_index"]
+                    for request in client.prepared_requests] == [1, 1]
         finally:
             await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_reconciliation_recovers_projection_candidate_index_after_pre_action_commit(tmp_path):
+    async def run():
+        identity = _identity("pre-action-reconnect-task")
+        goals = _goal_set()
+        cfw = _CFWPort()
+        csw = _CSWPort()
+        client = _in_process_client(tmp_path, close_service=False)
+        first = _bridge(tmp_path, identity=identity, goal_set=goals,
+                        cfw_port=cfw, csw_port=csw, client=client)
+        await first.open()
+        result = await first.before_action_candidate(
+            ActionCandidate(
+                action_class="file_edit",
+                proposed_purpose="Implement the requested visual criterion",
+                affected_criterion_ids=("criterion-visual",),
+                action_id="action-before-reconnect", tool_name="apply_patch",
+                operation="edit_file", mutating=True, reversible=True,
+                external=False,
+            ),
+            cfw_action_request={"tool_binding_id": "apply_patch",
+                                "arguments": {"path": "view.py"}},
+        )
+        assert result["status"] == "ready"
+        assert first._action_index == -1
+        assert first._cfw_projection_action_index == 1
+        assert cfw.applied_behavior_projection["host_action_index"] == 1
+
+        await client.close()  # Simulate disconnect before POST_ACTION.
+        resumed = _bridge(tmp_path, identity=identity, goal_set=goals,
+                          cfw_port=cfw, csw_port=csw, client=client)
+        try:
+            state = await resumed.open()
+            assert state["status"] == "ready"
+            assert resumed._state.revision == 1
+            assert resumed._action_index == -1
+            assert resumed._cfw_projection_action_index == 1
+            expected = build_cfw_behavior_projection(
+                resumed._state, host_action_index=1).to_dict()
+            assert cfw.applied_behavior_projection == expected
+        finally:
+            await resumed.close()
+            await client.close()
 
     asyncio.run(run())
 

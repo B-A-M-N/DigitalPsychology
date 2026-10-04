@@ -228,12 +228,13 @@ class RuntimeObservation:
             decision = getattr(self, name)
             if decision is not None and decision not in gate_decisions:
                 raise ValueError(f"{name} is outside the CFW action-gate contract")
-        # The private control protocol carries a candidate at the pre-action
-        # boundary and again only when CFW reports a rejection.
-        if not self.action_completed and (
+        # Candidate observations are pre-action records and cannot claim
+        # outcomes. Non-action boundaries such as validator observations may
+        # carry independently produced evidence references.
+        if self.candidate_action is not None and (
                 self.progress_made or self.regression_observed or self.artifact_changed
                 or self.evidence_refs):
-            raise ValueError("pre-action observations cannot claim action outcomes")
+            raise ValueError("candidate observations cannot claim action outcomes")
         statuses = dict(self.criterion_status)
         if len(statuses) > 256 or any(
                 not isinstance(key, str) or not key or len(key) > 128

@@ -18,6 +18,7 @@ except ImportError:  # transport stays optional for library-only consumers
         MCPServer = None
 
 from ..control.service import ControlPlaneService
+from ..control_protocol import PROTOCOL_VERSION, bounded_control_mapping
 from ..feedback_loop import trusted_state_root
 from ..service import DigitalPsychologyService
 from ..runtime.store import BehaviorStateStore
@@ -83,6 +84,21 @@ def create_control_server(control: ControlPlaneService | None = None):
     async def close_control_session(request: dict[str, Any]) -> dict[str, Any]:
         """Close a session when no control decision remains prepared."""
         return control.close_control_session(request)
+
+    @server.tool()
+    async def read_behavioral_trial_record(request: dict[str, Any]) -> dict[str, Any]:
+        """Read DP's internal evidence for an externally evaluated trial."""
+        data = bounded_control_mapping(request, "behavioral trial record request")
+        if set(data) != {"protocol_version", "control_session_id", "trial_id"}:
+            raise ValueError("behavioral trial record request fields are invalid")
+        if data["protocol_version"] != PROTOCOL_VERSION:
+            raise ValueError("behavioral trial record protocol version is invalid")
+        for name in ("control_session_id", "trial_id"):
+            value = data[name]
+            if not isinstance(value, str) or not value or len(value) > 256:
+                raise ValueError(f"{name} must be bounded text")
+        return control.behavioral_trial_record(
+            data["control_session_id"], trial_id=data["trial_id"])
 
     return server
 

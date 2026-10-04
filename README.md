@@ -574,10 +574,11 @@ Run:
 ```bash
 python3 scripts/self-test.py
 python3 scripts/test-routing-learning.py
+python3 scripts/acceptance-runtime-triad.py
 pytest -q tests
 ```
 
-The automated release gate is defined by the sibling CFW repository's [`release-gates.json`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/release-gates.json). It covers structural and cross-system behavior. Real-agent improvement claims require CFW's [`acceptance-real-agent.py`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/scripts/acceptance-real-agent.py) with an explicit external model command; deterministic DP tests do not establish that claim.
+The automated release gate is defined by the sibling CFW repository's [`release-gates.json`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/release-gates.json). Its guard-policy causal check and private-MCP runtime-triad check are separate mandatory gates. The runtime triad exercises current DP, CFW, and CSW authorities together, including a private DP process restart, a CFW final-gate rejection, lease ownership, and twelve-criterion attention coverage. Real-agent improvement claims require CFW's [`acceptance-real-agent.py`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/scripts/acceptance-real-agent.py) with an explicit external model command; deterministic DP tests do not establish that claim.
 
 DP's promotion receipts are authoritative for its own experiment artifacts, but real model behavior, tool outcomes, and deployment-specific evaluator quality remain external dependencies. The optional MCP transport is not required for library-only use.
 

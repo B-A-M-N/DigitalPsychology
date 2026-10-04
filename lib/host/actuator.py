@@ -60,7 +60,8 @@ class ControlActuator:
 
         projection = build_cfw_behavior_projection(
             BehaviorState.from_mapping(state),
-            host_action_index=int(basis["host_action_index"]),
+            host_action_index=int(basis.get(
+                "cfw_projection_action_index", basis["host_action_index"])),
         ).to_dict()
 
         cfw_prepared = None

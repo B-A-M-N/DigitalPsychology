@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..telemetry.material_progress import normalized_behavior_codes
+
 
 @dataclass(frozen=True)
 class DetectedConditions:
@@ -22,8 +24,9 @@ def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
                         support_action_threshold: int,
                         semantic_threshold: float) -> DetectedConditions:
     """Derive bounded triggers from host facts and calibrated semantic advice."""
-    codes = {signal.code for signal in context.cfw_signals if signal.active}
-    codes.update(context.active_trigger_codes)
+    active_signals = tuple(signal for signal in context.cfw_signals if signal.active)
+    signal_codes = tuple(signal.code for signal in active_signals)
+    codes = set(normalized_behavior_codes(context.active_trigger_codes, signal_codes))
     attention_ids = (context.attention_lease.criterion_ids
                      if context.attention_lease is not None
                      else context.state.focus_criteria)
@@ -52,13 +55,17 @@ def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
         task_complete = False
 
     scoped_retry_signal = any(
-        signal.active and signal.code == "equivalent_retry"
+        "equivalent_retry" in normalized_behavior_codes((), (signal.code,))
         and (signal.criterion_id in attention_ids or not multi_item_task)
-        for signal in context.cfw_signals)
+        for signal in active_signals)
     scoped_support_signal = any(
         signal.active and signal.code == "support_work_budget_exceeded"
         and (signal.criterion_id in attention_ids or not multi_item_task)
-        for signal in context.cfw_signals)
+        for signal in active_signals)
+    scoped_drift_signal = any(
+        "goal_drift" in normalized_behavior_codes((), (signal.code,))
+        and (signal.criterion_id in attention_ids or not multi_item_task)
+        for signal in active_signals)
     unscoped_retry = ("equivalent_retry" in context.active_trigger_codes
                       and not multi_item_task)
     unscoped_support = ("support_work_budget_exceeded" in context.active_trigger_codes
@@ -70,7 +77,8 @@ def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
                  and semantic.retry_confidence >= semantic_threshold)
              or scoped_retry_signal or unscoped_retry)
     drift = (focused_stall_count >= support_action_threshold
-             or scoped_support_signal or unscoped_support
+             or scoped_support_signal or scoped_drift_signal or unscoped_support
+             or ("goal_drift" in context.active_trigger_codes and not multi_item_task)
              or (semantic.goal_drift is True
                  and semantic.goal_drift_confidence >= semantic_threshold)) \
             and not focused_progress
