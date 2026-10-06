@@ -19,7 +19,8 @@ def identify_condition(*, cause: str, target_criteria: Sequence[str],
                        goal_set: GoalSetSnapshot | None,
                        csw_snapshot: CSWBehaviorSnapshot,
                        evidence_refs: Sequence[str],
-                       approach_epoch: str = "") -> BehaviorConditionIdentity:
+                       approach_epoch: str = "",
+                       upstream_cause_ids: Sequence[str] = ()) -> BehaviorConditionIdentity:
     """Bind a trigger to the objective, workflow, evidence, and approach epoch.
 
     The identity deliberately excludes action index and behavior revision: those
@@ -40,11 +41,11 @@ def identify_condition(*, cause: str, target_criteria: Sequence[str],
     basis = {
         "cause": cause,
         "target_criteria": criteria,
-        "goal_set_revision": goal_set.revision if goal_set is not None else None,
         "goal_items": targets,
         "workflow": workflow,
         "evidence_refs": tuple(sorted(set(evidence_refs))),
         "approach_epoch": approach_epoch,
+        "upstream_cause_ids": tuple(sorted(set(upstream_cause_ids))),
     }
     digest = hashlib.sha256(json.dumps(
         basis, sort_keys=True, separators=(",", ":"), ensure_ascii=True

@@ -10,8 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Protocol
 
-from .behavior_state import (BehaviorIntervention, GoalSetSnapshot,
-                             InterventionOutcome, TaskSetOutcome)
+from .behavior_state import (PREVENTIVE_UTILITY_KINDS, BehaviorIntervention,
+                             GoalSetSnapshot, InterventionOutcome, TaskSetOutcome)
 from .attention import fairness_bound_actions
 
 
@@ -24,12 +24,15 @@ _SOURCE_KINDS = {
     "cfw_observation": {"materially_different_attempt", "equivalent_approach"},
     "host_experiment_evaluator": {
         "intervention_effect_confirmed", "intervention_no_effect",
-        "progress_not_attributed",
+        "preventive_utility_confirmed", "progress_not_attributed",
     },
 }
 _COMPARATIVE_KINDS = {
-    "intervention_effect_confirmed", "intervention_no_effect",
-    "progress_not_attributed",
+    "intervention_effect_confirmed", "preventive_utility_confirmed",
+    "intervention_no_effect", "progress_not_attributed",
+}
+_COMPARATIVE_CONFIRMATIONS = {
+    "intervention_effect_confirmed", "preventive_utility_confirmed",
 }
 
 
@@ -49,6 +52,7 @@ class HostOutcomeFact:
     intervention_id: str | None = None
     comparison_id: str | None = None
     comparison_design: str | None = None
+    preventive_utility: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.evidence_ref, str) or not self.evidence_ref.strip() \
@@ -79,6 +83,18 @@ class HostOutcomeFact:
                         "matched_baseline", "matched_baseline_holdout"}):
                 raise ValueError(
                     "comparative outcome facts require an intervention-bound comparison")
+        utility = self.preventive_utility
+        if (not isinstance(utility, (tuple, list)) or len(utility) > 4
+                or any(not isinstance(item, str) or item not in PREVENTIVE_UTILITY_KINDS
+                       for item in utility)
+                or len(utility) != len(set(utility))):
+            raise ValueError("preventive utility evidence is malformed")
+        if self.kind == "preventive_utility_confirmed":
+            if not utility:
+                raise ValueError("preventive confirmation requires a utility classification")
+        elif utility:
+            raise ValueError("only preventive confirmation may classify preventive utility")
+        object.__setattr__(self, "preventive_utility", tuple(utility))
 
 
 class OutcomeEvidenceAuthority(Protocol):
@@ -191,6 +207,10 @@ class InterventionEvaluator:
                 raise ValueError("outcome evidence must be bound to a host action index")
             if not intervention.baseline_action_index < fact.action_index <= frame.action_index:
                 raise ValueError("outcome evidence falls outside the intervention window")
+            if (fact.kind == "preventive_utility_confirmed"
+                    and fact.action_index != frame.action_index):
+                raise ValueError(
+                    "preventive utility evidence must be bound to the evaluation boundary")
             if fact.intervention_id is not None and fact.intervention_id != intervention.intervention_id:
                 raise ValueError("comparative evidence is bound to another intervention")
             facts.append(fact)
@@ -245,14 +265,16 @@ class InterventionEvaluator:
             raise ValueError("outcome evidence contains conflicting comparison identities")
         comparison_id = next(iter(comparison_ids), None)
         comparison_verdicts = {fact.kind for fact in comparative}
-        if ("intervention_effect_confirmed" in comparison_verdicts
-                and len(comparison_verdicts) > 1):
+        if (_COMPARATIVE_CONFIRMATIONS & comparison_verdicts
+                and comparison_verdicts - _COMPARATIVE_CONFIRMATIONS):
             raise ValueError("outcome evidence contains conflicting comparison verdicts")
         explicit_no_credit = any(fact.kind in {
             "intervention_no_effect", "progress_not_attributed"}
             for fact in comparative)
         explicit_effect = any(fact.kind == "intervention_effect_confirmed"
                               for fact in comparative)
+        preventive_confirmation = any(
+            fact.kind == "preventive_utility_confirmed" for fact in comparative)
         criterion_rejected = {
             fact.criterion_id for fact in facts
             if fact.kind == "criterion_rejected" and fact.criterion_id in target_ids
@@ -261,6 +283,12 @@ class InterventionEvaluator:
         applied = intervention.intervention_id in frame.applied_intervention_ids
         overlapping = (set(frame.competing_intervention_ids)
                        | set(intervention.concurrent_intervention_ids))
+        preventive_effect_supported = (
+            preventive_confirmation
+            and (not overlapping or all(
+                fact.comparison_design == "matched_baseline_holdout"
+                for fact in comparative
+                if fact.kind == "preventive_utility_confirmed")))
         attention_only = (len(intervention.targets) == 1
                           and intervention.targets[0].target == "focus_criteria")
         fairness_progress = bool(
@@ -301,10 +329,21 @@ class InterventionEvaluator:
                 outcome = "ineffective"
                 attribution = "supported"
             goal_progress = False
+        elif frame.evaluation_complete and preventive_effect_supported:
+            outcome = "effective"
+            attribution = "supported"
+            goal_progress = False
         else:
             outcome = "inconclusive"
             attribution = "insufficient"
             goal_progress = None
+        preventive_utility = ()
+        if outcome == "effective" and preventive_effect_supported:
+            preventive_utility = tuple(sorted({
+                kind for fact in facts
+                if fact.kind == "preventive_utility_confirmed"
+                for kind in fact.preventive_utility
+            }))
 
         return InterventionOutcome(
             intervention_id=intervention.intervention_id,
@@ -322,6 +361,7 @@ class InterventionEvaluator:
             comparison_id=comparison_id,
             target_criteria=intervention.target_criteria,
             task_set_outcome=task_set_outcome,
+            preventive_utility=preventive_utility,
         )
 
     @staticmethod

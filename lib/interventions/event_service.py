@@ -52,6 +52,7 @@ class InterventionEventService:
             "behavior_intervention_directive_ids": sorted(applied),
             "behavior_condition_id": intervention.condition_id,
             "behavior_condition_basis_digest": intervention.condition_basis_digest,
+            "behavior_recovery_epoch_id": intervention.recovery_epoch_id,
         }
         return self._build_event(
             event_context, category="decision", event_type="behavior_intervention_applied",
@@ -75,6 +76,8 @@ class InterventionEventService:
                 if outcome.task_set_outcome is not None else None),
             "behavior_intervention_goal_progress": outcome.goal_progress,
             "behavior_intervention_comparison_id": outcome.comparison_id,
+            "behavior_intervention_preventive_utility": list(
+                outcome.preventive_utility),
             "behavior_intervention_artifact_changed": outcome.artifact_changed,
             "behavior_intervention_repeated_approach": outcome.repeated_approach,
             "behavior_intervention_verification_quality": outcome.verification_quality,

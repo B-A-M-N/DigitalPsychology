@@ -12,6 +12,7 @@ from ..behavior_state import (BehaviorDirective, BehaviorIntervention,
                               CSWBehaviorSnapshot, GoalItemSnapshot,
                               GoalSetSnapshot, InterventionOutcome)
 from ..attention import schedule_attention
+from ..compatibility import MAX_CFW_SIGNALS, MAX_GOAL_CRITERIA
 from ..lease_window import intervention_expiry
 from ..fast_loop import FastLoopInput
 from ..outcomes import InterventionEvaluationFrame, InterventionEventContext
@@ -58,7 +59,7 @@ class RuntimeSession:
         self.identity = identity
         self.scope = identity.scope
         self.objective_criteria = tuple(objective_criteria)
-        if (len(self.objective_criteria) > 256
+        if (len(self.objective_criteria) > MAX_GOAL_CRITERIA
                 or len(set(self.objective_criteria)) != len(self.objective_criteria)
                 or any(not isinstance(item, str) or not item or len(item) > 128
                        for item in self.objective_criteria)):
@@ -72,6 +73,36 @@ class RuntimeSession:
         self.controller = controller
         self.cfw = cfw
         self.csw = csw
+        self._cfw_components = tuple(self.cfw.available_component_ids())
+        self._cfw_behavior_contract: dict[str, Any] | None = None
+        self._cfw_suppression_modes: Mapping[str, tuple[str, ...]] = {}
+        self._initial_behavior_state = BehaviorState()
+        contract_provider = getattr(self.cfw, "task_behavior_contract", None)
+        raw_contract = contract_provider() if callable(contract_provider) else None
+        if raw_contract is not None:
+            from .cfw_behavior_contract import (
+                initial_behavior_state_from_contract,
+                validate_cfw_behavior_contract,
+            )
+            contract = validate_cfw_behavior_contract(
+                raw_contract, available_components=tuple(sorted(self._cfw_components)))
+            identity_provider = getattr(self.cfw, "authority_identity", None)
+            authority_identity = (identity_provider() if callable(identity_provider)
+                                  else identity_provider)
+            declared_hash = (authority_identity.get("task_behavior_contract_hash")
+                             if isinstance(authority_identity, Mapping) else None)
+            if declared_hash is not None and declared_hash != contract["contract_hash"]:
+                raise ValueError("CFW task behavior contract differs from its authority identity")
+            self._cfw_behavior_contract = contract
+            self._cfw_suppression_modes = contract["suppression_modes"]
+            self._initial_behavior_state = initial_behavior_state_from_contract(contract)
+        else:
+            identity_provider = getattr(self.cfw, "authority_identity", None)
+            authority_identity = (identity_provider() if callable(identity_provider)
+                                  else identity_provider)
+            if (isinstance(authority_identity, Mapping)
+                    and authority_identity.get("task_behavior_contract_hash")):
+                raise ValueError("CFW authority omitted its declared task behavior contract")
         self.outcome_evidence_authority = outcome_evidence_authority
         self.state_store = state_store
         self.system_one_frame_factory = system_one_frame_factory
@@ -83,7 +114,7 @@ class RuntimeSession:
             runtime_configuration,
         )
         attestation = provider_attestation(system_one_frame_factory)
-        cfw_connected = bool(self.cfw.available_component_ids())
+        cfw_connected = bool(self._cfw_components)
         csw_connected = not isinstance(self.csw, NullCSWWorkflowPort)
         self.behavioral_trace = BehavioralTrace(
             task_id=identity.task_id,
@@ -124,7 +155,7 @@ class RuntimeSession:
                     "in-process RuntimeSession accepts completed actions; use HostControlBridge "
                     "for pre-action candidate evaluation")
             self._dispatch_outbox()
-            record = self.state_store.load(self.scope)
+            record = self._load_state_record()
             self._ensure_adapter_state_is_reconcilable(record.state)
             if observation.action_index <= record.action_index:
                 raise ValueError("host action index must advance the runtime session")
@@ -152,9 +183,11 @@ class RuntimeSession:
                 expire_csw(host_action_index=observation.action_index)
             snapshot = self._csw_snapshot()
             candidate_statework_ids = self._candidate_statework_ids(snapshot)
-            signals = tuple(self.cfw.collect_behavior_signals(observation))
+            signals, committed_signal_cursor = self._read_cfw_signal_batch(
+                observation, record)
             available_frameworks = tuple(self.cfw.available_component_ids())
-            if len(signals) > 32 or any(not hasattr(item, "code") for item in signals):
+            if (len(signals) > MAX_CFW_SIGNALS
+                    or any(not hasattr(item, "code") for item in signals)):
                 raise ValueError("CFW adapter returned malformed behavioral signals")
             semantic_attempted = judgment is not None
             semantic_judgment_returned = judgment is not None
@@ -210,10 +243,21 @@ class RuntimeSession:
                 evidence_refs=observation.evidence_refs,
                 intervention_assessments=tuple(outcome_assessments),
                 available_frameworks=available_frameworks,
+                cfw_suppression_modes=self._cfw_suppression_modes,
                 approach_epoch=observation.approach_epoch,
             )
             decision = self._parse_decision(
                 self.controller.decide_behavior(decision_input, judgment=judgment))
+            if self._cfw_behavior_contract is not None:
+                from .cfw_behavior_contract import (
+                    validate_directives_against_behavior_contract,
+                    validate_state_against_behavior_contract,
+                )
+                validate_state_against_behavior_contract(
+                    decision.state, self._cfw_behavior_contract,
+                    label="DP policy candidate")
+                validate_directives_against_behavior_contract(
+                    decision.directives, self._cfw_behavior_contract)
             if decision.expected_revision != record.state.revision:
                 raise RuntimeError("DP controller returned a stale behavior revision")
             if decision.state.attention_lease != (attention.lease if attention else None):
@@ -330,6 +374,7 @@ class RuntimeSession:
                     application_receipts=receipts,
                     outbox_events=tuple(application_event_payloads
                                         + outcome_event_payloads),
+                    cfw_signal_cursor=committed_signal_cursor,
                 )
                 self._latest_goal_set = goal_set
                 # The action is durably committed, so its behavioral facts can
@@ -395,6 +440,19 @@ class RuntimeSession:
                         + "; ".join(compensation_errors)) from failure
                 raise
 
+            if committed_signal_cursor > record.cfw_signal_cursor:
+                acknowledge = getattr(self.cfw, "acknowledge_behavior_signals", None)
+                if not callable(acknowledge):
+                    raise RuntimeError(
+                        "DP behavior committed but CFW signal acknowledgement is unavailable")
+                try:
+                    acknowledge(through_cursor=committed_signal_cursor)
+                except Exception as exc:
+                    # The cursor was committed atomically with DP state. The
+                    # next process can safely finish this acknowledgement.
+                    raise RuntimeError(
+                        "DP behavior committed but CFW signal acknowledgement failed") from exc
+
             self._dispatch_outbox()
             application_events = [str(item["event_id"])
                                   for item in application_event_payloads]
@@ -412,6 +470,33 @@ class RuntimeSession:
                 behavior_context=context,
                 pending_event_ids=pending_event_ids,
             )
+
+    def _read_cfw_signal_batch(self, observation: RuntimeObservation,
+                               record: RuntimeStateRecord
+                               ) -> tuple[tuple[Any, ...], int]:
+        peek = getattr(self.cfw, "peek_behavior_signals", None)
+        acknowledge = getattr(self.cfw, "acknowledge_behavior_signals", None)
+        if callable(peek) and callable(acknowledge):
+            if record.cfw_signal_cursor:
+                acknowledge(through_cursor=record.cfw_signal_cursor)
+            batch = peek(after_cursor=record.cfw_signal_cursor,
+                         maximum=MAX_CFW_SIGNALS,
+                         observation=observation)
+            after = getattr(batch, "after_cursor", None)
+            next_cursor = getattr(batch, "next_cursor", None)
+            signals = getattr(batch, "signals", None)
+            if (type(after) is not int or after != record.cfw_signal_cursor
+                    or type(next_cursor) is not int or next_cursor < after
+                    or next_cursor - after > MAX_CFW_SIGNALS
+                    or not isinstance(signals, Sequence)
+                    or len(signals) > MAX_CFW_SIGNALS):
+                raise ValueError("CFW returned a malformed retryable signal batch")
+            return tuple(signals), next_cursor
+        if self.cfw.available_component_ids():
+            raise RuntimeError(
+                "in-process DP with connected CFW requires retryable signal cursors; "
+                "use HostControlBridge or upgrade the CFW adapter")
+        return tuple(self.cfw.collect_behavior_signals(observation)), record.cfw_signal_cursor
 
     def _record_behavioral_trace(self, state: BehaviorState, *, attention: Any,
                                  prior_state: BehaviorState,
@@ -560,6 +645,16 @@ class RuntimeSession:
         if self._closed:
             raise RuntimeError("DP runtime session is closed")
 
+    def _load_state_record(self) -> RuntimeStateRecord:
+        record = self.state_store.load(
+            self.scope, initial=self._initial_behavior_state)
+        if self._cfw_behavior_contract is not None:
+            from .cfw_behavior_contract import validate_state_against_behavior_contract
+            validate_state_against_behavior_contract(
+                record.state, self._cfw_behavior_contract,
+                label="persisted DP behavior state")
+        return record
+
     def apply_workflow_step(self, statework_id: str, step_id: str, *,
                             evidence_refs: Sequence[str],
                             expected_workflow_revision: int) -> Any:
@@ -578,7 +673,7 @@ class RuntimeSession:
                           action_hint: Mapping[str, Any] | None = None) -> str:
         """Ask the CFW component port to inject the committed DP projection."""
         self._require_open()
-        record = self.state_store.load(self.scope)
+        record = self._load_state_record()
         self._ensure_adapter_state_is_reconcilable(record.state)
         snapshot = self._csw_snapshot()
         projection = self.project_behavior_context(record.state, snapshot)
@@ -592,7 +687,7 @@ class RuntimeSession:
     def before_tool_planning(self, *,
                              action_hint: Mapping[str, Any] | None = None) -> str:
         self._require_open()
-        record = self.state_store.load(self.scope)
+        record = self._load_state_record()
         self._ensure_adapter_state_is_reconcilable(record.state)
         snapshot = self._csw_snapshot()
         projection = self.project_behavior_context(record.state, snapshot)
@@ -645,7 +740,7 @@ class RuntimeSession:
     def project_behavior_context(self, state: BehaviorState | None = None,
                                  snapshot: CSWBehaviorSnapshot | None = None,
                                  *, goal_set: GoalSetSnapshot | None = None) -> str:
-        state = state or self.state_store.load(self.scope).state
+        state = state or self._load_state_record().state
         snapshot = snapshot or self._csw_snapshot()
         goal_set = goal_set or self._latest_goal_set
         return _project_behavior_context(

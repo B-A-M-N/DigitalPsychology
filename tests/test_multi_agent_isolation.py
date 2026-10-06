@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from lib.feedback_loop import Event, EventError
+from lib.events import SCHEMA_VERSION
 from lib.routing_profiles import RoutingProfileError, derive_profiles
 from lib.trajectories import build_trajectories
 
@@ -117,7 +118,7 @@ def test_persisted_event_retrieval_requires_complete_origin():
     with tempfile.TemporaryDirectory() as raw:
         service = DigitalPsychologyService(event_db=Path(raw) / "events.sqlite3")
         event = EventFactory.from_dict({
-            "schema_version": "2.7.0", "event_id": "same-event",
+            "schema_version": SCHEMA_VERSION, "event_id": "same-event",
             "timestamp": datetime.now(timezone.utc).isoformat(), "namespace_id": "ns-a",
             "application_id": "app", "application_instance_id": "instance-a",
             "task_id": "task", "agent_id": "agent", "actor_id": "agent",

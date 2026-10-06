@@ -280,6 +280,126 @@ def test_failed_intervention_does_not_poison_a_new_approach_epoch():
     assert decision.state.active_interventions[0].condition_id != old_condition.condition_id
 
 
+def test_unrelated_goal_progress_does_not_change_condition_identity():
+    from lib.condition_identity import identify_condition
+
+    workflow = CSWBehaviorSnapshot(revision=3)
+    before = GoalSetSnapshot(4, (
+        GoalItemSnapshot("criterion-1", status="ACTIVE"),
+        GoalItemSnapshot("criterion-2", status="READY"),
+    ))
+    after_unrelated_progress = GoalSetSnapshot(5, (
+        GoalItemSnapshot("criterion-1", status="ACTIVE"),
+        GoalItemSnapshot("criterion-2", status="VERIFIED"),
+    ))
+
+    first = identify_condition(
+        cause="equivalent_retry", target_criteria=("criterion-1",),
+        goal_set=before, csw_snapshot=workflow, evidence_refs=(),
+        approach_epoch="hypothesis-1")
+    unrelated_change = identify_condition(
+        cause="equivalent_retry", target_criteria=("criterion-1",),
+        goal_set=after_unrelated_progress, csw_snapshot=workflow, evidence_refs=(),
+        approach_epoch="hypothesis-1")
+
+    assert unrelated_change == first
+
+
+def test_relevant_workflow_evidence_and_hypothesis_changes_reset_condition_identity():
+    from lib.condition_identity import identify_condition
+
+    goals = GoalSetSnapshot(4, (
+        GoalItemSnapshot("criterion-1", status="ACTIVE"),
+        GoalItemSnapshot("criterion-2", status="READY"),
+    ))
+    workflow = CSWBehaviorSnapshot(
+        revision=3, active_stateworks=("repair",),
+        workflow_revisions={"repair": 7})
+
+    def identify(*, snapshot=workflow, evidence=("evidence-current",),
+                 hypothesis="hypothesis-current"):
+        return identify_condition(
+            cause="equivalent_retry",
+            target_criteria=("criterion-1",),
+            goal_set=goals,
+            csw_snapshot=snapshot,
+            evidence_refs=evidence,
+            approach_epoch=hypothesis,
+        )
+
+    original = identify()
+    changed_workflow = identify(snapshot=CSWBehaviorSnapshot(
+        revision=4, active_stateworks=("repair",),
+        workflow_revisions={"repair": 8}))
+    changed_evidence = identify(evidence=("evidence-revised",))
+    changed_hypothesis = identify(hypothesis="hypothesis-revised")
+
+    assert changed_workflow.condition_id != original.condition_id
+    assert changed_evidence.condition_id != original.condition_id
+    assert changed_hypothesis.condition_id != original.condition_id
+
+
+def test_cfw_cause_id_is_part_of_the_recovery_epoch_and_intervention():
+    from lib.condition_identity import identify_condition
+    from lib.behavior_state import AttentionLease
+
+    scope = "tenant/app/agent/session/task/attempt"
+    snapshot = CSWBehaviorSnapshot(revision=2)
+    goals = GoalSetSnapshot(0, (GoalItemSnapshot("criterion-1"),))
+    signal = FrameworkSignal(
+        "owl", "owl.approach_failed", criterion_id="criterion-1",
+        cause_id="cfw-approach-cause-7")
+    decision = BehavioralController().decide(FastLoopInput(
+        scope=scope, state=BehaviorState(), csw_snapshot=snapshot,
+        objective_criteria=("criterion-1",), goal_set=goals,
+        attention_lease=AttentionLease(
+            lease_id="retry-focus", criterion_ids=("criterion-1",),
+            issued_revision=0, goal_set_revision=0, start_action=0),
+        cfw_signals=(signal,)))
+    intervention = next(item for item in decision.state.active_interventions
+                        if item.cause == "equivalent_retry")
+    expected = identify_condition(
+        cause="equivalent_retry", target_criteria=("criterion-1",),
+        goal_set=goals, csw_snapshot=snapshot, evidence_refs=(),
+        upstream_cause_ids=("cfw-approach-cause-7",))
+
+    assert intervention.condition_id == expected.condition_id
+    assert intervention.recovery_epoch_id == expected.condition_id
+
+
+def test_repeated_cfw_emission_for_the_same_cause_keeps_one_recovery_epoch():
+    from lib.behavior_state import AttentionLease
+
+    scope = "tenant/app/agent/session/task/attempt"
+    snapshot = CSWBehaviorSnapshot(revision=2)
+    goals = GoalSetSnapshot(0, (GoalItemSnapshot("criterion-1"),))
+    attention = AttentionLease(
+        lease_id="retry-focus", criterion_ids=("criterion-1",),
+        issued_revision=0, goal_set_revision=0, start_action=0)
+    signal = FrameworkSignal(
+        "owl", "owl.approach_failed", criterion_id="criterion-1",
+        evidence_refs=("cfw:approach-7:failed",),
+        cause_id="cfw-approach-cause-7")
+    controller = BehavioralController()
+    first = controller.decide(FastLoopInput(
+        scope=scope, state=BehaviorState(), csw_snapshot=snapshot,
+        objective_criteria=("criterion-1",), goal_set=goals,
+        attention_lease=attention,
+        cfw_signals=(signal,)))
+    second = controller.decide(FastLoopInput(
+        scope=scope, state=first.state, csw_snapshot=snapshot,
+        objective_criteria=("criterion-1",), goal_set=goals,
+        attention_lease=attention,
+        cfw_signals=(signal,)))
+
+    first_recovery = next(item for item in first.state.active_interventions
+                          if item.cause == "equivalent_retry")
+    second_recovery = next(item for item in second.state.active_interventions
+                           if item.cause == "equivalent_retry")
+    assert second_recovery.recovery_epoch_id == first_recovery.recovery_epoch_id
+    assert second_recovery.intervention_id == first_recovery.intervention_id
+
+
 def test_intervention_identity_is_scoped_per_agent_session():
     controller = BehavioralController()
     state = BehaviorState()
@@ -397,7 +517,9 @@ def test_1000_intervention_soak_keeps_history_and_hot_path_bounded():
     state = BehaviorState()
     elapsed = []
     saw_outcome = False
-    for index in range(1000):
+    interventions_created = 0
+    for index in range(2000):
+        prior_ids = {item.intervention_id for item in state.active_interventions}
         started = time.perf_counter()
         decision = controller.decide(FastLoopInput(
             scope="tenant/app/agent/session/task/attempt",
@@ -410,6 +532,9 @@ def test_1000_intervention_soak_keeps_history_and_hot_path_bounded():
         ))
         elapsed.append(time.perf_counter() - started)
         state = decision.state
+        interventions_created += sum(
+            item.intervention_id not in prior_ids
+            for item in state.active_interventions)
         saw_outcome = saw_outcome or bool(state.intervention_history)
         assert len(state.active_interventions) <= 16
         assert len(state.intervention_history) <= 32
@@ -417,8 +542,9 @@ def test_1000_intervention_soak_keeps_history_and_hot_path_bounded():
 
     elapsed.sort()
     assert saw_outcome
+    assert interventions_created == 1000
     assert elapsed[-1] < 1.0
-    assert elapsed[949] < 0.2
+    assert elapsed[1899] < 0.2
 
 
 def test_intervention_capacity_preserves_every_live_owner_and_skips_statework():

@@ -9,7 +9,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lib.behavior_state import (BehaviorIntervention, GoalItemSnapshot,
-                                GoalSetSnapshot, InterventionTarget)
+                                GoalSetSnapshot, InterventionOutcome,
+                                InterventionTarget)
 from lib.behavior_state import BehaviorDirective
 from lib.outcomes import (HostOutcomeFact, InterventionEventContext,
                           InterventionEvaluationFrame, InterventionEvaluator)
@@ -49,11 +50,22 @@ def _fact(reference, kind, source, *, criterion_id=None, revision=6):
                            action_index=12)
 
 
+def _preventive_fact(reference, *, design="matched_baseline", action_index=13):
+    return HostOutcomeFact(
+        reference, SCOPE, "host_experiment_evaluator",
+        "preventive_utility_confirmed", observed_revision=7,
+        action_index=action_index, intervention_id="intv-1",
+        comparison_id="comparison-prevention", comparison_design=design,
+        preventive_utility=("prevented_invalid_completion",),
+    )
+
+
 def _frame(*refs, competitors=(), complete=True, action_index=13,
+           applied=("intv-1",),
            goal_set=None, attention_last_seen=None):
     return InterventionEvaluationFrame(
         scope=SCOPE, observed_revision=6, action_index=action_index,
-        evaluation_complete=complete, applied_intervention_ids=("intv-1",),
+        evaluation_complete=complete, applied_intervention_ids=tuple(applied),
         competing_intervention_ids=tuple(competitors), evidence_refs=tuple(refs),
         goal_set=goal_set, attention_last_seen=attention_last_seen or {},
     )
@@ -119,6 +131,98 @@ def test_host_comparison_can_identify_progress_unrelated_to_intervention():
     assert outcome.comparison_id == "comparison-42"
 
 
+def test_host_comparison_can_credit_preventive_utility_without_goal_progress():
+    fact = _preventive_fact("prevented-regression")
+
+    outcome = InterventionEvaluator().assess(
+        _intervention(), _frame("prevented-regression"),
+        authority=_EvidenceAuthority({fact.evidence_ref: fact}),
+    )
+
+    assert outcome.outcome == "effective"
+    assert outcome.attribution == "supported"
+    assert outcome.goal_progress is False
+    assert outcome.criterion_ids_progressed == ()
+    assert outcome.preventive_utility == ("prevented_invalid_completion",)
+    assert outcome.comparison_id == "comparison-prevention"
+
+    unapplied = InterventionEvaluator().assess(
+        _intervention(), _frame("prevented-regression", applied=()),
+        authority=_EvidenceAuthority({fact.evidence_ref: fact}),
+    )
+    assert unapplied.outcome == "unattributed"
+    assert unapplied.attribution == "insufficient"
+    assert unapplied.preventive_utility == ()
+
+
+@pytest.mark.parametrize(
+    ("design", "expected"),
+    (("matched_baseline", "inconclusive"),
+     ("matched_baseline_holdout", "effective")),
+)
+def test_overlapping_interventions_need_holdout_evidence_for_preventive_credit(
+        design, expected):
+    fact = _preventive_fact("prevented-regression", design=design)
+
+    outcome = InterventionEvaluator().assess(
+        _intervention(), _frame("prevented-regression", competitors=("intv-other",)),
+        authority=_EvidenceAuthority({fact.evidence_ref: fact}),
+    )
+
+    assert outcome.outcome == expected
+    if expected == "effective":
+        assert outcome.goal_progress is False
+    else:
+        assert outcome.attribution == "insufficient"
+        assert outcome.goal_progress is None
+
+
+def test_preventive_credit_requires_terminal_host_evidence_and_complete_window():
+    late_fact = _preventive_fact("late-prevention", action_index=12)
+    with pytest.raises(ValueError, match="evaluation boundary"):
+        InterventionEvaluator().assess(
+            _intervention(), _frame("late-prevention"),
+            authority=_EvidenceAuthority({late_fact.evidence_ref: late_fact}),
+        )
+
+    fact = _preventive_fact("incomplete-prevention")
+    outcome = InterventionEvaluator().assess(
+        _intervention(), _frame("incomplete-prevention", complete=False),
+        authority=_EvidenceAuthority({fact.evidence_ref: fact}),
+    )
+    assert outcome.outcome == "inconclusive"
+    assert outcome.attribution == "insufficient"
+
+
+def test_observed_regression_and_conflicting_comparison_block_preventive_credit():
+    prevention = _preventive_fact("prevented-regression")
+    regression = _fact(
+        "regression", "objective_regression", "csw_authority")
+    outcome = InterventionEvaluator().assess(
+        _intervention(), _frame("prevented-regression", "regression"),
+        authority=_EvidenceAuthority({
+            prevention.evidence_ref: prevention,
+            regression.evidence_ref: regression,
+        }),
+    )
+    assert outcome.outcome == "regressed"
+    assert outcome.goal_progress is False
+
+    no_effect = HostOutcomeFact(
+        "no-effect", SCOPE, "host_experiment_evaluator", "intervention_no_effect",
+        observed_revision=7, action_index=13, intervention_id="intv-1",
+        comparison_id="comparison-prevention", comparison_design="matched_baseline",
+    )
+    with pytest.raises(ValueError, match="conflicting comparison verdicts"):
+        InterventionEvaluator().assess(
+            _intervention(), _frame("prevented-regression", "no-effect"),
+            authority=_EvidenceAuthority({
+                prevention.evidence_ref: prevention,
+                no_effect.evidence_ref: no_effect,
+            }),
+        )
+
+
 def test_unknown_baseline_or_missing_applied_receipt_cannot_claim_effectiveness():
     facts = {"criterion": _fact(
         "criterion", "criterion_verified", "host_validator",
@@ -163,6 +267,22 @@ def test_complete_window_with_host_rejection_of_target_is_ineffective():
 def test_agent_assertion_is_not_an_authorized_outcome_source():
     with pytest.raises(ValueError, match="not authorized"):
         _fact("agent-says-fixed", "criterion_verified", "agent")
+
+
+def test_preventive_credit_requires_a_typed_host_utility_classification():
+    with pytest.raises(ValueError, match="utility classification"):
+        HostOutcomeFact(
+            "untyped", SCOPE, "host_experiment_evaluator",
+            "preventive_utility_confirmed", observed_revision=7,
+            action_index=13, intervention_id="intv-1",
+            comparison_id="comparison-prevention",
+            comparison_design="matched_baseline",
+        )
+    with pytest.raises(ValueError, match="unsupported outcome kind"):
+        InterventionOutcome(
+            intervention_id="intv-1", cause="goal_drift", outcome="effective",
+            observed_revision=7, preventive_utility=("warning_count_increased",),
+        )
 
 
 def test_evidence_authority_cannot_return_another_scope_or_pre_intervention_fact():
@@ -293,6 +413,13 @@ def test_host_application_and_assessment_are_persisted_as_authenticated_events(t
         outcome = InterventionEvaluator().assess(
             intervention, _frame("criterion"), authority=_EvidenceAuthority(facts))
         outcome_event_id = service.record_intervention_outcome(outcome, event_context=context)
+        preventive_fact = _preventive_fact("prevented")
+        preventive = InterventionEvaluator().assess(
+            intervention, _frame("prevented"),
+            authority=_EvidenceAuthority({"prevented": preventive_fact}),
+        )
+        preventive_event_id = service.record_intervention_outcome(
+            preventive, event_context=context)
         rows = service._sink._conn.execute(
             "SELECT event_id, payload FROM events ORDER BY row_id").fetchall()
         authenticated = service._sink._conn.execute(
@@ -305,12 +432,18 @@ def test_host_application_and_assessment_are_persisted_as_authenticated_events(t
     assert events[applied_event_id]["event_type"] == "behavior_intervention_applied"
     assert events[applied_event_id]["payload"]["behavior_intervention_status"] == "applied"
     assessed = events[outcome_event_id]
+    preventive_assessed = events[preventive_event_id]
     assert assessed["actor_id"] == "digitalpsychology_runtime"
     assert assessed["authority_source"] == "host_outcome_evaluator"
     assert assessed["payload"]["behavior_intervention_status"] == "effective"
     assert assessed["payload"]["behavior_intervention_goal_progress"] is True
     assert assessed["evidence_refs"] == ["criterion"]
-    assert {row[0] for row in authenticated} >= {applied_event_id, outcome_event_id}
+    assert preventive_assessed["payload"]["behavior_intervention_status"] == "effective"
+    assert preventive_assessed["payload"]["behavior_intervention_goal_progress"] is False
+    assert preventive_assessed["payload"]["behavior_intervention_preventive_utility"] == [
+        "prevented_invalid_completion"]
+    assert {row[0] for row in authenticated} >= {
+        applied_event_id, outcome_event_id, preventive_event_id}
 
 
 def test_new_directive_requires_absolute_expiry_and_legacy_decoder_is_explicit():

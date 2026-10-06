@@ -73,7 +73,8 @@ class InterventionStateBuilder:
                           baseline_goal_set: GoalSetSnapshot | None = None,
                           baseline_attention_last_seen: Mapping[str, int] | None = None,
                           condition_id: str = "legacy-condition",
-                          condition_basis_digest: str = "legacy-condition"
+                          condition_basis_digest: str = "legacy-condition",
+                          recovery_epoch_id: str | None = None
                           ) -> BehaviorIntervention:
         intervention_id = "intv-" + self._digest({
             "scope": scope, "revision": revision, "cause": cause,
@@ -103,7 +104,8 @@ class InterventionStateBuilder:
             baseline_goal_set=baseline_goal_set,
             baseline_attention_last_seen=baseline_attention_last_seen or {},
             condition_id=condition_id,
-            condition_basis_digest=condition_basis_digest)
+            condition_basis_digest=condition_basis_digest,
+            recovery_epoch_id=(recovery_epoch_id or condition_id))
     @staticmethod
     def set_target(state: BehaviorState, target: str, value: str) -> BehaviorState:
         if target == "mode":

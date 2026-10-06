@@ -195,6 +195,8 @@ def promoted_policy_profile(policy, *, treatment_count=20,
                            confidence_interval=(0.75, 0.98),
                            regression_confidence_interval=(0.0, 0.15),
                            repeated_failure_confidence_interval=(0.0, 0.15)):
+    from lib.control.session_registry import current_behavior_policy_compatibility
+
     subject = {
         "namespace_id": "ns", "application_id": "app",
         "application_version": "1", "application_instance_id": "instance",
@@ -229,6 +231,7 @@ def promoted_policy_profile(policy, *, treatment_count=20,
                                       for index in range(treatment_count)],
         "policy_hashes": ["policy-hash"],
         "policy_identities": {"control": "control", "treatment": "treatment"},
+        "candidate_policy_compatibility": current_behavior_policy_compatibility(policy),
         "comparison_context_hash": "comparison",
         "evaluator_id": "host-objective", "evaluator_version": "1",
         "evaluator_hash": "b" * 64,
@@ -258,6 +261,21 @@ def promoted_policy_profile(policy, *, treatment_count=20,
     }
     receipt["receipt_hash"] = hashlib.sha256(_canonical(receipt).encode()).hexdigest()
     return promote_profile(profile, receipt, status="active")
+
+
+def test_promoted_policy_from_a_different_candidate_generator_is_ignored():
+    state = BehaviorState()
+    profile = promoted_policy_profile(candidate(state).policy_mapping())
+    receipt = dict(profile["evidence"]["receipt"])
+    receipt["candidate_policy_compatibility"] = {
+        **dict(receipt["candidate_policy_compatibility"]),
+        "candidate_generator_contract_hash": "0" * 64,
+    }
+    receipt.pop("receipt_hash", None)
+    receipt["receipt_hash"] = hashlib.sha256(_canonical(receipt).encode()).hexdigest()
+    profile["evidence"]["receipt"] = receipt
+
+    assert BehaviorPolicyPrior.from_promoted_profile(profile) == ()
 
 
 def test_validated_progress_evidence_beats_lower_estimated_cost():

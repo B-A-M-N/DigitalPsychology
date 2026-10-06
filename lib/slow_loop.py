@@ -212,6 +212,8 @@ def collect_intervention_credit_assignments(
                 payload.get("behavior_intervention_criterion_progress") or ()),
             "goal_progress": payload.get("behavior_intervention_goal_progress"),
             "comparison_id": payload.get("behavior_intervention_comparison_id"),
+            "preventive_utility": list(
+                payload.get("behavior_intervention_preventive_utility") or ()),
             "artifact_changed": payload.get("behavior_intervention_artifact_changed"),
             "repeated_approach": payload.get("behavior_intervention_repeated_approach"),
             "verification_quality": payload.get(

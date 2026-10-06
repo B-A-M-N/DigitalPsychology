@@ -1044,6 +1044,10 @@ class SQLiteSink:
             day TEXT NOT NULL, namespace_id TEXT NOT NULL,
             application_instance_id TEXT NOT NULL, event_count INTEGER NOT NULL,
             PRIMARY KEY(day, namespace_id, application_instance_id))""")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS authenticated_events (
+            namespace_id TEXT NOT NULL, application_instance_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            PRIMARY KEY(namespace_id, application_instance_id, event_id))""")
         self._conn.commit()
         self._conn.execute("""CREATE TABLE IF NOT EXISTS retention_aggregates (
             aggregate_id TEXT PRIMARY KEY,

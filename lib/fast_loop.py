@@ -101,13 +101,21 @@ class BehavioralController:
 
         def condition_for(cause: str,
                           target_criteria: tuple[str, ...] = condition_criteria):
+            target_set = set(target_criteria)
+            related_causes = tuple(
+                item for item in context.behavioral_causes
+                if (target_set.intersection(item.criterion_ids)
+                    or (not item.criterion_ids
+                        and len(context.objective_criteria) <= 1)))
             return identify_condition(
                 cause=cause,
                 target_criteria=target_criteria,
                 goal_set=context.goal_set,
                 csw_snapshot=context.csw_snapshot,
-                evidence_refs=context.evidence_refs,
+                evidence_refs=tuple(context.evidence_refs) + tuple(
+                    ref for item in related_causes for ref in item.evidence_refs),
                 approach_epoch=context.approach_epoch,
+                upstream_cause_ids=tuple(item.cause_id for item in related_causes),
             )
 
         def applies_to_attention(criterion_ids: tuple[str, ...]) -> bool:
@@ -180,7 +188,8 @@ class BehavioralController:
                 current_state=working,
                 available_frameworks=context.available_frameworks,
                 goal_set=context.goal_set,
-                required_mode=required_mode),
+                required_mode=required_mode,
+                cfw_suppression_modes=context.cfw_suppression_modes),
             csw_snapshot=context.csw_snapshot,
             goal_set=context.goal_set,
             policy_context=context.policy_context,

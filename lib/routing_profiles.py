@@ -305,8 +305,12 @@ def build_routing_experiment_receipt(plan: Mapping[str, Any], trials: Iterable[M
                                      evaluator_version: str = ROUTING_EVALUATOR_VERSION) -> dict[str, Any]:
     """Evaluate independent trajectories and return a verifiable receipt.
 
-    A trial is one unique (agent, session, task, attempt) trajectory.  Route
+    A trial is one unique (agent, session, task, attempt) trajectory. Route
     log lines are evidence references inside a trial; they are never samples.
+    Behavior-policy receipts pin the evaluated mapping to this DP implementation
+    and candidate generator. Revalidating a stale prior means rerunning this
+    offline experiment and promoting its new receipt; the action path never
+    migrates old pins.
     """
     plan = validate_experiment_plan(plan)
     if evaluator_version != plan.get("target_evaluator_version"):
@@ -480,6 +484,11 @@ def build_routing_experiment_receipt(plan: Mapping[str, Any], trials: Iterable[M
         "source_evidence_hash": source_hash,
         "decision": decision,
     }
+    behavior_policy = (plan.get("candidate_adjustment") or {}).get("behavior_policy")
+    if isinstance(behavior_policy, Mapping):
+        from .control.session_registry import current_behavior_policy_compatibility
+        receipt["candidate_policy_compatibility"] = (
+            current_behavior_policy_compatibility(behavior_policy))
     receipt["receipt_hash"] = hashlib.sha256(_canonical(receipt).encode("utf-8")).hexdigest()
     return receipt
 
@@ -676,6 +685,43 @@ def validate_profile(profile: Mapping[str, Any], *, require_deployable: bool = F
             isinstance(item, Mapping) and isinstance(item.get("behavior_policy"), Mapping)
             for item in (profile.get("routing_adjustments") or ()))
         if has_behavior_policy:
+            compatibility = receipt.get("candidate_policy_compatibility")
+            policy_mappings = [item.get("behavior_policy")
+                               for item in (profile.get("routing_adjustments") or ())
+                               if isinstance(item, Mapping)
+                               and isinstance(item.get("behavior_policy"), Mapping)]
+            compatibility_fields = {
+                "behavior_policy_contract_hash", "candidate_generator_contract_hash",
+                "dp_control_implementation_version", "dp_control_implementation_hash",
+                "candidate_policy_mapping_hash",
+            }
+            if (not isinstance(compatibility, Mapping)
+                    or set(compatibility) != compatibility_fields
+                    or not policy_mappings):
+                raise RoutingProfileError(
+                    "behavior policy receipt lacks explicit implementation compatibility pins")
+            for name in compatibility_fields - {"dp_control_implementation_version"}:
+                digest = compatibility.get(name)
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(character not in "0123456789abcdef" for character in digest)):
+                    raise RoutingProfileError(
+                        "behavior policy receipt has an invalid compatibility hash")
+            if (not isinstance(compatibility.get("dp_control_implementation_version"), str)
+                    or not compatibility["dp_control_implementation_version"]):
+                raise RoutingProfileError(
+                    "behavior policy receipt has no DP implementation version")
+            receipt_adjustment = receipt.get("candidate_adjustment") or {}
+            receipt_policy = (receipt_adjustment.get("behavior_policy")
+                              if isinstance(receipt_adjustment, Mapping) else None)
+            if (not isinstance(receipt_policy, Mapping)
+                    or dict(receipt_policy) not in [dict(item) for item in policy_mappings]):
+                raise RoutingProfileError(
+                    "behavior policy receipt does not bind a promoted policy candidate")
+            encoded_policy = _canonical(dict(receipt_policy))
+            if compatibility["candidate_policy_mapping_hash"] != hashlib.sha256(
+                    encoded_policy.encode("utf-8")).hexdigest():
+                raise RoutingProfileError(
+                    "behavior policy receipt is bound to a different candidate mapping")
             policy_evidence = receipt.get("candidate_policy_evidence")
             if not isinstance(policy_evidence, Mapping):
                 raise RoutingProfileError(

@@ -10,6 +10,10 @@ from ..behavior_state import (
     FrameworkSignal, GoalSetSnapshot, InterventionOutcome,
     group_behavioral_causes,
 )
+from ..compatibility import (
+    MAX_AVAILABLE_FRAMEWORKS, MAX_CFW_SIGNALS,
+    MAX_GOAL_CRITERIA,
+)
 
 @dataclass(frozen=True)
 class FastLoopInput:
@@ -38,25 +42,46 @@ class FastLoopInput:
     policy_context: Mapping[str, Any] = field(default_factory=dict)
     available_frameworks: tuple[str, ...] = (
         "owl", "anchor", "fuse", "ward", "flow", "sispis", "dox")
+    cfw_suppression_modes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, str) or not self.scope.strip() or len(self.scope) > 256:
             raise ValueError("fast-loop scope must be non-empty bounded text")
-        if len(self.objective_criteria) > 256 or len(set(self.objective_criteria)) != len(self.objective_criteria):
-            raise ValueError("objective criteria must be unique and bounded to 256")
+        if (len(self.objective_criteria) > MAX_GOAL_CRITERIA
+                or len(set(self.objective_criteria)) != len(self.objective_criteria)):
+            raise ValueError(
+                f"objective criteria must be unique and bounded to {MAX_GOAL_CRITERIA}")
         if any(not isinstance(value, str) or not value or len(value) > 128
                for value in self.objective_criteria):
             raise ValueError("objective criterion IDs must be bounded text")
-        if len(self.cfw_signals) > 32 or len(self.active_trigger_codes) > 32:
+        if (len(self.cfw_signals) > MAX_CFW_SIGNALS
+                or len(self.active_trigger_codes) > MAX_CFW_SIGNALS):
             raise ValueError("fast-loop input exceeds bounded signal counts")
         supported_frameworks = {"owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"}
         frameworks = tuple(self.available_frameworks)
-        if (len(frameworks) > 16 or len(frameworks) != len(set(frameworks))
+        if (len(frameworks) > MAX_AVAILABLE_FRAMEWORKS
+                or len(frameworks) != len(set(frameworks))
                 or any(not isinstance(value, str) or value.lower() not in supported_frameworks
                        for value in frameworks)):
             raise ValueError("available CFW frameworks are malformed")
         object.__setattr__(self, "available_frameworks",
                            tuple(value.lower() for value in frameworks))
+        floors = dict(self.cfw_suppression_modes or {})
+        if (len(floors) > MAX_AVAILABLE_FRAMEWORKS or not set(floors).issubset(
+                set(self.available_frameworks))):
+            raise ValueError("CFW suppression floors must be bounded to selected components")
+        normalized_floors = {}
+        for component, modes in floors.items():
+            if not isinstance(modes, (tuple, list)):
+                raise ValueError("CFW suppression floor modes are malformed")
+            values = tuple(modes)
+            if (not isinstance(component, str) or component.lower() != component
+                    or len(values) > 2
+                    or any(mode not in {"off", "passive"} for mode in values)
+                    or len(values) != len(set(values))):
+                raise ValueError("CFW suppression floor modes are malformed")
+            normalized_floors[component] = values
+        object.__setattr__(self, "cfw_suppression_modes", normalized_floors)
         if (self.actions_since_goal_progress < 0 or self.equivalent_retry_count < 0
                 or self.host_action_index < 0):
             raise ValueError("outcome counters must be non-negative")
@@ -69,7 +94,8 @@ class FastLoopInput:
                 for value in self.evidence_refs):
             raise ValueError("evidence references must be bounded")
         statuses = dict(self.criterion_status or {})
-        if len(statuses) > 256 or not set(statuses).issubset(set(self.objective_criteria)):
+        if (len(statuses) > MAX_GOAL_CRITERIA
+                or not set(statuses).issubset(set(self.objective_criteria))):
             raise ValueError("criterion status must be bounded to objective criteria")
         if any(status not in {"unmet", "in_progress", "verified", "blocked", "unknown"}
                for status in statuses.values()):
@@ -86,7 +112,8 @@ class FastLoopInput:
             if not set(self.attention_lease.criterion_ids).issubset(set(self.objective_criteria)):
                 raise ValueError("attention lease escapes the full objective set")
         seen = dict(self.attention_last_seen or {})
-        if len(seen) > 256 or not set(seen).issubset(set(self.objective_criteria)):
+        if (len(seen) > MAX_GOAL_CRITERIA
+                or not set(seen).issubset(set(self.objective_criteria))):
             raise ValueError("attention history must be bounded to objective criteria")
         if any(type(key) is not str or type(value) is not int or value < 0
                for key, value in seen.items()):

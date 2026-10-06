@@ -16,10 +16,11 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..behavior_state import (BEHAVIOR_MODES, FRAMEWORK_MODES, BehaviorState,
                               AttentionLease, CSWBehaviorSnapshot, GoalSetSnapshot)
 from ..attention import projected_starvation_risk
+from ..compatibility import MAX_AVAILABLE_FRAMEWORKS
 from ..routing_profiles import RoutingProfileError, condition_matches, validate_profile
 
 
-POLICY_PRIOR_VERSION = "1.0.0"
+POLICY_PRIOR_VERSION = "2.0.0"
 _CONTROL_VALUES = {
     "verification_intensity": {"passive", "normal", "high", "strict"},
     "exploration_budget": {"disabled", "low", "normal", "bounded"},
@@ -32,6 +33,11 @@ _CONTROL_NAMES = tuple(_CONTROL_VALUES)
 _MAX_CANDIDATES = 8
 _MAX_PRIORS = 64
 _VALIDATED_PRIOR_SEAL = object()
+_POLICY_COMPATIBILITY_FIELDS = frozenset({
+    "behavior_policy_contract_hash", "candidate_generator_contract_hash",
+    "dp_control_implementation_version", "dp_control_implementation_hash",
+    "candidate_policy_mapping_hash",
+})
 
 
 @dataclass(frozen=True)
@@ -150,7 +156,8 @@ class BehaviorCandidate:
             raise ValueError("behavior candidate has an unsupported cognitive mode")
         frameworks = {str(key).lower(): str(value)
                       for key, value in self.framework_modes.items()}
-        if (len(frameworks) > 16 or any(value not in FRAMEWORK_MODES
+        if (len(frameworks) > MAX_AVAILABLE_FRAMEWORKS
+                or any(value not in FRAMEWORK_MODES
                                         for value in frameworks.values())):
             raise ValueError("behavior candidate framework modes are malformed")
         controls = dict(self.controls)
@@ -271,6 +278,7 @@ class BehaviorPolicyPrior:
     sharing_scope: str
     evidence: CandidateEvidence
     version: str = POLICY_PRIOR_VERSION
+    compatibility: Mapping[str, str] = field(default_factory=dict)
     _seal: object = field(default=None, repr=False, compare=False)
 
     @property
@@ -294,9 +302,22 @@ class BehaviorPolicyPrior:
             raise ValueError("behavior policy prior requires validated candidate evidence")
         if self.evidence.evidence_class != "validated_experiment":
             raise ValueError("behavior policy prior requires validated experiment evidence")
+        if (not isinstance(self.compatibility, Mapping)
+                or set(self.compatibility) != _POLICY_COMPATIBILITY_FIELDS
+                or any(not isinstance(value, str) or not value
+                       for value in self.compatibility.values())):
+            raise ValueError("behavior policy prior compatibility pins are invalid")
+        for name in _POLICY_COMPATIBILITY_FIELDS - {
+                "dp_control_implementation_version"}:
+            digest = self.compatibility[name]
+            if (len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)):
+                raise ValueError("behavior policy prior compatibility hash is invalid")
         object.__setattr__(self, "context", MappingProxyType(dict(self.context)))
         object.__setattr__(self, "subject", MappingProxyType(dict(self.subject)))
         object.__setattr__(self, "condition", MappingProxyType(dict(self.condition)))
+        object.__setattr__(self, "compatibility",
+                           MappingProxyType(dict(self.compatibility)))
         if self.sharing_scope not in {"agent_private", "application_shared", "cross_application"}:
             raise ValueError("unsupported behavior policy sharing scope")
 
@@ -353,6 +374,15 @@ class BehaviorPolicyPrior:
             policy = adjustment.get("behavior_policy")
             if not isinstance(policy, Mapping):
                 continue
+            compatibility = receipt.get("candidate_policy_compatibility")
+            try:
+                from .session_registry import current_behavior_policy_compatibility
+                current_compatibility = current_behavior_policy_compatibility(policy)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            if (not isinstance(compatibility, Mapping)
+                    or dict(compatibility) != current_compatibility):
+                continue
             receipt_adjustment = receipt.get("candidate_adjustment") or {}
             if (not isinstance(receipt_adjustment, Mapping)
                     or receipt_adjustment.get("behavior_policy") != dict(policy)):
@@ -371,6 +401,7 @@ class BehaviorPolicyPrior:
                     condition=dict(adjustment.get("condition") or {}),
                     sharing_scope=str(profile.get("sharing_scope") or "agent_private"),
                     evidence=evidence,
+                    compatibility=dict(compatibility),
                     _seal=_VALIDATED_PRIOR_SEAL,
                 )
             except (KeyError, TypeError, ValueError):
@@ -413,6 +444,7 @@ class BehaviorPolicyPrior:
         return {
             "version": self.version,
             "candidate": self.candidate.policy_mapping(),
+            "compatibility": dict(self.compatibility),
             "profile_id": self.profile_id,
             "profile_hash": self.profile_hash,
             "receipt_id": self.receipt_id,
@@ -431,6 +463,7 @@ class BehaviorPolicyConstraints:
     available_frameworks: tuple[str, ...]
     goal_set: GoalSetSnapshot | None
     required_mode: str | None = None
+    cfw_suppression_modes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 class BehaviorConstraintResolver:
@@ -461,6 +494,8 @@ class BehaviorConstraintResolver:
             if not set(candidate.focus_criteria).issubset(runnable):
                 return "focus_includes_non_runnable_goal"
         for name, mode in candidate.framework_modes.items():
+            if mode in constraints.cfw_suppression_modes.get(name, ()):
+                return f"cfw_task_baseline_floor:{name}"
             if (mode != current.framework_modes.get(name)
                     and name not in set(constraints.available_frameworks)):
                 return "framework_not_available"

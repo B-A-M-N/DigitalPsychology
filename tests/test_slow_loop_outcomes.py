@@ -12,7 +12,7 @@ from lib.slow_loop import collect_intervention_credit_assignments
 
 def _event(event_id, event_type, *, actor="digitalpsychology_runtime",
            authority="digitalpsychology_runtime", status=None, attribution=None,
-           evidence_refs=(), goal_progress=None):
+           evidence_refs=(), goal_progress=None, preventive_utility=()):
     payload = {"behavior_intervention_id": "intv-a"}
     if event_type == "behavior_intervention_applied":
         payload.update({
@@ -30,6 +30,7 @@ def _event(event_id, event_type, *, actor="digitalpsychology_runtime",
             "behavior_intervention_artifact_changed": True,
             "behavior_intervention_repeated_approach": False,
             "behavior_intervention_verification_quality": "improved",
+            "behavior_intervention_preventive_utility": list(preventive_utility),
         })
     return Event(
         event_id=event_id, timestamp="2026-10-01T12:00:00Z",
@@ -82,3 +83,20 @@ def test_same_intervention_id_cannot_join_across_runtime_sessions():
 
     assert pairs == []
     assert observations == []
+
+
+def test_slow_loop_preserves_independently_supported_preventive_utility():
+    applied = _event("apply-preventive", "behavior_intervention_applied")
+    preventive = _event(
+        "outcome-preventive", "behavior_intervention_assessed",
+        authority="host_outcome_evaluator", status="effective",
+        attribution="supported", evidence_refs=("csw-evidence-2",),
+        goal_progress=False,
+        preventive_utility=("prevented_invalid_completion",))
+
+    pairs, _ = collect_intervention_credit_assignments([applied, preventive])
+
+    assert len(pairs) == 1
+    assert pairs[0]["outcome"] == "effective"
+    assert pairs[0]["goal_progress"] is False
+    assert pairs[0]["preventive_utility"] == ["prevented_invalid_completion"]
