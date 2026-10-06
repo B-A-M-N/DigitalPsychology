@@ -1,9 +1,14 @@
 # DigitalPsychology
 
-> **Meta-meta behavioral control for AI agents.**
-> DP manages the behavioral configuration during a task, then measures whether its interventions improve outcomes across tasks.
+> **External cognitive-behavioral control and learning plane.**
+> DP adapts optional behavior during a task and measures intervention outcomes across independent trajectories.
 
-DigitalPsychology (DP) owns the meaning and transition policy of `BehaviorState`. Its fast loop combines runtime outcomes, CognitiveFrameWorks signals, bounded CognitiveStateWorks snapshots, and optional Laya/Jev judgments to choose temporary behavioral interventions. Its slow loop evaluates those interventions over independent trajectories.
+DigitalPsychology (DP) sits outside the controlled agent's runtime. A trusted
+host calls it automatically at task and action boundaries; the agent does not
+invoke DP. DP owns the meaning and transition policy of `BehaviorState`. Its
+fast loop uses runtime outcomes, CFW signals, CSW snapshots, and optional
+Laya/Jev judgments to choose bounded temporary interventions. Its slow loop
+evaluates those interventions over independent trajectories.
 
 It was originally conceived as another behavioral skill pack. That became the wrong abstraction.
 
@@ -15,7 +20,13 @@ DP does not infer subjective experience. It uses observable behavior to decide w
 
 ## Current implementation
 
-DigitalPsychology owns the cross-system runtime host. The private control MCP in `lib/transport/control_mcp.py` runs DP's decision engine out of process; `lib/host/` keeps the persistent MCP client, lifecycle bridge, and local CFW/CSW actuators. The older `RuntimeSession` remains an in-process compatibility adapter. DP does not grant permissions, define legal StateWork transitions, validate evidence, or replace either system's authority.
+DP supplies the host-side behavioral controller. The private control MCP in
+`lib/transport/control_mcp.py` runs its decision engine out of process;
+`lib/host/` provides the private client, lifecycle bridge, and CFW/CSW adapters.
+The trusted execution host owns the overall agent session. The older
+`RuntimeSession` remains an in-process compatibility adapter. DP does not grant
+permissions, define legal StateWork transitions, validate evidence, or replace
+either system's authority.
 
 Implemented capabilities include:
 
@@ -34,7 +45,7 @@ Implemented capabilities include:
 - **Transactional intervention event outbox** that commits authenticated application and outcome events with the DP behavior revision, then retries delivery idempotently after restarts.
 - **Constrained StateWork preferences** ranked only from the eligible choices supplied by CSW. DP cannot commit or legalize a CSW transition.
 - **A versioned private MCP control protocol** with prepare/apply/commit/abort/reconcile transactions, exact directive receipts, and restart recovery against CFW and CSW revisions.
-- **One sequenced control boundary** for task start, pre-model, pre-action, post-action, validator, workflow, operator, and pre-completion observations. Pre-action candidates are bounded and sanitized; non-action boundaries do not age intervention horizons, and action counters advance only after completed host actions.
+- **One sequenced control boundary** for task start, pre-model, pre-tool-planning, pre-action, post-action, validator, workflow, operator, and pre-completion observations. Pre-model and pre-tool-planning traces remain distinct at the same action index. Pre-action candidates are bounded and sanitized; non-action boundaries do not age intervention horizons, and action counters advance only after completed host actions.
 - **Separate model and audit projections** so prompts receive replaceable goal guidance while intervention IDs, authority revisions, hashes, and reconciliation metadata remain host-private.
 - **Host failure semantics** that retain the last committed behavior projection when DP is unavailable; CFW hard action gates and CSW legality remain active.
 
@@ -46,7 +57,7 @@ The bridge retains a bounded receipt for the last System-1 query in its
 host-only audit projection. The semantic answer is not copied into model
 context.
 
-The private `digital-psychology-control-mcp` is started by `HostControlBridge` and is not a Codex model-visible MCP server. The legacy `digital-psychology-mcp` entry point fails closed unless explicitly enabled; `digital-psychology-admin-mcp` is for a trusted operator namespace. Keep the control process on the host side of the tool boundary.
+The private `digital-psychology-control-mcp` is started by `HostControlBridge` and is not a Codex model-visible MCP server. Before opening a bridge, the trusted host supplies the controlled agent's complete model-visible tool registry; DP rejects a registry that contains its private control or admin tools. An absent or partial registry cannot prove that every agent-facing tool is hidden. The legacy `digital-psychology-mcp` entry point fails closed unless explicitly enabled; `digital-psychology-admin-mcp` is for a trusted operator namespace. Keep the control process on the host side of the tool boundary.
 
 The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
 
@@ -109,6 +120,39 @@ The full three-system deployment is the intended setup when adaptive behavior
 should be coordinated across components and workflows. CFW and CSW also have
 independent standalone entry points and work together without DP installed.
 
+## Hard authority boundaries
+
+DP chooses bounded behavioral adjustments from host-supplied eligible choices.
+It cannot disable WARD, lower CFW component floors, authorize an action, bypass
+CFW's preflight or final action gate, rewrite CSW evidence, or make an illegal
+workflow transition valid. CSW validates each workflow activation, release,
+and transition against its own registry and revision. The trusted host owns
+tool execution and completion evidence. Optional Laya/Jev judgments can inform
+DP's choice; they do not grant authority.
+
+## Direct Codex qualification
+
+CFW connects directly to the regular packaged Codex CLI through the generic
+App Server protocol. That path is independent of HarvardCodex Control. The
+trusted host registers CFW actions; DP's private control MCP stays on the host
+side and is not placed in the model-visible tool registry. Codex's internal
+inference and planning boundaries are not intercepted.
+
+The four-defect coding fixture is an integration and non-regression check. Its
+baseline reached 4/4 on all 10 trials in the recorded run, so it does not leave
+room to measure general behavioral improvement. A later single development
+triad run completed 4/4 with 24 host tool calls and 48 CFW gate receipts. It is
+one noncanonical sample and does not establish an effect. See CFW's
+[`live-results` index](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/evaluation_fixtures/live-results/README.md)
+for provenance and limitations.
+
+ChatGPT-mode App Server attempts stopped during workspace-routing discovery
+before the host or model turn began. The completed direct sample used
+FreeInference's external-provider Responses route with the regular packaged
+Codex CLI. The recorded host policy exposed zero DP tools to the model. These
+results establish integration for the recorded fixture, not behavioral
+superiority; the baseline was already at the fixture ceiling.
+
 ### Wiring the trusted runtime host
 
 The host supplies explicit CFW and optional CSW ports to DP. It calls
@@ -139,10 +183,16 @@ maximum is 258 only when all 256 criteria are runnable. The prompt may show
 the current attention window, while the host keeps the full goal set for
 completion checks.
 
+Host task-list items are required by default. The host may explicitly mark an
+item optional, in which case DP excludes it from required-work attention and
+completion. DP does not schedule optional items; the host owns any separate
+best-effort budget or may omit them intentionally.
+
 Every intervention records its cause, condition identity, target criteria,
 expected effect, baseline, action horizon, and applied-directive receipt. The
 condition identity includes the host's approach epoch, evidence basis,
-goal-set revision, and relevant CSW workflow state. After the horizon,
+target-criterion facts, and relevant CSW workflow state. Unrelated goal-set
+revision changes do not reset a criterion's failure history. After the horizon,
 DP evaluates objective progress from independent host, CSW, or validator
 evidence. Agent claims and changed files alone do not establish success.
 Targeted progress can earn credit only when the measured window also accounts
@@ -519,9 +569,11 @@ DP therefore records interaction and delegation provenance and distinguishes ind
 DigitalPsychology owns both the bounded fast controller and the evidence driven slow learner.
 
 ```text
-During a task:  CFW + CSW → observe and govern their domains
-                DP → select bounded behavior interventions
-                host evidence → score each intervention
+During a task:  host event
+                → CFW and CSW provide bounded state
+                → DP selects optional behavior changes
+                → host applies only legal changes
+                → host evidence scores each intervention
 
 Across tasks:   DP → reconstruct → compare → experiment
                   → validate → affect future composition
@@ -552,15 +604,22 @@ Fast-loop changes carry bounded leases and independent outcomes. Slow-loop polic
 ## The three-system model
 
 ```text
-CognitiveFrameWorks
-    HOW should the agent behave?
-
-CognitiveStateWorks
-    WHAT behavior and transitions are appropriate NOW?
-
 DigitalPsychology
-    WHY does this behavior recur under THESE CONDITIONS,
-    and WHAT ACTUALLY CHANGES IT?
+(optional external behavior controller)
+              │ private bounded decisions
+              ▼
+       Trusted execution host
+          /             \\
+         ▼               ▼
+        CFW             CSW
+ component/action     workflow/state
+ enforcement          authority
+         \\               /
+          \\             /
+          Controlled agent
+                 │
+       host outcomes and evidence
+                 └──────────────► DP
 ```
 
 CFW provides cognitive components, signals, and enforcement. CSW provides authoritative workflow state and legal transitions. DigitalPsychology owns cross-system behavioral adaptation and measures whether its interventions improve progress toward the user's objective.
