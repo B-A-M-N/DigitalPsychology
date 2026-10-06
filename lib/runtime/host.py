@@ -13,6 +13,7 @@ from .contracts import (BehavioralDecisionService, CFWComponentPort,
 from .adapters.standalone import NullCFWComponentPort, NullCSWWorkflowPort
 from .session import RuntimeSession
 from .store import BehaviorStateStore
+from ..compatibility import CFW_ADAPTER_PROTOCOL_VERSION, CSW_ADAPTER_PROTOCOL_VERSION
 
 
 class RuntimeHost:
@@ -23,12 +24,15 @@ class RuntimeHost:
     def __init__(self, *, service: BehavioralDecisionService | None = None,
                  state_path: Path | None = None,
                  system_one_frame_factory: SystemOneFrameFactory | None = None,
-                 session_cache_limit: int = SESSION_CACHE_LIMIT) -> None:
+                 session_cache_limit: int = SESSION_CACHE_LIMIT,
+                 model_visible_tools: Sequence[str] | None = None) -> None:
         if type(session_cache_limit) is not int or not 1 <= session_cache_limit <= 4096:
             raise ValueError("runtime session cache limit must be between 1 and 4096")
         self.service = service
         self.system_one_frame_factory = system_one_frame_factory
         self.session_cache_limit = session_cache_limit
+        self.model_visible_tools = (tuple(model_visible_tools)
+                                    if model_visible_tools is not None else None)
         if state_path is None:
             state_path = trusted_state_root() / "behavior-state.sqlite3"
         self.state_store = (BehaviorStateStore(Path(state_path))
@@ -123,7 +127,7 @@ class RuntimeHost:
             if not isinstance(cfw_identity, Mapping) or not required.issubset(cfw_identity):
                 raise ValueError("CFW did not advertise its complete authority identity")
             if (cfw_identity["adapter_kind"] != "cfw-component-runtime"
-                    or cfw_identity["adapter_protocol_version"] != "1.2.0"):
+                    or cfw_identity["adapter_protocol_version"] != CFW_ADAPTER_PROTOCOL_VERSION):
                 raise ValueError("CFW adapter identity or protocol version is incompatible")
         cfw_version = _declared(cfw, "behavior_projection_version")
         if not isinstance(cfw, NullCFWComponentPort) and cfw_version is None:
@@ -136,11 +140,12 @@ class RuntimeHost:
             provider = getattr(csw, "authority_identity", None)
             csw_identity = provider() if callable(provider) else provider
             required = {"adapter_kind", "authority_id", "adapter_protocol_version",
-                        "workflow_port_version", "scope_hash", "capability_hash"}
+                        "workflow_port_version", "registry_hash", "scope_hash",
+                        "capability_hash"}
             if not isinstance(csw_identity, Mapping) or not required.issubset(csw_identity):
                 raise ValueError("CSW did not advertise its complete authority identity")
             if (csw_identity["adapter_kind"] != "csw-workflow-authority"
-                    or csw_identity["adapter_protocol_version"] != "1.1.0"):
+                    or csw_identity["adapter_protocol_version"] != CSW_ADAPTER_PROTOCOL_VERSION):
                 raise ValueError("CSW adapter identity or protocol version is incompatible")
         csw_version = _declared(csw, "workflow_port_version")
         if not isinstance(csw, NullCSWWorkflowPort) and csw_version is None:
@@ -192,6 +197,11 @@ class RuntimeHost:
                                   fault_handler: Any = None):
         """Open a host-driven session whose decisions cross the private DP MCP."""
         from ..host.bridge import HostControlBridge
+        if self.model_visible_tools is None:
+            raise RuntimeError(
+                "host must supply the controlled agent's tool registry before opening DP control")
+        from ..host.tool_visibility import assert_dp_tools_not_model_visible
+        assert_dp_tools_not_model_visible(self.model_visible_tools)
         cfw_port = cfw if cfw is not None else NullCFWComponentPort()
         csw_port = csw if csw is not None else NullCSWWorkflowPort()
         self._check_contract_versions(cfw_port, csw_port)

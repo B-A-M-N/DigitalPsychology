@@ -5,6 +5,8 @@ import time
 from typing import Any, Mapping
 
 from ..feedback_loop import EventError, EventFactory, SQLiteSink
+from ..compatibility import CFW_RUNTIME_EVENT_SCHEMA_VERSION
+from ..runtime_event_adapter import from_cfw_runtime_event
 from ..security.attestation import EventAttestationAuthority
 
 
@@ -45,7 +47,10 @@ class BehaviorEventIngestor:
                 attestation = data.pop("host_attestation", None)
             authenticated = self.attestation.attest(
                 data, attestation if isinstance(attestation, Mapping) else None)
-            parsed = EventFactory.from_dict(data)
+            if data.get("schema_version") == CFW_RUNTIME_EVENT_SCHEMA_VERSION:
+                parsed = from_cfw_runtime_event(data)
+            else:
+                parsed = EventFactory.from_dict(data)
             origin = (parsed.namespace_id, parsed.application_instance_id)
             now = time.monotonic()
             recent = [stamp for stamp in self._pending_origins.get(origin, ())

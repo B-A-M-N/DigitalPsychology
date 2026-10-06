@@ -4,6 +4,9 @@ from pathlib import Path
 import sys
 import json
 from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,6 +19,8 @@ from lib.outcomes import HostOutcomeFact
 from lib.runtime import (BehaviorStateStore, CFWRuntimeAdapter, RuntimeHost,
                          RuntimeIdentity, RuntimeObservation)
 from lib.runtime.adapters import NullCFWComponentPort, NullCSWWorkflowPort
+from lib.runtime.adapters.csw import CSWRuntimeAdapter
+from lib.host.projection_manager import HostProjectionManager
 from lib.behavior_state import AttentionLease
 from lib.attention import AttentionSchedule, fairness_bound_actions
 from lib.protocol_artifact import QUESTION_REGISTRY
@@ -36,7 +41,7 @@ class _CFWPort:
     def authority_identity(self):
         return {"adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
                 "adapter_protocol_version": "1.2.0",
-                "behavior_projection_version": "2.0.0",
+                "behavior_projection_version": "2.1.0",
                 "scope_hash": "a" * 64, "capability_hash": "b" * 64}
 
     def available_component_ids(self):
@@ -110,7 +115,8 @@ class _CSWPort:
 
     def authority_identity(self):
         return {"adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-                "adapter_protocol_version": "1.1.0", "workflow_port_version": "1.2.0",
+                "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.4.0",
+                "registry_hash": "e" * 64,
                 "scope_hash": "c" * 64, "capability_hash": "d" * 64}
 
     def behavioral_snapshot(self, *, candidate_statework_ids=None):
@@ -122,6 +128,7 @@ class _CSWPort:
                                       if item.statework_id not in self.active),
             workflow_states={item: "UNKNOWN" for item in self.active},
             snapshot_id=("a" * 64),
+            registry_hash="e" * 64,
             workflow_revisions={item: 0 for item in self.active},
             eligible_steps={item: ("inspect",) for item in self.active},
         )
@@ -160,6 +167,48 @@ class _CSWPort:
         return {"accepted": True, "revision": expected_workflow_revision + 1}
 
 
+def _projection_manager_with_mutable_identities():
+    class MutableCFW(_CFWPort):
+        def __init__(self):
+            super().__init__()
+            self.capability = "b" * 64
+
+        def authority_identity(self):
+            return {**super().authority_identity(), "capability_hash": self.capability}
+
+    class MutableCSW(_CSWPort):
+        def __init__(self):
+            super().__init__()
+            self.registry = "e" * 64
+
+        def authority_identity(self):
+            return {**super().authority_identity(), "registry_hash": self.registry}
+
+    cfw, csw = MutableCFW(), MutableCSW()
+    bridge = SimpleNamespace(
+        cfw=cfw, csw=csw, _cfw_components=cfw.available_component_ids(),
+        _session_descriptor=SimpleNamespace(
+            cfw_authority_identity=cfw.authority_identity(),
+            csw_authority_identity=csw.authority_identity()))
+    return HostProjectionManager(bridge), cfw, csw
+
+
+def test_session_snapshot_rejects_live_cfw_identity_drift():
+    manager, cfw, _ = _projection_manager_with_mutable_identities()
+    cfw.capability = "f" * 64
+
+    with pytest.raises(RuntimeError, match="CFW authority identity changed"):
+        manager._csw_snapshot()
+
+
+def test_session_snapshot_rejects_live_csw_registry_reload():
+    manager, _, csw = _projection_manager_with_mutable_identities()
+    csw.registry = "f" * 64
+
+    with pytest.raises(RuntimeError, match="CSW authority identity changed"):
+        manager._csw_snapshot()
+
+
 class _EvidenceAuthority:
     def __init__(self, facts):
         self.facts = facts
@@ -195,6 +244,28 @@ class _FailOnceEventDispatchService(DigitalPsychologyService):
             self.fail_next_dispatch = False
             raise OSError("simulated event sink interruption")
         return super().dispatch_runtime_event(value)
+
+
+class _SignalRecordingService(DigitalPsychologyService):
+    def __init__(self, *, event_db):
+        super().__init__(event_db=event_db)
+        self.cfw_signal_batches = []
+
+    def decide_behavior(self, context, *, judgment=None):
+        self.cfw_signal_batches.append(tuple(context.cfw_signals))
+        return super().decide_behavior(context, judgment=judgment)
+
+
+class _FailOnceSignalAckCFWPort(_CFWPort):
+    def __init__(self):
+        super().__init__()
+        self.acknowledgement_attempts = 0
+
+    def acknowledge_behavior_signals(self, *, through_cursor):
+        self.acknowledgement_attempts += 1
+        if self.acknowledgement_attempts == 1:
+            raise OSError("simulated CFW signal acknowledgement interruption")
+        super().acknowledge_behavior_signals(through_cursor=through_cursor)
 
 
 def _system_one_frame(identity):
@@ -261,6 +332,13 @@ def _identity():
         workflow_id="workflow-1", subject_ref="repo:example", segment_id="segment-0",
         agent_id="agent-1", behavioral_subject="task-1", goal_contract_hash="a" * 64,
     )
+
+
+def test_production_csw_adapter_requires_durable_selection_checkpoints():
+    incomplete_authority = SimpleNamespace(workflow_port_version="1.4.0")
+
+    with pytest.raises(ValueError, match="durable selection checkpoint operations"):
+        CSWRuntimeAdapter(incomplete_authority, identity=_identity(), bindings={})
 
 
 def test_runtime_host_applies_cfw_controls_and_credits_host_verified_progress(tmp_path):
@@ -587,6 +665,63 @@ def test_runtime_event_outbox_recovers_after_host_restart(tmp_path):
         assert len(delivered) == 1
         assert delivered[0]["event_type"] == "behavior_intervention_applied"
         assert not BehaviorStateStore(state_path).pending_outbox(identity.scope)
+    finally:
+        resumed_service.close()
+
+
+def test_cfw_signal_ack_failure_does_not_replay_after_dp_restart(tmp_path):
+    identity = _identity()
+    state_path = tmp_path / "behavior-state.sqlite3"
+    event_path = tmp_path / "events.sqlite3"
+    cfw_port = _FailOnceSignalAckCFWPort()
+    csw = _CSWPort()
+
+    service = _SignalRecordingService(event_db=event_path)
+    host = RuntimeHost(service=service, state_path=state_path)
+    session = host.open_session(
+        identity=identity, objective="Render the requested page",
+        objective_criteria=("criterion-visual",),
+        cfw=CFWRuntimeAdapter(cfw_port), csw=csw,
+        outcome_evidence_authority=_EvidenceAuthority({}),
+    )
+
+    with pytest.raises(RuntimeError, match="CFW signal acknowledgement failed"):
+        session.process_action(RuntimeObservation(
+            action_index=1, equivalent_retry_count=2,
+            criterion_status={"criterion-visual": "unmet"},
+        ))
+
+    committed = BehaviorStateStore(state_path).load(identity.scope)
+    assert committed.action_index == 1
+    assert committed.cfw_signal_cursor == 1
+    assert cfw_port.signal_ack_cursor == 0
+    assert len(service.cfw_signal_batches) == 1
+    assert len(service.cfw_signal_batches[0]) == 1
+    host.close()
+    service.close()
+
+    resumed_service = _SignalRecordingService(event_db=event_path)
+    try:
+        resumed_host = RuntimeHost(service=resumed_service, state_path=state_path)
+        resumed_session = resumed_host.open_session(
+            identity=identity, objective="Render the requested page",
+            objective_criteria=("criterion-visual",),
+            cfw=CFWRuntimeAdapter(cfw_port), csw=csw,
+            outcome_evidence_authority=_EvidenceAuthority({}),
+        )
+
+        resumed_session.process_action(RuntimeObservation(
+            action_index=2,
+            criterion_status={"criterion-visual": "unmet"},
+        ))
+
+        assert len(resumed_service.cfw_signal_batches) == 1
+        assert resumed_service.cfw_signal_batches[0] == ()
+        assert cfw_port.acknowledgement_attempts == 2
+        assert cfw_port.signal_ack_cursor == 1
+        resumed = BehaviorStateStore(state_path).load(identity.scope)
+        assert resumed.action_index == 2
+        assert resumed.cfw_signal_cursor == 1
     finally:
         resumed_service.close()
 

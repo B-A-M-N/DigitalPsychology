@@ -27,22 +27,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CFW_ROOT = ROOT.parent / "CognitiveFrameWorks"
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(CFW_ROOT / "scripts"))
 from lib.feedback_loop import (Guard, GuardRegistry, ReceiptBuilder,  # noqa: E402
                                ReceiptRegistry, TrialEvidence, guard_semantic_hash)
 from lib.receipts import DEFAULT_PRODUCTION_CRITERION  # noqa: E402
 
 
 def load_module(name: str, path: Path):
-    if name == "cross_runtime" and "resolve_runtime" in sys.modules:
-        del sys.modules["resolve_runtime"]
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    if name == "cross_runtime":
-        sys.modules["resolve_runtime"] = sys.modules["cross_resolve_runtime"]
     spec.loader.exec_module(module)
     if name == "cross_runtime":
-        assert module.resolve_runtime is sys.modules["cross_resolve_runtime"]
+        assert module.resolve_runtime.__name__ == "resolver.api"
     return module
 
 
@@ -63,6 +60,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="dp-cfw-loop-") as raw_root:
         state_root = Path(raw_root) / "trusted-state"
         os.environ["DIGITALPSYCHOLOGY_STATE_ROOT"] = str(state_root)
+        os.environ["XDG_RUNTIME_DIR"] = str(Path(raw_root) / "xdg")
 
         registry = GuardRegistry(default_to_trusted_state=True)
         receipts = ReceiptRegistry(default_to_trusted_state=True)
@@ -119,17 +117,18 @@ def main() -> int:
         assert resolve_runtime.dp_trusted_guard_pack_path() == trusted_pack_path
         runtime_root = Path(raw_root) / "cfw-runtime"
         resolve_runtime.runtime_state_dir = lambda: runtime_root
+        runtime.resolve_runtime.runtime_state_dir = lambda: runtime_root
 
         canary_request = resolve_runtime.TaskRequest(
-            task_id="canary-task", application_id="digital-psychology", subject_ref="claim", shape="implement",
-            domain_tags=("debug",), model="no-model", harness="cross-system")
+            task_id="canary-task", application_id="digital-psychology",
+            shape="implement", model="no-model", harness="cross-system")
         canary_bundle = resolve_runtime.resolve(canary_request)
         canary_keys = {g["key"] for g in canary_bundle.guard_pack["guards"]}
         assert "G-cross-system@1" in canary_keys, canary_keys
         noncanary_bundle = resolve_runtime.resolve(
             resolve_runtime.TaskRequest(
-                task_id="noncanary-task", application_id="digital-psychology", subject_ref="claim", shape="implement",
-                domain_tags=("debug",), model="no-model", harness="cross-system"))
+                task_id="noncanary-task", application_id="digital-psychology",
+                shape="implement", model="no-model", harness="cross-system"))
         assert "G-cross-system@1" not in {
             g["key"] for g in noncanary_bundle.guard_pack["guards"]}
         assert canary_bundle.pinned["policy_hash"] != noncanary_bundle.pinned["policy_hash"]
@@ -178,7 +177,7 @@ def main() -> int:
         assert export_active.returncode == 0, export_active.stdout + export_active.stderr
 
         active_bundle = resolve_runtime.resolve(
-            "after-promotion", "implement", ["debug"])
+            "after-promotion", "implement", [])
         assert "G-cross-system@1" in {
             g["key"] for g in active_bundle.guard_pack["guards"]}
 

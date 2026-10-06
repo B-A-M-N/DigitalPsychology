@@ -24,7 +24,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "2.7.0"
+      "const": "2.9.0"
     },
     "event_id": {
       "type": "string",
@@ -380,6 +380,15 @@
         },
         "candidate_adjustment_applied": {
           "type": "boolean"
+        },
+        "policy_outcome_correct_progress": {
+          "type": ["boolean", "null"]
+        },
+        "policy_outcome_regression": {
+          "type": ["boolean", "null"]
+        },
+        "policy_outcome_repeated_failure": {
+          "type": ["boolean", "null"]
         },
         "intervention_assigned": {
           "type": "boolean"
@@ -1004,6 +1013,19 @@
           "type": ["string", "null"],
           "maxLength": 128
         },
+        "behavior_intervention_preventive_utility": {
+          "type": "array",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "prevented_invalid_completion",
+              "caught_change_induced_regression",
+              "detected_preexisting_regression",
+              "prevented_unsafe_action"
+            ]
+          }
+        },
         "behavior_intervention_artifact_changed": {
           "type": ["boolean", "null"]
         },
@@ -1016,12 +1038,34 @@
         "source_decision_id": {
           "type": "string",
           "maxLength": 256
+        },
+        "runtime_metadata": {
+          "type": "object",
+          "description": "Opaque bounded metadata translated from a neutral host-runtime event.",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "$ref": "#/$defs/runtime_metadata_value"
+          }
         }
       },
       "additionalProperties": false
     }
   },
   "additionalProperties": false,
+  "$defs": {
+    "runtime_metadata_value": {
+      "oneOf": [
+        {"type": "string", "maxLength": 4096},
+        {"type": "number", "minimum": -1000000000000, "maximum": 1000000000000},
+        {"type": "boolean"},
+        {"type": "null"},
+        {"type": "array", "maxItems": 256,
+         "items": {"$ref": "#/$defs/runtime_metadata_value"}},
+        {"type": "object", "maxProperties": 64,
+         "additionalProperties": {"$ref": "#/$defs/runtime_metadata_value"}}
+      ]
+    }
+  },
   "allOf": [
     {
       "if": {

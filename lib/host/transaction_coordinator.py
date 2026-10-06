@@ -174,6 +174,8 @@ class HostTransactionCoordinator:
                 self.host._needs_reconciliation = True
                 return self.host._degraded("DP control prepare unavailable", exc)
             raise
+        if prepared.get("status") == "unchanged":
+            return {**self.host._status(prepared), "status": "unchanged"}
         if prepared.get("status") == "committed":
             result = prepared.get("committed_result")
             if not isinstance(result, Mapping):
@@ -245,10 +247,17 @@ class HostTransactionCoordinator:
                 )
             raise
         self.host._accept_committed(result, goals)
+        if any(item.get("operation") in {"release_statework", "prefer_statework"}
+               for item in prepared.get("csw_directives") or ()):
+            finalize_checkpoint = getattr(
+                self.host.csw, "finalize_selection_checkpoint", None)
+            if callable(finalize_checkpoint):
+                finalize_checkpoint(tick_id=str(prepared["tick_id"]))
         self.host._record_system_one_observation(prepared, tick_status="committed")
         self.host._offline_controls_expired = False
         self.host._fault = None
         self.host._needs_reconciliation = False
+        self.host._clear_degradation_periods()
         try:
             self.host._acknowledge_cfw_signals(cfw_signal_batch.next_cursor)
         except Exception as exc:

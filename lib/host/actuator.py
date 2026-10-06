@@ -2,12 +2,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Mapping, Sequence
 
 from ..behavior_state import (BehaviorState, CSWBehaviorSnapshot,
                               StateWorkReleaseResult)
+from ..compatibility import MAX_CONTROL_BATCH_ITEMS
 from ..lease_window import intervention_expiry
 from ..runtime.cfw_projection import build_cfw_behavior_projection
+
+_LOG = logging.getLogger(__name__)
+
+
+def _metric_increment(metrics: Any, name: str) -> None:
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        try:
+            increment(name)
+        except Exception:
+            _LOG.warning("could not persist an authority rejection metric", exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -28,12 +41,14 @@ class ActuationFailure(RuntimeError):
 class ControlActuator:
     """Apply host-local changes; DP has no reference to this actuator."""
 
-    def __init__(self, *, cfw: Any = None, csw: Any = None) -> None:
+    def __init__(self, *, cfw: Any = None, csw: Any = None,
+                 production_metrics: Any = None) -> None:
         if cfw is None:
             from ..runtime.adapters.standalone import NullCFWComponentPort
             cfw = NullCFWComponentPort()
         self.cfw = cfw
         self.csw = csw
+        self.production_metrics = production_metrics
 
     def apply(self, prepared: Mapping[str, Any]) -> ControlApplication:
         basis = dict(prepared.get("basis") or {})
@@ -68,9 +83,29 @@ class ControlActuator:
         cfw_prepared = None
         cfw_attempted = False
         csw_changes: list[tuple[str, dict[str, Any]]] = []
+        checkpoint_created = False
+        tick_id = str(prepared.get("tick_id") or "")
         applied: set[str] = set()
+        authority_stage: str | None = None
         try:
+            if csw_directives:
+                authority_stage = "csw"
+                checkpoint = getattr(self.csw, "checkpoint_selection", None)
+                restore = getattr(self.csw, "restore_selection_checkpoint", None)
+                finalize = getattr(self.csw, "finalize_selection_checkpoint", None)
+                if not all(callable(method) for method in
+                           (checkpoint, restore, finalize)):
+                    raise RuntimeError(
+                        "CSW StateWork changes require durable selection checkpoints")
+                if not tick_id:
+                    raise ValueError(
+                        "prepared DP decision has no tick ID for CSW rollback")
+                checkpoint(tick_id=tick_id,
+                           expected_selection_revision=snapshot.revision)
+                checkpoint_created = True
+
             if cfw_connected:
+                authority_stage = "cfw"
                 cfw_prepared = self.cfw.prepare_behavior_directives(cfw_directives)
                 cfw_attempted = True
                 returned = tuple(self.cfw.apply_behavior_projection(
@@ -79,7 +114,18 @@ class ControlActuator:
                 if len(returned) != len(set(returned)) or set(returned) != expected:
                     raise RuntimeError("CFW did not confirm the exact prepared directives")
                 applied.update(returned)
+            else:
+                # The trusted host owns model-facing projections when CFW is
+                # absent. Component-mode changes still require CFW's runtime.
+                host_projectable = tuple(
+                    item for item in cfw_directives
+                    if item["operation"] in {"set_mode", "set_control"})
+                if len(host_projectable) != len(cfw_directives):
+                    raise RuntimeError(
+                        "DP requested component changes without a CFW authority")
+                applied.update(item["directive_id"] for item in host_projectable)
 
+            authority_stage = "csw" if csw_directives else None
             releases = [item for item in csw_directives
                         if item["operation"] == "release_statework"]
             activations = [item for item in csw_directives
@@ -89,7 +135,11 @@ class ControlActuator:
             if len({item["target"] for item in csw_directives}) != len(csw_directives):
                 raise ValueError("DP requested duplicate CSW StateWork changes")
 
-            for directive in releases + activations:
+            # Activate newly selected workflows before releasing old ones.
+            # A newly selected workflow may depend on a workflow being
+            # replaced; CSW will retain that prerequisite under dependency
+            # ownership when its release is processed afterward.
+            for directive in activations + releases:
                 statework_id = directive["target"]
                 intervention_id = directive.get("intervention_id")
                 if not isinstance(intervention_id, str) or not intervention_id:
@@ -127,8 +177,13 @@ class ControlActuator:
                             raise RuntimeError("CSW did not confirm StateWork release")
                 else:
                     eligible = {item.statework_id for item in snapshot.eligible_stateworks}
-                    if directive.get("value") != "preferred" or statework_id not in eligible:
-                        raise RuntimeError("CSW activation is outside current eligibility")
+                    if directive.get("value") != "preferred":
+                        raise RuntimeError("CSW activation directive value is invalid")
+                    if statework_id not in eligible:
+                        raise RuntimeError(
+                            "CSW activation target is outside current eligibility "
+                            f"(target={statework_id!r}, eligible={sorted(eligible)}, "
+                            f"active={sorted(snapshot.active_stateworks)})")
                     expires_at_action = self._directive_expiry(directive)
                     owner_expiry = intervention_expiry(
                         state.get("active_interventions") or (), intervention_id)
@@ -159,41 +214,58 @@ class ControlActuator:
                 raise RuntimeError("CFW did not materialize the candidate behavior revision")
             return ControlApplication(tuple(sorted(applied)), cfw_revision, snapshot)
         except Exception as failure:
+            if authority_stage == "cfw" and cfw_directives:
+                _metric_increment(
+                    self.production_metrics, "cfw_directive_rejections")
+            elif authority_stage == "csw" and csw_directives:
+                _metric_increment(
+                    self.production_metrics, "csw_directive_rejections")
             errors = []
             if cfw_attempted:
                 try:
                     self.cfw.rollback_behavior_directives(cfw_prepared)
                 except Exception as exc:
                     errors.append(f"CFW rollback failed: {exc}")
-            for operation, directive in reversed(csw_changes):
+            if checkpoint_created:
                 try:
-                    statework_id = directive["target"]
-                    intervention_id = directive["intervention_id"]
                     current = self._snapshot(candidate_ids)
-                    if operation == "prefer_statework":
-                        if statework_id in current.active_stateworks:
-                            current = self.csw.deactivate_statework(
-                                statework_id,
-                                expected_selection_revision=current.revision,
-                                candidate_statework_ids=candidate_ids,
-                                intervention_id=intervention_id,
-                            )
-                        if statework_id in current.active_stateworks:
-                            raise RuntimeError("CSW did not confirm activation rollback")
-                    else:
-                        if statework_id not in current.active_stateworks:
-                            current = self.csw.activate_statework(
-                                statework_id,
-                                expected_selection_revision=current.revision,
-                                candidate_statework_ids=candidate_ids,
-                                intervention_id=intervention_id,
-                                expires_at_action=int(directive["expires_at_action"]),
-                            )
-                        if statework_id not in current.active_stateworks:
-                            raise RuntimeError("CSW did not confirm release rollback")
+                    restored = self.csw.restore_selection_checkpoint(
+                        tick_id=tick_id,
+                        expected_selection_revision=current.revision)
+                    if restored is None:
+                        raise RuntimeError("CSW rollback checkpoint disappeared")
                 except Exception as exc:
-                    errors.append(
-                        f"CSW rollback failed for {directive.get('target')}: {exc}")
+                    errors.append(f"CSW exact selection restore failed: {exc}")
+            else:
+                for operation, directive in reversed(csw_changes):
+                    try:
+                        statework_id = directive["target"]
+                        intervention_id = directive["intervention_id"]
+                        current = self._snapshot(candidate_ids)
+                        if operation == "prefer_statework":
+                            if statework_id in current.active_stateworks:
+                                current = self.csw.deactivate_statework(
+                                    statework_id,
+                                    expected_selection_revision=current.revision,
+                                    candidate_statework_ids=candidate_ids,
+                                    intervention_id=intervention_id,
+                                )
+                            if statework_id in current.active_stateworks:
+                                raise RuntimeError("CSW did not confirm activation rollback")
+                        else:
+                            if statework_id not in current.active_stateworks:
+                                current = self.csw.activate_statework(
+                                    statework_id,
+                                    expected_selection_revision=current.revision,
+                                    candidate_statework_ids=candidate_ids,
+                                    intervention_id=intervention_id,
+                                    expires_at_action=int(directive["expires_at_action"]),
+                                )
+                            if statework_id not in current.active_stateworks:
+                                raise RuntimeError("CSW did not confirm release rollback")
+                    except Exception as exc:
+                        errors.append(
+                            f"CSW rollback failed for {directive.get('target')}: {exc}")
             message = str(failure)
             if errors:
                 message += "; " + "; ".join(errors)
@@ -267,7 +339,7 @@ class ControlActuator:
 
     @staticmethod
     def _directives(raw: Any) -> tuple[dict[str, Any], ...]:
-        if not isinstance(raw, (tuple, list)) or len(raw) > 32:
+        if not isinstance(raw, (tuple, list)) or len(raw) > MAX_CONTROL_BATCH_ITEMS:
             raise ValueError("prepared directives are malformed")
         items = []
         for value in raw:

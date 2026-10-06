@@ -14,15 +14,15 @@ POLICY_CONTROL_FIELDS = (
     "retry_policy", "recovery_level", "context_strategy", "response_strategy",
 )
 
-# Every policy control has an explicit path to behavior. Response formatting
-# belongs to DP's response_strategy guidance; CFW SISPIS validates evidence and
-# calibration but does not select a competing response format.
+# These controls currently have a direct model-guidance consumer. CFW projects
+# their values for reconciliation, but does not claim to enforce retry or
+# recovery policy mechanically.
 CONTROL_EFFECTS = MappingProxyType({
     "cognitive_mode": "model_projection",
-    "verification_intensity": "model_projection+system_one_frame",
-    "exploration_budget": "model_projection+candidate_selection",
-    "retry_policy": "model_projection+candidate_selection+cfw_fuse",
-    "recovery_level": "model_projection+candidate_selection+cfw_recovery",
+    "verification_intensity": "model_projection",
+    "exploration_budget": "model_projection",
+    "retry_policy": "model_projection",
+    "recovery_level": "model_projection",
     "context_strategy": "model_projection",
     "response_strategy": "model_projection",
 })
@@ -159,6 +159,7 @@ def build_behavior_projection(state: BehaviorState,
         "active_interventions": [item.to_dict() for item in state.active_interventions],
         "csw_selection_revision": snapshot.revision,
         "csw_snapshot_id": snapshot.snapshot_id,
+        "csw_registry_hash": snapshot.registry_hash,
         "csw_active_stateworks": list(snapshot.active_stateworks),
         "csw_workflow_states": dict(snapshot.workflow_states),
         "csw_workflow_revisions": dict(snapshot.workflow_revisions),

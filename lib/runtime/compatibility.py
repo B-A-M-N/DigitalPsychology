@@ -1,0 +1,36 @@
+"""Runtime-facing import path for the shared DP compatibility registry.
+
+The registry itself lives one package level up so state-model imports do not
+trigger the runtime package's public API initializer.
+"""
+from ..compatibility import (
+    CFW_ADAPTER_PROTOCOL_VERSION,
+    CFW_BEHAVIOR_PROJECTION_VERSION,
+    CFW_TASK_BEHAVIOR_CONTRACT_VERSION,
+    COMPATIBILITY,
+    CONTROL_LIMITS,
+    CSW_ADAPTER_PROTOCOL_VERSION,
+    CSW_WORKFLOW_PORT_VERSION,
+    DP_CONTROL_PROTOCOL_VERSION,
+    MAX_ACTIVE_STATEWORKS,
+    MAX_AVAILABLE_FRAMEWORKS,
+    MAX_CFW_SIGNALS,
+    MAX_CONTROL_BATCH_ITEMS,
+    MAX_CONTROL_PAYLOAD_BYTES,
+    MAX_ELIGIBLE_STATEWORKS,
+    MAX_GOAL_CRITERIA,
+    MAX_OUTCOME_FACTS,
+    advertised_control_capabilities,
+    validate_control_capabilities,
+)
+
+__all__ = [
+    "CFW_ADAPTER_PROTOCOL_VERSION", "CFW_BEHAVIOR_PROJECTION_VERSION",
+    "CFW_TASK_BEHAVIOR_CONTRACT_VERSION", "COMPATIBILITY", "CONTROL_LIMITS",
+    "CSW_ADAPTER_PROTOCOL_VERSION", "CSW_WORKFLOW_PORT_VERSION",
+    "DP_CONTROL_PROTOCOL_VERSION", "MAX_ACTIVE_STATEWORKS",
+    "MAX_AVAILABLE_FRAMEWORKS", "MAX_CFW_SIGNALS", "MAX_CONTROL_BATCH_ITEMS",
+    "MAX_CONTROL_PAYLOAD_BYTES", "MAX_ELIGIBLE_STATEWORKS", "MAX_GOAL_CRITERIA",
+    "MAX_OUTCOME_FACTS", "advertised_control_capabilities",
+    "validate_control_capabilities",
+]

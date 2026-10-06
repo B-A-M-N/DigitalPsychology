@@ -15,13 +15,10 @@ from typing import Any, Mapping, Sequence
 from ...behavior_state import (CSWBehaviorSnapshot, StateWorkOption,
                                StateWorkReleaseResult)
 from ..contracts import RuntimeIdentity
-
-# CSW owns workflow eligibility and composition; this names the port contract
-# DP drives so a version mismatch is caught at session startup instead of on
-# the first workflow transition.
-CSW_WORKFLOW_PORT_VERSION = "1.2.0"
-CSW_ADAPTER_PROTOCOL_VERSION = "1.1.0"
-
+from ...compatibility import (
+    CSW_ADAPTER_PROTOCOL_VERSION, CSW_WORKFLOW_PORT_VERSION,
+    MAX_ELIGIBLE_STATEWORKS,
+)
 
 @dataclass(frozen=True)
 class CSWWorkflowBinding:
@@ -55,7 +52,18 @@ class CSWRuntimeAdapter:
             raise ValueError(
                 f"CSW authority workflow port {actual_version!r} is incompatible with "
                 f"DP's {CSW_WORKFLOW_PORT_VERSION!r}")
-        if len(self.bindings) > 32:
+        checkpoint_operations = (
+            "checkpoint_selection", "restore_selection_checkpoint",
+            "finalize_selection_checkpoint",
+        )
+        missing_checkpoint_operations = tuple(
+            name for name in checkpoint_operations
+            if not callable(getattr(authority, name, None)))
+        if missing_checkpoint_operations:
+            raise ValueError(
+                "CSW authority lacks durable selection checkpoint operations: "
+                + ", ".join(missing_checkpoint_operations))
+        if len(self.bindings) > MAX_ELIGIBLE_STATEWORKS:
             raise ValueError("CSW workflow binding set exceeds its bound")
         for statework_id, binding in self.bindings.items():
             if binding.identity.get("statework_id") != statework_id:
@@ -107,6 +115,7 @@ class CSWRuntimeAdapter:
                     str(item) for item in row.get("dependency_required_by") or ())
                 for row in active_rows if row.get("activation_owner") == "dependency"
             },
+            registry_hash=str(raw["registry_hash"]),
         )
 
     def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot:
@@ -136,12 +145,20 @@ class CSWRuntimeAdapter:
         authority_basis = (str(root.resolve())
                            if callable(getattr(root, "resolve", None))
                            else f"{type(self.authority).__module__}.{type(self.authority).__qualname__}")
-        authority_id = "csw-authority:" + hashlib.sha256(
-            authority_basis.encode()).hexdigest()
+        authority_id = str(getattr(self.authority, "authority_instance_id", ""))
+        if not authority_id:
+            authority_id = "csw-authority:" + hashlib.sha256(
+                authority_basis.encode()).hexdigest()
+        registry_hash = str(getattr(self.authority, "registry_hash", ""))
+        if not registry_hash:
+            raise RuntimeError("CSW authority omitted its pinned registry hash")
         capabilities = json.dumps({
-            statework_id: {"identity": dict(binding.identity),
-                           "contract_hash": binding.contract_hash}
-            for statework_id, binding in sorted(self.bindings.items())
+            "registry_hash": registry_hash,
+            "bindings": {
+                statework_id: {"identity": dict(binding.identity),
+                               "contract_hash": binding.contract_hash}
+                for statework_id, binding in sorted(self.bindings.items())
+            },
         }, sort_keys=True, separators=(",", ":"))
         return {
             "adapter_kind": "csw-workflow-authority",
@@ -151,10 +168,67 @@ class CSWRuntimeAdapter:
             # drive against the one CSW implements, at startup rather than on
             # the first workflow transition.
             "workflow_port_version": str(self.authority.workflow_port_version),
+            "registry_hash": registry_hash,
             "scope": hashlib.sha256(scope.encode()).hexdigest(),
             "scope_hash": hashlib.sha256(scope.encode()).hexdigest(),
             "capability_hash": hashlib.sha256(capabilities.encode()).hexdigest(),
         }
+
+    def workflow_authority_identities(self) -> Mapping[str, Mapping[str, str]]:
+        """Return CSW's immutable identity for every binding this adapter can use."""
+        provider = getattr(self.authority, "workflow_authority_identity", None)
+        if not callable(provider):
+            raise RuntimeError(
+                "CSW authority does not expose stable workflow authority identities")
+        expected_fields = {
+            "namespace_id", "application_id", "application_instance_id",
+            "workflow_id", "subject_ref", "registry_hash",
+            "authority_instance_id", "storage_identity", "contract_version",
+        }
+        result: dict[str, Mapping[str, str]] = {}
+        for statework_id, binding in sorted(self.bindings.items()):
+            raw = provider(binding.identity, contract_hash=binding.contract_hash)
+            if callable(getattr(raw, "to_dict", None)):
+                raw = raw.to_dict()
+            if (not isinstance(raw, Mapping) or set(raw) != expected_fields
+                    or any(not isinstance(value, str) or not value
+                           for value in raw.values())):
+                raise RuntimeError("CSW returned a malformed workflow authority identity")
+            for field in ("namespace_id", "application_id", "application_instance_id",
+                          "workflow_id", "subject_ref", "contract_version"):
+                if raw[field] != binding.identity[field]:
+                    raise RuntimeError(
+                        "CSW workflow authority identity differs from its adapter binding")
+            if raw["registry_hash"] != str(getattr(self.authority, "registry_hash", "")):
+                raise RuntimeError("CSW workflow authority registry identity is inconsistent")
+            result[statework_id] = MappingProxyType(dict(raw))
+        return MappingProxyType(result)
+
+    def checkpoint_selection(self, *, tick_id: str,
+                             expected_selection_revision: int) -> None:
+        checkpoint = getattr(self.authority, "checkpoint_selection", None)
+        if not callable(checkpoint):
+            raise RuntimeError("CSW authority has no durable selection checkpoint")
+        checkpoint(workflow_scope=self.identity.csw_scope(), tick_id=tick_id,
+                   expected_selection_revision=expected_selection_revision)
+
+    def restore_selection_checkpoint(self, *, tick_id: str,
+                                     expected_selection_revision: int
+                                     ) -> CSWBehaviorSnapshot | None:
+        restore = getattr(self.authority, "restore_selection_checkpoint", None)
+        if not callable(restore):
+            raise RuntimeError("CSW authority has no durable selection checkpoint")
+        result = restore(workflow_scope=self.identity.csw_scope(), tick_id=tick_id,
+                         expected_selection_revision=expected_selection_revision)
+        if result is None:
+            return None
+        return self.behavioral_snapshot()
+
+    def finalize_selection_checkpoint(self, *, tick_id: str) -> None:
+        finalize = getattr(self.authority, "finalize_selection_checkpoint", None)
+        if not callable(finalize):
+            raise RuntimeError("CSW authority has no durable selection checkpoint")
+        finalize(workflow_scope=self.identity.csw_scope(), tick_id=tick_id)
 
     def activate_statework(self, statework_id: str, *,
                            expected_selection_revision: int,

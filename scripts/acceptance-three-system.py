@@ -18,13 +18,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CFW_ROOT = ROOT.parent / "CognitiveFrameWorks"
+CSW_ROOT = ROOT.parent / "CognitiveStateWork"
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(CFW_ROOT / "scripts"))
 
 from lib.feedback_loop import (  # noqa: E402
     EpisodeBuilder, Guard, GuardRegistry, ProbeRunner, ReceiptBuilder,
-    ReceiptRegistry, TrialEvidence, guard_semantic_hash, load_events,
+    ReceiptRegistry, TrialEvidence, guard_semantic_hash,
 )
 from lib.receipts import DEFAULT_PRODUCTION_CRITERION  # noqa: E402
+from lib.runtime_event_adapter import load_cfw_runtime_events  # noqa: E402
 
 
 def load_module(name: str, path: Path):
@@ -86,6 +89,7 @@ def main() -> int:
         runtime_root = raw / "cfw-runtime"
         os.environ["DIGITALPSYCHOLOGY_STATE_ROOT"] = str(trusted)
         os.environ["XDG_RUNTIME_DIR"] = str(runtime_root)
+        os.environ["COGNITIVE_STATEWORK_ROOT"] = str(CSW_ROOT)
 
         registry = GuardRegistry(default_to_trusted_state=True)
         receipts = ReceiptRegistry(default_to_trusted_state=True)
@@ -162,6 +166,7 @@ def main() -> int:
         sys.modules["resolve_runtime"] = resolve_runtime
         api = load_module("three_cognitive_runtime", CFW_ROOT / "scripts" / "cognitive_runtime.py")
         resolve_runtime.runtime_state_dir = lambda: runtime_root
+        runtime.resolve_runtime.runtime_state_dir = lambda: runtime_root
         runner = ProbeRunner()
         all_events = []
         task_groups = {"control": [], "treatment": [], "holdout": []}
@@ -188,7 +193,7 @@ def main() -> int:
                     path for path in (runtime_root / "telemetry").glob("*.ndjson")
                     if any(json.loads(line).get("task_id") == task_id
                            for line in path.read_text(encoding="utf-8").splitlines() if line))
-                events = load_events(event_path)
+                events = load_cfw_runtime_events(event_path)
                 assert events, f"no host telemetry for {task_id}"
                 all_events.extend(events)
                 task_groups[cohort].append((task_id, bundle, events))

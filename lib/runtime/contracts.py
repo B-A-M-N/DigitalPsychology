@@ -13,9 +13,11 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from ..behavior_state import (BehaviorDirective, BehaviorState,
-                              CSWBehaviorSnapshot, FrameworkSignal,
-                              GoalSetSnapshot)
+                              BehaviorSignalBatch, CSWBehaviorSnapshot,
+                              FrameworkSignal, GoalSetSnapshot,
+                              StateWorkReleaseResult)
 from ..system_one_contracts import SystemOneFrame
+from ..compatibility import CFW_ADAPTER_PROTOCOL_VERSION, MAX_GOAL_CRITERIA
 
 
 @dataclass(frozen=True)
@@ -230,7 +232,7 @@ class RuntimeObservation:
                 if (not isinstance(receipt["authority_id"], str)
                         or not receipt["authority_id"] or len(receipt["authority_id"]) > 256
                         or receipt["adapter_kind"] != "cfw-component-runtime"
-                        or receipt["adapter_protocol_version"] != "1.2.0"
+                        or receipt["adapter_protocol_version"] != CFW_ADAPTER_PROTOCOL_VERSION
                         or receipt["decision"] not in gate_decisions):
                     raise ValueError("candidate gate receipt authority or decision is invalid")
                 digest = receipt["action_digest"]
@@ -299,7 +301,7 @@ class RuntimeObservation:
                 or self.evidence_refs):
             raise ValueError("candidate observations cannot claim action outcomes")
         statuses = dict(self.criterion_status)
-        if len(statuses) > 256 or any(
+        if len(statuses) > MAX_GOAL_CRITERIA or any(
                 not isinstance(key, str) or not key or len(key) > 128
                 or value not in {"unmet", "in_progress", "verified", "blocked", "unknown"}
                 for key, value in statuses.items()):
@@ -338,8 +340,19 @@ class CFWComponentPort(Protocol):
 
     def authorize_action(self, action: Mapping[str, Any]) -> Mapping[str, str]: ...
 
-    def collect_behavior_signals(self, observation: RuntimeObservation
-                                 ) -> Sequence[FrameworkSignal]: ...
+    def authority_identity(self) -> Mapping[str, str] | None: ...
+
+    def lifecycle_revision(self) -> int: ...
+
+    def peek_behavior_signals(self, *, after_cursor: int | None,
+                              maximum: int,
+                              observation: RuntimeObservation) -> BehaviorSignalBatch: ...
+
+    def acknowledge_behavior_signals(self, *, through_cursor: int) -> None: ...
+
+    def effective_behavior_projection(self) -> Mapping[str, Any] | None: ...
+
+    def expire_local_behavior_leases(self, action_index: int) -> bool: ...
 
     def prepare_behavior_directives(self, directives: Sequence[Mapping[str, Any]]) -> Any: ...
 
@@ -374,6 +387,13 @@ class CSWWorkflowPort(Protocol):
                             ) -> CSWBehaviorSnapshot:
         """Read the current snapshot. This never expires leases as a side effect."""
 
+    def available_statework_ids(self) -> Sequence[str]: ...
+
+    def authority_identity(self) -> Mapping[str, str]: ...
+
+    def activation_matches(self, statework_id: str, *,
+                           intervention_id: str) -> bool: ...
+
     def activate_statework(self, statework_id: str, *,
                            expected_selection_revision: int,
                            candidate_statework_ids: Sequence[str],
@@ -383,7 +403,16 @@ class CSWWorkflowPort(Protocol):
     def deactivate_statework(self, statework_id: str, *,
                              expected_selection_revision: int,
                              candidate_statework_ids: Sequence[str],
-                             intervention_id: str) -> CSWBehaviorSnapshot: ...
+                             intervention_id: str) -> StateWorkReleaseResult: ...
+
+    def checkpoint_selection(self, *, tick_id: str,
+                             expected_selection_revision: int) -> None: ...
+
+    def restore_selection_checkpoint(self, *, tick_id: str,
+                                     expected_selection_revision: int
+                                     ) -> CSWBehaviorSnapshot | None: ...
+
+    def finalize_selection_checkpoint(self, *, tick_id: str) -> None: ...
 
     def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot:
         """Explicitly expire DP-owned leases at a host action boundary."""

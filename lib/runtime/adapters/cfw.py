@@ -5,6 +5,7 @@ from typing import Any, Mapping, Sequence
 
 from ...behavior_state import BehaviorSignalBatch, FrameworkSignal
 from ..contracts import RuntimeObservation
+from ...compatibility import CFW_ADAPTER_PROTOCOL_VERSION, MAX_AVAILABLE_FRAMEWORKS, MAX_CFW_SIGNALS
 
 
 _TRIGGER_CODES = {
@@ -25,13 +26,51 @@ class CFWRuntimeAdapter:
 
     def available_component_ids(self) -> tuple[str, ...]:
         raw = self.component_port.available_component_ids()
-        if not isinstance(raw, Sequence) or len(raw) > 16:
+        if not isinstance(raw, Sequence) or len(raw) > MAX_AVAILABLE_FRAMEWORKS:
             raise ValueError("CFW component capability set exceeds its bounded contract")
         values = tuple(str(item).lower() for item in raw)
         if (len(values) != len(set(values))
                 or any(not item or len(item) > 64 for item in values)):
             raise ValueError("CFW returned malformed component capability IDs")
         return values
+
+    def task_behavior_contract(self) -> Mapping[str, Any] | None:
+        provider = getattr(self.component_port, "task_behavior_contract", None)
+        value = provider() if callable(provider) else None
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise RuntimeError("CFW returned a malformed task behavior contract")
+        return dict(value)
+
+    def composite_runtime_snapshot(self) -> Mapping[str, str] | None:
+        provider = getattr(self.component_port, "composite_runtime_snapshot", None)
+        value = provider() if callable(provider) else None
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise RuntimeError("CFW returned a malformed composite runtime snapshot")
+        expected = {
+            "cfw_policy_hash", "csw_registry_hash", "csw_workflow_plan_hash",
+            "cfw_task_behavior_contract_hash", "host_goal_contract_hash",
+            "model_harness_toolset_hash",
+            "dp_policy_contract_hash", "laya_identity_hash", "snapshot_hash",
+        }
+        result = dict(value)
+        if set(result) != expected or any(not isinstance(item, str) for item in result.values()):
+            raise RuntimeError("CFW composite runtime snapshot fields are invalid")
+        for key in ("cfw_policy_hash", "model_harness_toolset_hash", "snapshot_hash"):
+            digest = result[key]
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise RuntimeError("CFW composite runtime snapshot digest is invalid")
+        for key in ("csw_registry_hash", "csw_workflow_plan_hash",
+                    "cfw_task_behavior_contract_hash", "host_goal_contract_hash",
+                    "dp_policy_contract_hash", "laya_identity_hash"):
+            digest = result[key]
+            if digest and (len(digest) != 64
+                           or any(char not in "0123456789abcdef" for char in digest)):
+                raise RuntimeError("CFW composite runtime snapshot optional digest is invalid")
+        return result
 
     def preflight_action(self, action: Mapping[str, Any]) -> Mapping[str, Any]:
         if not isinstance(action, Mapping):
@@ -65,7 +104,7 @@ class CFWRuntimeAdapter:
         if (identity is None
                 or receipt.get("authority_id") != identity.get("authority_id")
                 or receipt.get("adapter_kind") != identity.get("adapter_kind")
-                or receipt.get("adapter_protocol_version") != "1.2.0"
+                or receipt.get("adapter_protocol_version") != CFW_ADAPTER_PROTOCOL_VERSION
                 or receipt.get("action_digest") != action_digest
                 or receipt.get("decision") != decision):
             raise RuntimeError("CFW action gate authority receipt is inconsistent")
@@ -102,6 +141,22 @@ class CFWRuntimeAdapter:
             raise RuntimeError("CFW returned a malformed authority identity")
         return dict(value)
 
+    def workflow_authority_identities(self) -> Mapping[str, Mapping[str, str]]:
+        """Expose attached CFW StateAuthority identities for bridge comparison."""
+        provider = getattr(self.component_port, "workflow_authority_identities", None)
+        value = provider() if callable(provider) else {}
+        if not isinstance(value, Mapping) or len(value) > 32:
+            raise RuntimeError("CFW returned malformed workflow authority identities")
+        result: dict[str, Mapping[str, str]] = {}
+        for statework_id, identity in value.items():
+            if (not isinstance(statework_id, str) or not statework_id
+                    or not isinstance(identity, Mapping)
+                    or any(not isinstance(key, str) or not isinstance(item, str)
+                           for key, item in identity.items())):
+                raise RuntimeError("CFW returned malformed workflow authority identity")
+            result[statework_id] = dict(identity)
+        return result
+
     def applied_behavior_projection(self) -> Mapping[str, Any] | None:
         raw = getattr(self.component_port, "applied_behavior_projection", None)
         value = raw() if callable(raw) else raw
@@ -124,7 +179,8 @@ class CFWRuntimeAdapter:
     def collect_behavior_signals(self, observation: RuntimeObservation
                                  ) -> tuple[FrameworkSignal, ...]:
         return self.peek_behavior_signals(
-            after_cursor=None, maximum=32, observation=observation).signals
+            after_cursor=None, maximum=MAX_CFW_SIGNALS,
+            observation=observation).signals
 
     def peek_behavior_signals(self, *, after_cursor: int | None,
                               maximum: int = 32,
@@ -154,7 +210,7 @@ class CFWRuntimeAdapter:
     def _normalize_signals(self, raw: Sequence[Any],
                            observation: RuntimeObservation | None = None
                            ) -> tuple[FrameworkSignal, ...]:
-        if not isinstance(raw, Sequence) or len(raw) > 32:
+        if not isinstance(raw, Sequence) or len(raw) > MAX_CFW_SIGNALS:
             raise ValueError("CFW signal port exceeded its bounded contract")
         goal_set = getattr(observation, "goal_set", None)
         objective_criteria = ({item.criterion_id for item in goal_set.items}

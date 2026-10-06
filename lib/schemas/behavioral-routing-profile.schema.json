@@ -764,6 +764,34 @@
               },
               "additionalProperties": false
             },
+            "candidate_policy_compatibility": {
+              "type": "object",
+              "required": [
+                "behavior_policy_contract_hash",
+                "candidate_generator_contract_hash",
+                "dp_control_implementation_version",
+                "dp_control_implementation_hash",
+                "candidate_policy_mapping_hash"
+              ],
+              "properties": {
+                "behavior_policy_contract_hash": {
+                  "type": "string", "pattern": "^[a-f0-9]{64}$"
+                },
+                "candidate_generator_contract_hash": {
+                  "type": "string", "pattern": "^[a-f0-9]{64}$"
+                },
+                "dp_control_implementation_version": {
+                  "type": "string", "minLength": 1, "maxLength": 64
+                },
+                "dp_control_implementation_hash": {
+                  "type": "string", "pattern": "^[a-f0-9]{64}$"
+                },
+                "candidate_policy_mapping_hash": {
+                  "type": "string", "pattern": "^[a-f0-9]{64}$"
+                }
+              },
+              "additionalProperties": false
+            },
             "effect": {
               "type": "number"
             },

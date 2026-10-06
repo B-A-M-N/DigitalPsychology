@@ -19,8 +19,7 @@ import hashlib
 from types import MappingProxyType
 from typing import Any, Mapping
 from ..behavior_state import MAX_ACTIVE_INTERVENTIONS, MAX_TARGETS_PER_INTERVENTION
-
-CFW_BEHAVIOR_PROJECTION_VERSION = "2.0.0"
+from ..compatibility import CFW_BEHAVIOR_PROJECTION_VERSION, MAX_AVAILABLE_FRAMEWORKS
 
 _MAX_FOCUS = 8
 _MAX_LEASES = MAX_ACTIVE_INTERVENTIONS * MAX_TARGETS_PER_INTERVENTION
@@ -41,6 +40,7 @@ class CFWTargetLease:
     applied_value: str
     expires_at_action: int
     source_revision: int
+    recovery_epoch_id: str
 
     def __post_init__(self) -> None:
         for name in ("lease_id", "intervention_id", "target", "previous_value",
@@ -52,6 +52,9 @@ class CFWTargetLease:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"CFW target lease {name} must be a non-negative integer")
+        if not isinstance(self.recovery_epoch_id, str) or not self.recovery_epoch_id \
+                or len(self.recovery_epoch_id) > 128:
+            raise ValueError("CFW target lease recovery epoch ID is malformed")
 
     def to_dict(self) -> dict[str, Any]:
         return {"lease_id": self.lease_id,
@@ -59,7 +62,8 @@ class CFWTargetLease:
                 "previous_value": self.previous_value,
                 "applied_value": self.applied_value,
                 "expires_at_action": self.expires_at_action,
-                "source_revision": self.source_revision}
+                "source_revision": self.source_revision,
+                "recovery_epoch_id": self.recovery_epoch_id}
 
 
 @dataclass(frozen=True)
@@ -89,7 +93,7 @@ class CFWBehaviorProjection:
             raise ValueError("CFW projection requires a cognitive mode")
         if (not isinstance(self.framework_modes, Mapping)
                 or not self.framework_modes
-                or len(self.framework_modes) > 16
+                or len(self.framework_modes) > MAX_AVAILABLE_FRAMEWORKS
                 or any(not isinstance(key, str) or not key
                        or not isinstance(value, str) or not value
                        for key, value in self.framework_modes.items())):
@@ -231,6 +235,9 @@ def build_cfw_behavior_projection(
                 applied_value=applied,
                 expires_at_action=expires_at_action,
                 source_revision=source_revision,
+                recovery_epoch_id=(field(intervention, "recovery_epoch_id")
+                                   or field(intervention, "condition_id")
+                                   or intervention_id),
             ))
 
     return CFWBehaviorProjection(

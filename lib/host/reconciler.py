@@ -7,6 +7,7 @@ from ..behavior_state import BehaviorState, GoalSetSnapshot
 from ..control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
                                 ControlCommitRequest)
 from ..runtime.cfw_projection import build_cfw_behavior_projection
+from .dependency_closure import expected_csw_active_stateworks
 
 class HostReconciler:
     """Responsibility-focused host bridge collaborator."""
@@ -18,6 +19,7 @@ class HostReconciler:
                              expire_cfw: bool = False) -> bool:
         """Advance CSW-owned DP leases even when the private DP process is down."""
         changed = False
+        expired_authorities = 0
         self.host._last_lease_expiry_failed = False
         if expire_cfw:
             expire_controls = getattr(self.host.cfw, "expire_local_behavior_leases", None)
@@ -25,6 +27,7 @@ class HostReconciler:
                 try:
                     cfw_changed = bool(expire_controls(max(0, host_action_index)))
                     changed = cfw_changed or changed
+                    expired_authorities += int(cfw_changed)
                     self.host._offline_controls_expired = (
                         self.host._offline_controls_expired or cfw_changed)
                 except Exception as exc:
@@ -36,6 +39,7 @@ class HostReconciler:
         if not callable(expire):
             if changed:
                 self.host._needs_reconciliation = True
+            self._record_expirations_during_outage(expired_authorities)
             return changed
         try:
             before, _ = self.host._csw_snapshot()
@@ -46,12 +50,26 @@ class HostReconciler:
             self.host._fault = f"CSW lease expiry failed at the host action boundary: {exc}"
             self.host._notify_fault(self.host._fault)
             self.host._needs_reconciliation = True
+            self._record_expirations_during_outage(expired_authorities)
             return changed
         changed = (before.revision != after.revision
                    or before.snapshot_id != after.snapshot_id or changed)
+        if before.revision != after.revision or before.snapshot_id != after.snapshot_id:
+            expired_authorities += 1
         if changed:
             self.host._needs_reconciliation = True
+        self._record_expirations_during_outage(expired_authorities)
         return changed
+
+    def _record_expirations_during_outage(self, count: int) -> None:
+        if count <= 0:
+            return
+        try:
+            if self.host.production_metrics.period_active("dp_outage"):
+                self.host.production_metrics.increment(
+                    "lease_expirations_during_outage", count)
+        except Exception:
+            pass
 
     async def _reconcile_locked(self) -> Mapping[str, Any]:
         snapshot, candidates = self.host._csw_snapshot()
@@ -64,6 +82,35 @@ class HostReconciler:
         pending = response.get("pending_decisions") or ()
         if not isinstance(pending, (tuple, list)):
             raise RuntimeError("DP reconciliation returned malformed pending decisions")
+        if not pending:
+            latest = response.get("latest_control_tick")
+            if isinstance(latest, Mapping) and self.host.csw is not None:
+                tick_id = latest.get("tick_id")
+                status = latest.get("status")
+                if isinstance(tick_id, str) and status == "committed":
+                    finalize_checkpoint = getattr(
+                        self.host.csw, "finalize_selection_checkpoint", None)
+                    if callable(finalize_checkpoint):
+                        finalize_checkpoint(tick_id=tick_id)
+                elif isinstance(tick_id, str) and status == "aborted":
+                    restore_checkpoint = getattr(
+                        self.host.csw, "restore_selection_checkpoint", None)
+                    if callable(restore_checkpoint):
+                        restored = restore_checkpoint(
+                            tick_id=tick_id,
+                            expected_selection_revision=snapshot.revision)
+                        if restored is not None:
+                            snapshot, _ = self.host._csw_snapshot()
+                            response = await self.host.client.reconcile_control_session({
+                                "protocol_version": PROTOCOL_VERSION,
+                                "control_session_id": self.host.identity.scope,
+                                "cfw_lifecycle_revision": self.host._current_cfw_revision(),
+                                "csw_snapshot": snapshot.to_dict(),
+                            })
+                            pending = response.get("pending_decisions") or ()
+                            if not isinstance(pending, (tuple, list)):
+                                raise RuntimeError(
+                                    "DP reconciliation returned malformed pending decisions")
         self.host._state = BehaviorState.from_mapping(response["behavior_state"])
         self.host._action_index = int(response["host_action_index"])
         self.host._cfw_projection_action_index = int(response.get(
@@ -101,6 +148,7 @@ class HostReconciler:
         if not unresolved:
             self.host._fault = None
             self.host._needs_reconciliation = False
+            self.host._clear_degradation_periods()
         else:
             self.host._needs_reconciliation = True
         return self.host._status(response)
@@ -109,7 +157,6 @@ class HostReconciler:
         basis = dict(prepared.get("basis") or {})
         candidate = dict(prepared.get("candidate_behavior_state") or {})
         directives = self.host._directives(prepared.get("directives"))
-        expected_active = set(basis.get("csw_active_stateworks") or ())
         activations = {
             item["target"]: item for item in directives
             if item["operation"] == "prefer_statework"
@@ -118,18 +165,9 @@ class HostReconciler:
             item["target"]: item for item in directives
             if item["operation"] == "release_statework"
         }
-        for directive in directives:
-            if directive["operation"] == "release_statework":
-                expected_active.discard(directive["target"])
-            elif directive["operation"] == "prefer_statework":
-                expected_active.add(directive["target"])
         snapshot, candidates = self.host._csw_snapshot()
-        for retained_id, required_by in snapshot.dependency_retention.items():
-            if (retained_id not in set(basis.get("csw_active_stateworks") or ())
-                    or not set(required_by).issubset(expected_active)):
-                raise RuntimeError(
-                    "CSW dependency retention does not match the pending DP decision")
-            expected_active.add(retained_id)
+        expected_active = expected_csw_active_stateworks(
+            basis, directives, snapshot.dependency_retention)
         actual_cfw = self.host.actuator.applied_behavior_projection()
         expected_cfw = build_cfw_behavior_projection(
             candidate, host_action_index=int(basis.get(
@@ -157,46 +195,63 @@ class HostReconciler:
             )
             committed = await self.host.client.commit_control_tick(receipt.to_dict())
             self.host._accept_committed(committed, self.host.goal_set)
+            if directives:
+                finalize_checkpoint = getattr(
+                    self.host.csw, "finalize_selection_checkpoint", None)
+                if callable(finalize_checkpoint):
+                    finalize_checkpoint(tick_id=str(prepared["tick_id"]))
             return False
 
         rollback_errors = []
         desired_active = set(basis.get("csw_active_stateworks") or ())
-        for statework_id in sorted(set(snapshot.active_stateworks) - desired_active):
-            directive = activations.get(statework_id)
-            if directive is None:
-                rollback_errors.append(
-                    f"unrequested CSW activation {statework_id} preserved during recovery")
-                continue
-            if (not callable(owns_activation) or not owns_activation(
-                    statework_id, intervention_id=directive["intervention_id"])):
-                rollback_errors.append(
-                    f"CSW activation {statework_id} has another owner and was preserved")
-                continue
+        restored_checkpoint = None
+        restore_checkpoint = getattr(self.host.csw, "restore_selection_checkpoint", None)
+        if directives and callable(restore_checkpoint):
             try:
-                snapshot = self.host.csw.deactivate_statework(
-                    statework_id,
-                    expected_selection_revision=snapshot.revision,
-                    candidate_statework_ids=candidates,
-                    intervention_id=directive["intervention_id"],
-                )
+                restored_checkpoint = restore_checkpoint(
+                    tick_id=str(prepared["tick_id"]),
+                    expected_selection_revision=snapshot.revision)
+                if restored_checkpoint is not None:
+                    snapshot = restored_checkpoint
             except Exception as exc:
-                rollback_errors.append(f"CSW release recovery failed: {exc}")
-        for statework_id in sorted(desired_active - set(snapshot.active_stateworks)):
-            directive = releases.get(statework_id)
-            if directive is None:
-                rollback_errors.append(
-                    f"unrequested CSW release {statework_id} was not reversed")
-                continue
-            try:
-                snapshot = self.host.csw.activate_statework(
-                    statework_id,
-                    expected_selection_revision=snapshot.revision,
-                    candidate_statework_ids=candidates,
-                    intervention_id=directive["intervention_id"],
-                    expires_at_action=self._directive_expiry(directive),
-                )
-            except Exception as exc:
-                rollback_errors.append(f"CSW activation recovery failed: {exc}")
+                rollback_errors.append(f"CSW exact selection recovery failed: {exc}")
+        if restored_checkpoint is None:
+            for statework_id in sorted(set(snapshot.active_stateworks) - desired_active):
+                directive = activations.get(statework_id)
+                if directive is None:
+                    rollback_errors.append(
+                        f"unrequested CSW activation {statework_id} preserved during recovery")
+                    continue
+                if (not callable(owns_activation) or not owns_activation(
+                        statework_id, intervention_id=directive["intervention_id"])):
+                    rollback_errors.append(
+                        f"CSW activation {statework_id} has another owner and was preserved")
+                    continue
+                try:
+                    snapshot = self.host.csw.deactivate_statework(
+                        statework_id,
+                        expected_selection_revision=snapshot.revision,
+                        candidate_statework_ids=candidates,
+                        intervention_id=directive["intervention_id"],
+                    )
+                except Exception as exc:
+                    rollback_errors.append(f"CSW release recovery failed: {exc}")
+            for statework_id in sorted(desired_active - set(snapshot.active_stateworks)):
+                directive = releases.get(statework_id)
+                if directive is None:
+                    rollback_errors.append(
+                        f"unrequested CSW release {statework_id} was not reversed")
+                    continue
+                try:
+                    snapshot = self.host.csw.activate_statework(
+                        statework_id,
+                        expected_selection_revision=snapshot.revision,
+                        candidate_statework_ids=candidates,
+                        intervention_id=directive["intervention_id"],
+                        expires_at_action=self._directive_expiry(directive),
+                    )
+                except Exception as exc:
+                    rollback_errors.append(f"CSW activation recovery failed: {exc}")
         committed_state = BehaviorState.from_mapping(self.host._state.to_dict())
         if self.host._cfw_components:
             try:

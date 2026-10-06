@@ -97,6 +97,7 @@ def test_all_nonframework_behavior_controls_have_visible_projection_effects():
 
 def test_every_policy_control_has_a_registered_consumer_and_distinct_projection():
     assert set(CONTROL_EFFECTS) == set(POLICY_CONTROL_FIELDS)
+    assert set(CONTROL_EFFECTS.values()) == {"model_projection"}
     assert set(POLICY_CONTROL_FIELDS).issubset(
         {item.name for item in fields(BehaviorState)})
     values = {

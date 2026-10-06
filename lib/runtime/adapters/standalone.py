@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from ...behavior_state import CSWBehaviorSnapshot
+from ...compatibility import CFW_BEHAVIOR_PROJECTION_VERSION
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,8 @@ class NullCFWComponentPort:
     def authority_identity(self) -> Mapping[str, str]:
         return {"adapter_kind": "null-cfw", "authority_id": "none",
                 "adapter_protocol_version": "1.0.0",
-                "behavior_projection_version": "2.0.0", "scope": "none",
+                "behavior_projection_version": CFW_BEHAVIOR_PROJECTION_VERSION,
+                "scope": "none",
                 "capability_hash": sha256(b"digitalpsychology:null-cfw").hexdigest()}
 
     def available_component_ids(self) -> tuple[str, ...]:

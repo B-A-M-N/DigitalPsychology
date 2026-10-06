@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import replace
+import logging
 import uuid
 from typing import Any, Mapping, Sequence
 
@@ -17,6 +18,8 @@ from ..runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObserva
 from ..runtime.projection import (AuditProjection, build_behavior_projection,
                                   cached_replace_model_projection)
 from ..runtime.adapters.standalone import NullCSWWorkflowPort
+from ..telemetry.production_metrics import (ProductionMetrics,
+                                            default_production_metrics_path)
 from .actuator import ActuationFailure, ControlActuator
 from .mcp_client import MCPControlClient, MCPControlUnavailable
 from .system_one_audit import summarize_system_one_observation
@@ -25,6 +28,8 @@ from .transaction_coordinator import HostTransactionCoordinator
 from .reconciler import HostReconciler
 from .projection_manager import HostProjectionManager
 from .degradation import HostDegradation
+
+_LOG = logging.getLogger(__name__)
 
 
 class HostControlBridge:
@@ -42,7 +47,8 @@ class HostControlBridge:
                  outcome_evidence_connected: bool = False,
                  host_policy_context: Mapping[str, Any] | None = None,
                  host_has_stable_objective_context: bool = False,
-                 fault_handler: Any = None) -> None:
+                 fault_handler: Any = None,
+                 production_metrics: ProductionMetrics | None = None) -> None:
         self.identity = identity
         self.objective = objective
         self.objective_criteria = tuple(objective_criteria)
@@ -51,7 +57,15 @@ class HostControlBridge:
         self.cfw = cfw
         self.csw = csw
         self.client = client or MCPControlClient()
-        self.actuator = ControlActuator(cfw=cfw, csw=csw)
+        service_metrics = getattr(
+            getattr(self.client, "control_service", None), "production_metrics", None)
+        client_env = getattr(self.client, "env", None)
+        metrics_path = default_production_metrics_path(
+            environment=client_env if isinstance(client_env, Mapping) else None)
+        self.production_metrics = (production_metrics or service_metrics
+                                   or ProductionMetrics(metrics_path))
+        self.actuator = ControlActuator(
+            cfw=cfw, csw=csw, production_metrics=self.production_metrics)
         self.outcome_evidence_connected = bool(outcome_evidence_connected)
         self.host_policy_context = dict(host_policy_context or {})
         if len(self.host_policy_context) > 32:
@@ -85,6 +99,7 @@ class HostControlBridge:
         self._last_model_projection_digest: str | None = None
         self._lock = asyncio.Lock()
         self._session_descriptor = self.projection_manager._create_descriptor()
+        self._workflow_authority_identity_pin: dict[str, Mapping[str, str]] | None = None
 
     @property
     def fault(self) -> str | None:
@@ -103,6 +118,17 @@ class HostControlBridge:
         """Return the last bounded semantic-provider receipt to the trusted host."""
         return (deepcopy(dict(self._latest_system_one_observation))
                 if self._latest_system_one_observation is not None else None)
+
+    def production_metrics_snapshot(self) -> Mapping[str, Any]:
+        """Expose bounded operational counters to the trusted host/operator."""
+        return self.production_metrics.snapshot()
+
+    def _clear_degradation_periods(self) -> None:
+        for name in ("dp_outage", "degraded"):
+            try:
+                self.production_metrics.end_period(name)
+            except Exception:
+                _LOG.warning("could not close a production metric period", exc_info=True)
 
     async def open(self) -> Mapping[str, Any]:
         return await self.lifecycle_hooks.open()

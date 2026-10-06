@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 
 from ..behavior_state import BehaviorState, GoalSetSnapshot
 from ..control_protocol import PROTOCOL_VERSION
+from ..compatibility import CFW_ADAPTER_PROTOCOL_VERSION
 from ..outcomes import HostOutcomeFact
 from ..runtime.contracts import ActionCandidate, RuntimeObservation
 from ..runtime.projection import AuditProjection, build_behavior_projection
@@ -24,6 +25,7 @@ class HostLifecycleHooks:
                 if not self.host._remote_open:
                     await self.host._connect_or_degrade_locked()
                 return self.host._status()
+            self.host.projection_manager._validate_shared_workflow_authorities()
             self.host._opened = True
             await self.host._connect_or_degrade_locked()
             return self.host._status()
@@ -168,14 +170,14 @@ class HostLifecycleHooks:
     def _validated_gate_receipt(self, value: Any, stage: str) -> Mapping[str, Any]:
         if not isinstance(value, Mapping) or value.get("stage") != stage:
             raise RuntimeError("CFW action gate omitted its stage receipt")
-        identity = self.host._cfw_authority_identity()
+        identity = dict(self.host._session_descriptor.cfw_authority_identity)
         receipt = dict(value)
         if set(receipt) != {"authority_id", "adapter_kind", "adapter_protocol_version",
                             "stage", "action_digest", "decision", "reason_codes"}:
             raise RuntimeError("CFW action gate receipt fields are invalid")
         if (receipt.get("authority_id") != identity.get("authority_id")
                 or receipt.get("adapter_kind") != identity.get("adapter_kind")
-                or receipt.get("adapter_protocol_version") != "1.2.0"):
+                or receipt.get("adapter_protocol_version") != CFW_ADAPTER_PROTOCOL_VERSION):
             raise RuntimeError("CFW action gate receipt authority differs from the session")
         return receipt
 
@@ -227,7 +229,7 @@ class HostLifecycleHooks:
     async def before_tool_planning(self, context: str, *,
                                    action_hint: Mapping[str, Any] | None = None
                                    ) -> str:
-        await self.host._control_boundary("pre_model_call")
+        await self.host._control_boundary("pre_tool_planning")
         async with self.host._lock:
             self.host._require_open()
             snapshot, _ = self.host._csw_snapshot()

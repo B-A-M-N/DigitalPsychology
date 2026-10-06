@@ -24,6 +24,16 @@ class HostDegradation:
         }
 
     def _degraded(self, message: str, failure: Exception) -> Mapping[str, Any]:
+        metrics = getattr(self.host, "production_metrics", None)
+        try:
+            metrics.begin_period("degraded")
+        except Exception:
+            pass
+        if self._transport_failure(failure):
+            try:
+                metrics.begin_period("dp_outage")
+            except Exception:
+                pass
         self.host._fault = f"{message}: {failure}"
         self.host._notify_fault(self.host._fault)
         return self.host._status()

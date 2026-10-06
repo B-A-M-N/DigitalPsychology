@@ -13,7 +13,10 @@ CFW = Path(os.environ.get("COGNITIVE_FRAMEWORKS_ROOT",
                           DP.parent / "CognitiveFrameWorks")).resolve()
 CSW = Path(os.environ.get("COGNITIVE_STATEWORK_ROOT",
                           DP.parent / "CognitiveStateWork")).resolve()
-TARGET = CFW / "tests" / "test_current_cross_repo_wire_contracts.py"
+TARGET = next((path for path in (
+    CFW / "integration_tests" / "test_current_cross_repo_wire_contracts.py",
+    CFW / "tests" / "test_current_cross_repo_wire_contracts.py",
+) if path.is_file()), CFW / "integration_tests" / "test_current_cross_repo_wire_contracts.py")
 
 
 def main() -> int:
