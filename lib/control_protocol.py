@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from typing import Any, Mapping, Sequence
 
@@ -9,12 +10,17 @@ from .behavior_state import (CSWBehaviorSnapshot, FrameworkSignal,
                              GoalSetSnapshot, StateWorkOption)
 from .outcomes import HostOutcomeFact
 from .runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
+from .compatibility import (
+    DP_CONTROL_PROTOCOL_VERSION as PROTOCOL_VERSION,
+    MAX_CONTROL_PAYLOAD_BYTES, MAX_GOAL_CRITERIA,
+    MAX_ELIGIBLE_STATEWORKS, MAX_AVAILABLE_FRAMEWORKS,
+    MAX_CFW_SIGNALS, MAX_CONTROL_BATCH_ITEMS, MAX_OUTCOME_FACTS,
+)
 
 
-PROTOCOL_VERSION = "1.7.0"
-MAX_CONTROL_PAYLOAD_BYTES = 131_072
 CONTROL_BOUNDARY_KINDS = frozenset({
-    "task_start", "pre_model_call", "pre_action", "pre_action_rejected", "post_action",
+    "task_start", "pre_model_call", "pre_tool_planning", "pre_action",
+    "pre_action_rejected", "post_action",
     "validator", "workflow", "operator", "pre_completion",
 })
 CANDIDATE_ACTION_BOUNDARIES = frozenset({"pre_action", "pre_action_rejected"})
@@ -46,7 +52,7 @@ def parse_goal_set(value: Any) -> GoalSetSnapshot:
     data = dict(_mapping(value, "goal_set"))
     if set(data) != {"revision", "items"}:
         raise ValueError("goal_set fields are invalid")
-    items = _sequence(data["items"], "goal_set.items", maximum=256)
+    items = _sequence(data["items"], "goal_set.items", maximum=MAX_GOAL_CRITERIA)
     return GoalSetSnapshot(revision=data["revision"], items=items)
 
 
@@ -54,10 +60,11 @@ def parse_csw_snapshot(value: Any) -> CSWBehaviorSnapshot:
     data = dict(_mapping(value, "csw_snapshot"))
     expected = {"revision", "active_stateworks", "eligible_stateworks",
                 "workflow_states", "snapshot_id", "workflow_revisions",
-                "eligible_steps", "dependency_retention"}
+                "eligible_steps", "dependency_retention", "registry_hash"}
     if set(data) != expected:
         raise ValueError("CSW snapshot fields are invalid")
-    options = _sequence(data["eligible_stateworks"], "eligible_stateworks", maximum=32)
+    options = _sequence(data["eligible_stateworks"], "eligible_stateworks",
+                        maximum=MAX_ELIGIBLE_STATEWORKS)
     return CSWBehaviorSnapshot(
         revision=data["revision"],
         active_stateworks=tuple(data["active_stateworks"]),
@@ -71,6 +78,7 @@ def parse_csw_snapshot(value: Any) -> CSWBehaviorSnapshot:
                         dict(data["eligible_steps"]).items()},
         dependency_retention={key: tuple(ids) for key, ids in
                               dict(data["dependency_retention"]).items()},
+        registry_hash=data["registry_hash"],
     )
 
 
@@ -91,7 +99,8 @@ class ControlSessionDescriptor:
         if not isinstance(self.objective, str) or not self.objective.strip() \
                 or len(self.objective) > 1024:
             raise ValueError("control session objective must be bounded text")
-        criteria = _sequence(self.objective_criteria, "objective_criteria", maximum=256)
+        criteria = _sequence(self.objective_criteria, "objective_criteria",
+                             maximum=MAX_GOAL_CRITERIA)
         if not criteria or len(criteria) != len(set(criteria)) or any(
                 not isinstance(item, str) or not item or len(item) > 128
                 for item in criteria):
@@ -99,7 +108,8 @@ class ControlSessionDescriptor:
         if not isinstance(self.initial_goal_set, GoalSetSnapshot) or {
                 item.criterion_id for item in self.initial_goal_set.items} != set(criteria):
             raise ValueError("initial goal set must cover the complete objective")
-        frameworks = _sequence(self.available_frameworks, "available_frameworks", maximum=16)
+        frameworks = _sequence(self.available_frameworks, "available_frameworks",
+                               maximum=MAX_AVAILABLE_FRAMEWORKS)
         if (len(frameworks) != len(set(frameworks))
                 or any(not isinstance(item, str) or item.lower() not in {
                     "owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"}
@@ -136,11 +146,45 @@ class ControlSessionDescriptor:
             raise ValueError("host capabilities must declare CSW connectivity")
         if capabilities["csw_connected"]:
             required_csw = {"adapter_kind", "authority_id", "adapter_protocol_version",
-                            "workflow_port_version", "scope_hash", "capability_hash"}
+                            "workflow_port_version", "registry_hash", "scope_hash",
+                            "capability_hash"}
             if not required_csw.issubset(authority):
                 raise ValueError("CSW authority identity lacks workflow capabilities")
         elif authority:
             raise ValueError("disconnected CSW cannot supply an authority identity")
+        composite = capabilities.get("composite_runtime_snapshot")
+        if composite is not None:
+            composite = dict(_mapping(composite, "composite_runtime_snapshot"))
+            required_composite = {
+                "cfw_policy_hash", "csw_registry_hash", "csw_workflow_plan_hash",
+                "cfw_task_behavior_contract_hash", "host_goal_contract_hash",
+                "model_harness_toolset_hash",
+                "dp_policy_contract_hash", "laya_identity_hash", "snapshot_hash",
+            }
+            if set(composite) != required_composite or not capabilities["cfw_connected"]:
+                raise ValueError("composite runtime snapshot fields or CFW binding are invalid")
+            for name in ("cfw_policy_hash", "model_harness_toolset_hash", "snapshot_hash"):
+                value = composite[name]
+                if (not isinstance(value, str) or len(value) != 64
+                        or any(char not in "0123456789abcdef" for char in value)):
+                    raise ValueError("composite runtime snapshot digest is invalid")
+            for name in ("csw_registry_hash", "csw_workflow_plan_hash",
+                         "cfw_task_behavior_contract_hash", "host_goal_contract_hash",
+                         "dp_policy_contract_hash", "laya_identity_hash"):
+                value = composite[name]
+                if (not isinstance(value, str) or (value and (len(value) != 64
+                        or any(char not in "0123456789abcdef" for char in value)))):
+                    raise ValueError("composite runtime snapshot optional digest is invalid")
+            expected_snapshot_hash = hashlib.sha256(json.dumps(
+                {key: value for key, value in composite.items()
+                 if key != "snapshot_hash"}, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest()
+            if composite["snapshot_hash"] != expected_snapshot_hash:
+                raise ValueError("composite runtime snapshot hash does not match its inputs")
+            if (capabilities["csw_connected"] and composite["csw_registry_hash"]
+                    and composite["csw_registry_hash"] != authority["registry_hash"]):
+                raise ValueError("composite snapshot and CSW authority registry pins differ")
+            capabilities["composite_runtime_snapshot"] = composite
         object.__setattr__(self, "objective_criteria", tuple(criteria))
         object.__setattr__(self, "available_frameworks", tuple(item.lower() for item in frameworks))
         object.__setattr__(self, "cfw_authority_identity", cfw_authority)
@@ -221,8 +265,8 @@ class ControlTickRequest:
         if (type(self.cfw_lifecycle_revision) is not int
                 or self.cfw_lifecycle_revision < -1):
             raise ValueError("cfw_lifecycle_revision must be at least -1")
-        signals = _sequence(self.cfw_signals, "cfw_signals", maximum=32)
-        outcomes = _sequence(self.outcome_facts, "outcome_facts", maximum=128)
+        signals = _sequence(self.cfw_signals, "cfw_signals", maximum=MAX_CFW_SIGNALS)
+        outcomes = _sequence(self.outcome_facts, "outcome_facts", maximum=MAX_OUTCOME_FACTS)
         if any(not isinstance(item, FrameworkSignal) for item in signals):
             raise ValueError("CFW signals are malformed")
         if any(not isinstance(item, HostOutcomeFact) for item in outcomes):
@@ -276,8 +320,9 @@ class ControlTickRequest:
             observation_data["candidate_action"] = ActionCandidate(
                 **dict(candidate))
         observation = RuntimeObservation(**observation_data, goal_set=goal_set)
-        signals = _sequence(data["cfw_signals"], "cfw_signals", maximum=32)
-        outcome_facts = _sequence(data["outcome_facts"], "outcome_facts", maximum=128)
+        signals = _sequence(data["cfw_signals"], "cfw_signals", maximum=MAX_CFW_SIGNALS)
+        outcome_facts = _sequence(data["outcome_facts"], "outcome_facts",
+                                  maximum=MAX_OUTCOME_FACTS)
         return cls(
             control_session_id=data["control_session_id"], tick_id=data["tick_id"],
             expected_behavior_revision=data["expected_behavior_revision"],
@@ -362,7 +407,8 @@ class ControlCommitRequest:
         if len(self.basis_digest) != 64 or any(
                 char not in "0123456789abcdef" for char in self.basis_digest):
             raise ValueError("basis_digest must be a SHA-256 digest")
-        receipts = _sequence(self.applied_directive_ids, "applied_directive_ids", maximum=32)
+        receipts = _sequence(self.applied_directive_ids, "applied_directive_ids",
+                             maximum=MAX_CONTROL_BATCH_ITEMS)
         if len(receipts) != len(set(receipts)) or any(
                 not isinstance(item, str) or not item or len(item) > 128
                 for item in receipts):
@@ -419,7 +465,8 @@ class ControlAbortRequest:
         if len(self.basis_digest) != 64 or any(
                 char not in "0123456789abcdef" for char in self.basis_digest):
             raise ValueError("basis_digest must be a SHA-256 digest")
-        receipts = _sequence(self.applied_directive_ids, "applied_directive_ids", maximum=32)
+        receipts = _sequence(self.applied_directive_ids, "applied_directive_ids",
+                             maximum=MAX_CONTROL_BATCH_ITEMS)
         if len(receipts) != len(set(receipts)) or any(
                 not isinstance(item, str) or not item or len(item) > 128
                 for item in receipts):

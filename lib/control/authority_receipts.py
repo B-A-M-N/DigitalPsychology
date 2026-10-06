@@ -5,6 +5,7 @@ from typing import Mapping
 
 from ..behavior_state import BehavioralDecision
 from ..control_protocol import ControlCommitRequest, ControlSessionDescriptor
+from ..host.dependency_closure import expected_csw_active_stateworks
 
 
 def validate_applied_authorities(decision: BehavioralDecision,
@@ -16,31 +17,33 @@ def validate_applied_authorities(decision: BehavioralDecision,
                     else original_cfw)
     if request.cfw_lifecycle_revision != expected_cfw:
         raise RuntimeError("CFW lifecycle revision does not match the committed behavior state")
+    expected_registry_hash = str(basis.get("csw_registry_hash") or "")
+    if expected_registry_hash and request.csw_snapshot.registry_hash != expected_registry_hash:
+        raise RuntimeError("CSW registry identity changed during control application")
 
     original_active = set(basis["csw_active_stateworks"])
-    expected_active = set(original_active)
     csw_changes = 0
     eligible = set(basis["csw_eligible_stateworks"])
     for directive in decision.directives:
         if directive.operation == "release_statework":
-            if directive.target not in expected_active:
+            if directive.target not in original_active:
                 raise ValueError("CSW release target was not active in the basis")
-            expected_active.remove(directive.target)
             csw_changes += 1
         elif directive.operation == "prefer_statework":
             if directive.target not in eligible:
                 raise ValueError("CSW activation target was not eligible in the basis")
-            if directive.target in expected_active:
+            if directive.target in original_active:
                 raise ValueError("CSW activation target was already active")
-            expected_active.add(directive.target)
             csw_changes += 1
     retained = dict(request.csw_snapshot.dependency_retention)
     for statework_id, required_by in retained.items():
         if statework_id not in original_active:
-            raise ValueError("CSW dependency retention names a workflow outside the basis")
-        if not set(required_by).issubset(expected_active):
-            raise ValueError("CSW retained a prerequisite without its active dependents")
-        expected_active.add(statework_id)
+            # An activation can introduce a dependency-owned prerequisite.
+            if not any(item.operation == "prefer_statework"
+                       for item in decision.directives):
+                raise ValueError("CSW dependency retention names a workflow outside the basis")
+    expected_active = expected_csw_active_stateworks(
+        basis, [item.to_dict() for item in decision.directives], retained)
     if set(request.csw_snapshot.active_stateworks) != expected_active:
         raise ValueError("CSW post-application state does not match DP requests")
     expected_revision = int(basis["csw_selection_revision"]) + csw_changes

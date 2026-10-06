@@ -8,6 +8,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
+from .compatibility import (
+    MAX_ACTIVE_STATEWORKS, MAX_AVAILABLE_FRAMEWORKS,
+    MAX_CFW_SIGNALS, MAX_CONTROL_BATCH_ITEMS, MAX_ELIGIBLE_STATEWORKS,
+    MAX_GOAL_CRITERIA,
+)
 
 
 BEHAVIOR_MODES = frozenset({
@@ -24,6 +29,10 @@ INTERVENTION_OUTCOMES = frozenset({
 })
 INTERVENTION_ATTRIBUTIONS = frozenset({
     "supported", "confounded", "not_attributed", "none", "insufficient",
+})
+PREVENTIVE_UTILITY_KINDS = frozenset({
+    "prevented_invalid_completion", "caught_change_induced_regression",
+    "detected_preexisting_regression", "prevented_unsafe_action",
 })
 MAX_ACTIVE_INTERVENTIONS = 16
 MAX_TARGETS_PER_INTERVENTION = 12
@@ -109,8 +118,10 @@ class GoalSetSnapshot:
     def __post_init__(self) -> None:
         if type(self.revision) is not int or self.revision < 0:
             raise ValueError("goal set revision must be non-negative")
-        if not isinstance(self.items, (tuple, list)) or not 1 <= len(self.items) <= 256:
-            raise ValueError("goal set must contain between one and 256 items")
+        if (not isinstance(self.items, (tuple, list))
+                or not 1 <= len(self.items) <= MAX_GOAL_CRITERIA):
+            raise ValueError(
+                f"goal set must contain between one and {MAX_GOAL_CRITERIA} items")
         items = tuple(item if isinstance(item, GoalItemSnapshot)
                       else GoalItemSnapshot(**dict(item)) for item in self.items)
         ids = [item.criterion_id for item in items]
@@ -315,6 +326,7 @@ class BehaviorIntervention:
     baseline_attention_last_seen: Mapping[str, int] = field(default_factory=dict)
     condition_id: str = "legacy-condition"
     condition_basis_digest: str = "legacy-condition"
+    recovery_epoch_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
@@ -323,6 +335,8 @@ class BehaviorIntervention:
         _text(self.scope, "intervention scope", limit=256)
         _text(self.condition_id, "intervention condition ID", limit=128)
         _text(self.condition_basis_digest, "intervention condition digest", limit=128)
+        if self.recovery_epoch_id is not None:
+            _text(self.recovery_epoch_id, "recovery epoch ID", limit=128)
         if self.start_revision < 0 or self.expires_after_actions < 1:
             raise ValueError("intervention revision and expiry must be positive bounds")
         if not 0 <= self.actions_elapsed <= self.expires_after_actions:
@@ -374,7 +388,7 @@ class BehaviorIntervention:
                 revision=int(value["revision"]),
                 items=tuple(GoalItemSnapshot(**dict(item)) for item in value["items"])))
         if (not isinstance(self.baseline_attention_last_seen, Mapping)
-                or len(self.baseline_attention_last_seen) > 256):
+                or len(self.baseline_attention_last_seen) > MAX_GOAL_CRITERIA):
             raise ValueError("baseline attention history must be bounded")
         baseline_attention = {}
         for criterion_id, action_index in self.baseline_attention_last_seen.items():
@@ -400,7 +414,8 @@ class BehaviorIntervention:
                                       if self.baseline_goal_set is not None else None),
                 "baseline_attention_last_seen": dict(self.baseline_attention_last_seen),
                 "condition_id": self.condition_id,
-                "condition_basis_digest": self.condition_basis_digest}
+                "condition_basis_digest": self.condition_basis_digest,
+                "recovery_epoch_id": self.recovery_epoch_id}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "BehaviorIntervention":
@@ -475,6 +490,7 @@ class InterventionOutcome:
     task_set_outcome: TaskSetOutcome | None = None
     condition_id: str = "legacy-condition"
     condition_basis_digest: str = "legacy-condition"
+    preventive_utility: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
@@ -505,6 +521,11 @@ class InterventionOutcome:
                                 "criterion_ids_progressed", limit=8))
         object.__setattr__(self, "target_criteria",
                            _ids(self.target_criteria, "outcome target_criteria", limit=8))
+        preventive_utility = _ids(
+            self.preventive_utility, "preventive_utility", limit=4)
+        if not set(preventive_utility).issubset(PREVENTIVE_UTILITY_KINDS):
+            raise ValueError("preventive_utility contains an unsupported outcome kind")
+        object.__setattr__(self, "preventive_utility", preventive_utility)
         task_set_outcome = self.task_set_outcome
         if task_set_outcome is not None and not isinstance(task_set_outcome, TaskSetOutcome):
             task_set_outcome = TaskSetOutcome(**dict(task_set_outcome))
@@ -526,7 +547,8 @@ class InterventionOutcome:
                 "task_set_outcome": (self.task_set_outcome.to_dict()
                                      if self.task_set_outcome is not None else None),
                 "condition_id": self.condition_id,
-                "condition_basis_digest": self.condition_basis_digest}
+                "condition_basis_digest": self.condition_basis_digest,
+                "preventive_utility": list(self.preventive_utility)}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "InterventionOutcome":
@@ -538,6 +560,7 @@ class InterventionOutcome:
         data["evidence_refs"] = tuple(data.get("evidence_refs", ()))
         data["criterion_ids_progressed"] = tuple(data.get("criterion_ids_progressed", ()))
         data["target_criteria"] = tuple(data.get("target_criteria", ()))
+        data["preventive_utility"] = tuple(data.get("preventive_utility", ()))
         if data.get("task_set_outcome") is not None:
             data["task_set_outcome"] = (
                 data["task_set_outcome"]
@@ -581,7 +604,8 @@ class BehaviorState:
             raise ValueError("behavior revision must be a non-negative integer")
         if self.cognitive_mode not in BEHAVIOR_MODES:
             raise ValueError("unsupported cognitive mode")
-        if not isinstance(self.framework_modes, Mapping) or len(self.framework_modes) > 32:
+        if (not isinstance(self.framework_modes, Mapping)
+                or len(self.framework_modes) > MAX_AVAILABLE_FRAMEWORKS):
             raise ValueError("framework_modes must be a bounded mapping")
         modes: dict[str, str] = {}
         for name, mode in self.framework_modes.items():
@@ -593,7 +617,8 @@ class BehaviorState:
         modes["ward"] = "mandatory"
         object.__setattr__(self, "framework_modes", MappingProxyType(modes))
         object.__setattr__(self, "active_stateworks",
-                           _ids(self.active_stateworks, "active_stateworks", limit=16))
+                           _ids(self.active_stateworks, "active_stateworks",
+                                limit=MAX_ACTIVE_STATEWORKS))
         object.__setattr__(self, "focus_criteria",
                            _ids(self.focus_criteria, "focus_criteria", limit=8))
         lease = self.attention_lease
@@ -609,7 +634,7 @@ class BehaviorState:
         if mode_lease is not None and mode_lease.mode != self.cognitive_mode:
             raise ValueError("mode lease must describe the current cognitive mode")
         if (not isinstance(self.attention_last_seen, Mapping)
-                or len(self.attention_last_seen) > 256):
+                or len(self.attention_last_seen) > MAX_GOAL_CRITERIA):
             raise ValueError("attention history must be bounded to 256 criteria")
         attention_last_seen = {}
         for criterion_id, action_index in self.attention_last_seen.items():
@@ -769,18 +794,21 @@ class CSWBehaviorSnapshot:
     workflow_revisions: Mapping[str, int] = field(default_factory=dict)
     eligible_steps: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     dependency_retention: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    registry_hash: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, int) or self.revision < 0:
             raise ValueError("CSW revision must be non-negative")
         object.__setattr__(self, "active_stateworks",
-                           _ids(self.active_stateworks, "active_stateworks", limit=16))
-        if len(self.eligible_stateworks) > 32:
+                           _ids(self.active_stateworks, "active_stateworks",
+                                limit=MAX_ACTIVE_STATEWORKS))
+        if len(self.eligible_stateworks) > MAX_ELIGIBLE_STATEWORKS:
             raise ValueError("CSW snapshot contains too many eligible StateWorks")
         ids = [item.statework_id for item in self.eligible_stateworks]
         if len(ids) != len(set(ids)):
             raise ValueError("eligible StateWork IDs must be unique")
-        if not isinstance(self.workflow_states, Mapping) or len(self.workflow_states) > 16:
+        if (not isinstance(self.workflow_states, Mapping)
+                or len(self.workflow_states) > MAX_ACTIVE_STATEWORKS):
             raise ValueError("workflow_states must be bounded")
         states = {}
         for key, value in self.workflow_states.items():
@@ -791,14 +819,21 @@ class CSWBehaviorSnapshot:
                                  or any(char not in "0123456789abcdef"
                                         for char in self.snapshot_id)):
             raise ValueError("CSW snapshot ID must be a SHA-256 digest")
+        if self.registry_hash and (not isinstance(self.registry_hash, str)
+                                   or len(self.registry_hash) != 64
+                                   or any(char not in "0123456789abcdef"
+                                          for char in self.registry_hash)):
+            raise ValueError("CSW registry hash must be a SHA-256 digest")
         revisions = dict(self.workflow_revisions)
-        if (len(revisions) > 16 or not set(revisions).issubset(set(self.active_stateworks))
+        if (len(revisions) > MAX_ACTIVE_STATEWORKS
+                or not set(revisions).issubset(set(self.active_stateworks))
                 or any(not isinstance(value, int) or value < 0
                        for value in revisions.values())):
             raise ValueError("workflow revisions must be bounded to active StateWorks")
         object.__setattr__(self, "workflow_revisions", MappingProxyType(revisions))
         step_map = {}
-        if not isinstance(self.eligible_steps, Mapping) or len(self.eligible_steps) > 16:
+        if (not isinstance(self.eligible_steps, Mapping)
+                or len(self.eligible_steps) > MAX_ACTIVE_STATEWORKS):
             raise ValueError("CSW legal step map must be bounded")
         for statework_id, steps in self.eligible_steps.items():
             key = _text(statework_id, "workflow ID", limit=128)
@@ -806,7 +841,7 @@ class CSWBehaviorSnapshot:
         object.__setattr__(self, "eligible_steps", MappingProxyType(step_map))
         retention = {}
         if (not isinstance(self.dependency_retention, Mapping)
-                or len(self.dependency_retention) > 16):
+                or len(self.dependency_retention) > MAX_ACTIVE_STATEWORKS):
             raise ValueError("dependency retention metadata exceeds its bound")
         for statework_id, required_by in self.dependency_retention.items():
             key = _text(statework_id, "retained StateWork ID", limit=128)
@@ -820,6 +855,7 @@ class CSWBehaviorSnapshot:
 
     def to_dict(self) -> dict[str, Any]:
         return {"revision": self.revision, "snapshot_id": self.snapshot_id,
+                "registry_hash": self.registry_hash,
                 "active_stateworks": list(self.active_stateworks),
                 "eligible_stateworks": [item.to_dict() for item in self.eligible_stateworks],
                 "workflow_states": dict(self.workflow_states),
@@ -996,7 +1032,7 @@ class BehaviorSignalBatch:
                 or self.next_cursor < self.after_cursor):
             raise ValueError("behavior signal batch cursor is malformed")
         signals = tuple(self.signals)
-        if len(signals) > 32 or any(not isinstance(item, FrameworkSignal)
+        if len(signals) > MAX_CFW_SIGNALS or any(not isinstance(item, FrameworkSignal)
                                     for item in signals):
             raise ValueError("behavior signal batch exceeds its bounded contract")
         if self.next_cursor - self.after_cursor != len(signals):
@@ -1021,10 +1057,12 @@ class BehavioralDecision:
         _text(self.reason, "decision reason", limit=512)
         if self.expected_revision < 0 or self.state.revision != self.expected_revision + 1:
             raise ValueError("decision must advance exactly one behavior revision")
-        if len(self.directives) > 32 or len(self.preferred_stateworks) > 16:
+        if (len(self.directives) > MAX_CONTROL_BATCH_ITEMS
+                or len(self.preferred_stateworks) > MAX_ACTIVE_STATEWORKS):
             raise ValueError("behavior decision exceeds bounded output limits")
         object.__setattr__(self, "preferred_stateworks",
-                           _ids(self.preferred_stateworks, "preferred_stateworks", limit=16))
+                           _ids(self.preferred_stateworks, "preferred_stateworks",
+                                limit=MAX_ACTIVE_STATEWORKS))
         if len(self.intervention_outcomes) > 16:
             raise ValueError("too many intervention outcomes")
 
@@ -1038,7 +1076,8 @@ class BehavioralDecision:
 
 
 __all__ = [
-    "BEHAVIOR_MODES", "INTERVENTION_ATTRIBUTIONS", "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
+    "BEHAVIOR_MODES", "INTERVENTION_ATTRIBUTIONS", "PREVENTIVE_UTILITY_KINDS",
+    "BehaviorIntervention", "BehaviorDirective", "BehaviorState",
     "BehavioralDecision", "CSWBehaviorSnapshot", "FrameworkSignal",
     "BehavioralCause", "group_behavioral_causes",
     "StateWorkReleaseResult",

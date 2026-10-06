@@ -28,7 +28,10 @@ digital-psychology-control-mcp = "digital_psychology.transport.control_mcp:main"
 [tool.setuptools]
 packages = ["digital_psychology", "digital_psychology.runtime",
             "digital_psychology.runtime.adapters", "digital_psychology.control",
-            "digital_psychology.host", "digital_psychology.transport"]
+            "digital_psychology.experiments", "digital_psychology.host",
+            "digital_psychology.interventions",
+            "digital_psychology.policy_priors", "digital_psychology.security",
+            "digital_psychology.telemetry", "digital_psychology.transport"]
 package-dir = {digital_psychology = "lib"}
 
 [tool.setuptools.package-data]

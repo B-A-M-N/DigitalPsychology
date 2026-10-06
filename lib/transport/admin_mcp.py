@@ -1,15 +1,12 @@
 """Operator-only DigitalPsychology telemetry and administration MCP."""
 from __future__ import annotations
 
+import os
 from typing import Any
-
-try:
-    from mcp.server.mcpserver import MCPServer
-except ImportError:  # transport stays optional for library consumers
-    MCPServer = None
 
 from ..service import DigitalPsychologyService
 from .stdio import run_stdio_server
+from .mcp_compat import MCPServer
 
 
 def create_admin_server(service: DigitalPsychologyService | None = None):
@@ -51,6 +48,8 @@ def create_admin_server(service: DigitalPsychologyService | None = None):
 
 
 def main() -> None:
+    if os.environ.get("DIGITALPSYCHOLOGY_ENABLE_ADMIN_MCP") != "1":
+        raise RuntimeError("DigitalPsychology admin MCP is disabled")
     service = DigitalPsychologyService()
     server = create_admin_server(service)
     try:

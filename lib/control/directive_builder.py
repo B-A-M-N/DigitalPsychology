@@ -103,7 +103,8 @@ class DirectiveBuilder:
                     baseline_goal_set=context.goal_set,
                     baseline_attention_last_seen=context.attention_last_seen,
                     condition_id=condition.condition_id,
-                    condition_basis_digest=condition.condition_basis_digest)
+                    condition_basis_digest=condition.condition_basis_digest,
+                    recovery_epoch_id=condition.condition_id)
                 interventions.append(intervention)
                 for target, _previous, value, effect in target_values:
                     operation = ("set_framework" if target.startswith("framework:")
@@ -205,7 +206,8 @@ class DirectiveBuilder:
                         baseline_goal_set=context.goal_set,
                         baseline_attention_last_seen=context.attention_last_seen,
                         condition_id=condition.condition_id,
-                        condition_basis_digest=condition.condition_basis_digest)
+                        condition_basis_digest=condition.condition_basis_digest,
+                        recovery_epoch_id=condition.condition_id)
                     interventions = list(working.active_interventions) + [intervention]
                     working = replace(working, active_interventions=tuple(interventions))
                 if preference:

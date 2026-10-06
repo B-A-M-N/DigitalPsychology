@@ -3,21 +3,54 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+from dataclasses import replace
+from functools import wraps
+import time
 from typing import Any, Mapping, Sequence
 
 from ..behavior_state import (BehaviorDirective, BehaviorState, BehavioralDecision,
                               CSWBehaviorSnapshot, InterventionOutcome,
                               group_behavioral_causes)
 from ..outcomes import InterventionEventContext
-from ..runtime.projection import (build_behavior_projection,
-                                  project_behavior_context)
+from ..runtime.projection import build_behavior_projection
+from ..runtime.cfw_behavior_contract import validate_state_against_cfw_contract
 from ..control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
                                 ControlCommitRequest, ControlSessionDescriptor,
                                 ControlTickRequest, bounded_control_mapping,
+                                ACTION_INDEX_BOUNDARIES,
+                                CANDIDATE_ACTION_BOUNDARIES,
                                 parse_csw_snapshot, parse_goal_set)
 from ..telemetry.trace_builder import (build_committed_action_trace,
                                        build_control_transition_trace)
 from .authority_receipts import validate_applied_authorities
+
+_LOG = logging.getLogger(__name__)
+
+
+def _record_metric(self: Any, operation: str, *args: Any) -> None:
+    metrics = getattr(self, "production_metrics", None)
+    method = getattr(metrics, operation, None)
+    if callable(method):
+        try:
+            method(*args)
+        except Exception:
+            _LOG.warning("could not persist a production metric", exc_info=True)
+
+
+def _measure(metric_name: str):
+    def decorate(function):
+        @wraps(function)
+        def measured(self, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return function(self, *args, **kwargs)
+            finally:
+                _record_metric(
+                    self, "observe_duration", metric_name,
+                    max(0.0, (time.perf_counter() - started) * 1000.0))
+        return measured
+    return decorate
 
 
 def _canonical(value: Any) -> str:
@@ -27,6 +60,68 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _decision_input_digest(descriptor: ControlSessionDescriptor,
+                           request: ControlTickRequest, state: BehaviorState,
+                           provider_identity: Mapping[str, Any], *,
+                           cfw_lifecycle_revision: int) -> str:
+    """Hash stable policy inputs while omitting transport-only tick sequencing."""
+    normalized_request = request.to_dict()
+    normalized_request.pop("tick_id", None)
+    normalized_request.pop("boundary_sequence", None)
+    normalized_request["expected_behavior_revision"] = state.revision
+    normalized_request["cfw_lifecycle_revision"] = cfw_lifecycle_revision
+    pressure = float(request.observation.context_pressure)
+    return _digest({
+        "version": 1,
+        "behavior_revision": state.revision,
+        "behavior_state": state.to_dict(),
+        "goal_set_revision": request.goal_set.revision,
+        "goal_set": request.goal_set.to_dict(),
+        "cfw_signal_cursor": request.cfw_signal_cursor,
+        "csw_snapshot_id": request.csw_snapshot.snapshot_id,
+        "context_pressure_band": "high" if pressure >= 0.85 else "normal",
+        "context_pressure": pressure,
+        "current_attention_lease": (
+            state.attention_lease.to_dict()
+            if state.attention_lease is not None else None),
+        "active_trigger_codes": list(request.observation.active_trigger_codes),
+        "boundary_kind": request.boundary_kind,
+        "semantic_policy_identity": {
+            "descriptor": descriptor.to_dict(),
+            "provider_identity": dict(provider_identity),
+        },
+        "request": normalized_request,
+    })
+
+
+def _lease_or_evaluation_due(state: BehaviorState, action_index: int) -> bool:
+    attention = state.attention_lease
+    if (attention is not None
+            and action_index - attention.start_action >= attention.max_actions):
+        return True
+    mode = state.mode_lease
+    if (mode is not None and mode.max_actions is not None
+            and action_index - mode.entered_action >= mode.max_actions):
+        return True
+    for intervention in state.active_interventions:
+        horizon = (intervention.evaluation_horizon_actions
+                   or intervention.expires_after_actions)
+        if (intervention.actions_elapsed >= horizon
+                or action_index - intervention.baseline_action_index >= horizon
+                or action_index > intervention.expires_at_action):
+            return True
+    return False
+
+
+def _state_changes_only_by_revision(before: BehaviorState,
+                                    after: BehaviorState) -> bool:
+    before_values = before.to_dict()
+    after_values = after.to_dict()
+    before_values.pop("revision", None)
+    after_values.pop("revision", None)
+    return before_values == after_values
 
 
 def _decision_from_mapping(value: Mapping[str, Any], *,
@@ -47,13 +142,32 @@ def _decision_from_mapping(value: Mapping[str, Any], *,
     )
 
 
+def _projection_capabilities(descriptor: ControlSessionDescriptor) -> dict[str, bool]:
+    """Return the trusted authority flags shared by tick and recovery projections."""
+    policy_context = descriptor.host_capabilities.get("policy_context") or {}
+    return {
+        "cfw_connected": bool(descriptor.available_frameworks),
+        "csw_connected": bool(descriptor.csw_authority_identity),
+        "outcome_evidence_connected": bool(
+            descriptor.host_capabilities.get("outcome_evidence_connected")),
+        "host_has_stable_objective_context": bool(
+            policy_context.get("host_has_stable_objective_context")),
+    }
+
+
 
 class ControlTransactionMethods:
+    @_measure("control_tick_prepare_duration_ms")
     def prepare_control_tick(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         request = ControlTickRequest.from_mapping(raw)
         descriptor = self._descriptor(request.control_session_id)
         scope = request.control_session_id
         record = self.state_store.load(scope)
+        if self.state_store.control_reconciliation_required(scope):
+            raise RuntimeError(
+                "control session requires reconciliation before preparing a new tick")
+        validate_state_against_cfw_contract(
+            record.state, descriptor, label="persisted DP behavior state")
         digest = _digest(request.to_dict())
         existing = self.state_store.control_tick(scope, request.tick_id)
         if existing is not None:
@@ -64,20 +178,83 @@ class ControlTransactionMethods:
             raise RuntimeError("control tick behavior revision is stale")
 
         preparation = self.engine.prepare(descriptor, record, request)
+        if preparation.system_one_query_attempted:
+            _record_metric(self, "increment", "laya_query_attempts")
+            if preparation.system_one_judgment_returned:
+                _record_metric(self, "increment", "laya_advisory_results")
+            if not preparation.semantic_judgment_used:
+                _record_metric(self, "increment", "laya_fallbacks")
+        if preparation.starvation_prevented:
+            _record_metric(self, "increment", "starvation_prevention_events",
+                           len(preparation.starvation_prevented))
         decision = preparation.decision
+        # Engine decisions describe a policy outcome and can repeat when a
+        # transaction is retried at a later boundary. Persisted decisions are
+        # transaction identities, so bind the ID to this tick to keep distinct
+        # ticks independently addressable while same-tick retries stay stable.
+        decision = replace(
+            decision,
+            decision_id="decision-" + _digest({
+                "scope": scope,
+                "tick_id": request.tick_id,
+                "policy_decision_id": decision.decision_id,
+            })[:24],
+        )
         boundary_kind = str(request.boundary_kind)
+        session = self.state_store.control_session(scope)
+        provider_identity = (session.get("provider_identity")
+                             if isinstance(session, Mapping) else None)
+        if isinstance(provider_identity, Mapping):
+            is_non_action = (
+                boundary_kind != "post_action"
+                and boundary_kind not in ACTION_INDEX_BOUNDARIES
+                and boundary_kind not in CANDIDATE_ACTION_BOUNDARIES
+                and not request.observation.action_completed
+                and request.observation.candidate_action is None)
+            has_outcome_input = bool(
+                request.outcome_facts or request.observation.evidence_refs
+                or request.observation.progress_made
+                or request.observation.regression_observed
+                or request.observation.artifact_changed)
+            basis_matcher = getattr(
+                self.state_store, "control_tick_input_basis_matches", None)
+            can_consider_unchanged = (
+                is_non_action and callable(basis_matcher)
+                and not request.cfw_signals and not has_outcome_input
+                and not preparation.system_one_query_attempted
+                and not preparation.starvation_prevented
+                and not decision.directives and not decision.preferred_stateworks
+                and not decision.intervention_outcomes
+                and not _lease_or_evaluation_due(
+                    record.state, request.observation.action_index)
+                and not _lease_or_evaluation_due(
+                    decision.state, request.observation.action_index)
+                and _state_changes_only_by_revision(record.state, decision.state))
+            if can_consider_unchanged:
+                current_input_digest = _decision_input_digest(
+                    descriptor, request, record.state, provider_identity,
+                    cfw_lifecycle_revision=request.cfw_lifecycle_revision)
+                if basis_matcher(
+                        scope, boundary_kind=boundary_kind,
+                        expected_revision=record.state.revision,
+                        expected_action_index=record.action_index,
+                        boundary_sequence=request.boundary_sequence,
+                        input_digest=current_input_digest):
+                    return {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "control_session_id": scope,
+                        "status": "unchanged",
+                        "behavior_revision": record.state.revision,
+                        "behavior_state": record.state.to_dict(),
+                        "boundary_kind": boundary_kind,
+                        "decision_input_digest": current_input_digest,
+                    }
+
         commit_action_index = (request.observation.action_index
                                if boundary_kind == "post_action" else record.action_index)
-        policy_context = descriptor.host_capabilities.get("policy_context") or {}
         model_projection = build_behavior_projection(
             decision.state, request.csw_snapshot, objective=descriptor.objective,
-            goal_set=request.goal_set,
-            cfw_connected=bool(descriptor.available_frameworks),
-            csw_connected=bool(descriptor.csw_authority_identity),
-            outcome_evidence_connected=bool(
-                descriptor.host_capabilities.get("outcome_evidence_connected")),
-            host_has_stable_objective_context=bool(
-                policy_context.get("host_has_stable_objective_context")),
+            goal_set=request.goal_set, **_projection_capabilities(descriptor),
         )
         previous_basis = self.state_store.latest_control_tick_basis(scope)
         prior_projection_index = max(
@@ -109,6 +286,7 @@ class ControlTransactionMethods:
                                       request.cfw_signals)],
             "csw_selection_revision": request.csw_snapshot.revision,
             "csw_snapshot_id": request.csw_snapshot.snapshot_id,
+            "csw_registry_hash": request.csw_snapshot.registry_hash,
             "csw_active_stateworks": list(request.csw_snapshot.active_stateworks),
             "csw_eligible_stateworks": [
                 item.statework_id for item in request.csw_snapshot.eligible_stateworks],
@@ -147,6 +325,32 @@ class ControlTransactionMethods:
                                      if signal.active],
             },
         }
+        if (isinstance(provider_identity, Mapping)
+                and boundary_kind != "post_action"
+                and boundary_kind not in ACTION_INDEX_BOUNDARIES
+                and boundary_kind not in CANDIDATE_ACTION_BOUNDARIES
+                and not request.observation.action_completed
+                and request.observation.candidate_action is None
+                and not request.cfw_signals
+                and not request.outcome_facts
+                and not request.observation.evidence_refs
+                and not request.observation.progress_made
+                and not request.observation.regression_observed
+                and not request.observation.artifact_changed
+                and not preparation.system_one_query_attempted
+                and not preparation.starvation_prevented
+                and not decision.directives
+                and not decision.preferred_stateworks
+                and not decision.intervention_outcomes
+                and not _lease_or_evaluation_due(
+                    decision.state, request.observation.action_index)):
+            predicted_cfw_revision = (
+                decision.state.revision
+                if descriptor.host_capabilities.get("cfw_connected")
+                else request.cfw_lifecycle_revision)
+            basis["decision_input_digest"] = _decision_input_digest(
+                descriptor, request, decision.state, provider_identity,
+                cfw_lifecycle_revision=predicted_cfw_revision)
         if preparation.system_one_query_attempted:
             basis["system_one"] = {
                 "frame": dict(preparation.system_one_frame),
@@ -157,6 +361,7 @@ class ControlTransactionMethods:
         saved = self.state_store.prepare_control_tick(
             scope, tick_id=request.tick_id, request_digest=digest,
             basis=basis, decision=decision.to_dict())
+        _record_metric(self, "increment", "control_ticks_prepared")
         response = self._prepared_response(scope, request.tick_id, saved)
         response["basis_digest"] = basis_digest
         return response
@@ -195,6 +400,7 @@ class ControlTransactionMethods:
             "abort_detail": transaction.get("detail"),
         }
 
+    @_measure("control_tick_commit_duration_ms")
     def commit_control_tick(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         request = ControlCommitRequest.from_mapping(raw)
         descriptor = self._descriptor(request.control_session_id)
@@ -216,6 +422,8 @@ class ControlTransactionMethods:
 
         decision = _decision_from_mapping(
             transaction["decision"], basis=transaction["basis"])
+        validate_state_against_cfw_contract(
+            decision.state, descriptor, label="prepared DP behavior candidate")
         expected_directives = {item.directive_id for item in decision.directives}
         if set(request.applied_directive_ids) != expected_directives:
             raise ValueError("host receipts do not cover the exact prepared directives")
@@ -229,6 +437,8 @@ class ControlTransactionMethods:
             **decision.state.to_dict(),
             "active_stateworks": list(request.csw_snapshot.active_stateworks),
         })
+        validate_state_against_cfw_contract(
+            committed_state, descriptor, label="committed DP behavior state")
         application_events, outcome_events, receipts = self._application_records(
             descriptor, record.state, decision, request.applied_directive_ids)
         event_values = application_events + outcome_events
@@ -263,6 +473,7 @@ class ControlTransactionMethods:
         transition_trace = build_control_transition_trace(
             scope, record.state, committed_state, decision, basis,
             request.applied_directive_ids)
+        previous_basis = self.state_store.latest_control_tick_basis(scope)
         self.state_store.save(
             scope,
             expected_revision=record.state.revision,
@@ -278,6 +489,29 @@ class ControlTransactionMethods:
                                      if action_trace is not None else None),
             behavioral_control_transition=transition_trace,
         )
+        _record_metric(self, "increment", "control_ticks_committed")
+        previous_lease = record.state.attention_lease
+        current_lease = committed_state.attention_lease
+        if (previous_lease is not None and current_lease is not None
+                and previous_lease.criterion_ids != current_lease.criterion_ids):
+            _record_metric(self, "increment", "attention_rotations")
+        if (record.state.cognitive_mode != "BLOCKED"
+                and committed_state.cognitive_mode == "BLOCKED"):
+            _record_metric(self, "increment", "global_blocked_transitions")
+        previous_goal_items = {
+            item.get("criterion_id"): item.get("status")
+            for item in ((previous_basis or {}).get("goal_set") or {}).get("items", ())
+            if isinstance(item, Mapping)}
+        current_goal_items = {
+            item.get("criterion_id"): item.get("status")
+            for item in (basis.get("goal_set") or {}).get("items", ())
+            if isinstance(item, Mapping)}
+        recoveries = sum(
+            prior_status in {"BLOCKED", "DEPENDENCY_BLOCKED"}
+            and current_goal_items.get(criterion_id) in {"READY", "ACTIVE", "VERIFIED"}
+            for criterion_id, prior_status in previous_goal_items.items())
+        if recoveries:
+            _record_metric(self, "increment", "criterion_local_recoveries", recoveries)
         self._dispatch_outbox(scope)
         return result
 
@@ -325,7 +559,7 @@ class ControlTransactionMethods:
     def abort_control_tick(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         data = bounded_control_mapping(raw, "control abort")
         request = ControlAbortRequest.from_mapping(data)
-        self._descriptor(request.control_session_id)
+        descriptor = self._descriptor(request.control_session_id)
         transaction = self.state_store.control_tick(
             request.control_session_id, request.tick_id)
         if transaction is None or transaction["decision"]["decision_id"] != request.decision_id:
@@ -343,12 +577,16 @@ class ControlTransactionMethods:
         aborted = self.state_store.abort_control_tick(
             request.control_session_id, request.tick_id,
             decision_id=request.decision_id, detail=detail)
+        if transaction["status"] == "prepared":
+            _record_metric(self, "increment", "control_ticks_aborted")
         state = self.state_store.load(request.control_session_id).state
+        validate_state_against_cfw_contract(state, descriptor)
         return {"protocol_version": PROTOCOL_VERSION,
                 **aborted, "behavior_revision": state.revision,
                 "behavior_state": state.to_dict(),
                 "requires_reconciliation": not request.rollback_completed}
 
+    @_measure("reconciliation_duration_ms")
     def reconcile_control_session(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         data = bounded_control_mapping(raw, "control reconciliation")
         expected = {"protocol_version", "control_session_id", "cfw_lifecycle_revision",
@@ -363,6 +601,8 @@ class ControlTransactionMethods:
         csw = parse_csw_snapshot(data["csw_snapshot"])
         pending = self.state_store.pending_control_ticks(scope)
         record = self.state_store.load(scope)
+        validate_state_against_cfw_contract(
+            record.state, descriptor, label="persisted DP behavior state")
         latest_basis = self.state_store.latest_control_tick_basis(scope)
         latest_goal_set = (parse_goal_set(latest_basis["goal_set"])
                            if latest_basis and latest_basis.get("goal_set")
@@ -373,6 +613,10 @@ class ControlTransactionMethods:
                 expected_action_index=record.action_index,
                 active_stateworks=csw.active_stateworks)
             record = self.state_store.load(scope)
+            validate_state_against_cfw_contract(
+                record.state, descriptor, label="reconciled DP behavior state")
+            self.state_store.acknowledge_control_reconciliation(scope)
+        _record_metric(self, "increment", "reconciliations")
         return {
             "protocol_version": PROTOCOL_VERSION,
             "control_session_id": scope,
@@ -391,13 +635,7 @@ class ControlTransactionMethods:
             "pending_decisions": [self._prepared_response(
                 scope, item["tick_id"], item)
                 for item in pending],
-            "objective": descriptor.objective,
-            "projection": project_behavior_context(
-                record.state, csw, objective=descriptor.objective,
-                goal_set=latest_goal_set,
-                cfw_connected=bool(descriptor.available_frameworks),
-                csw_connected=bool(descriptor.csw_authority_identity),
-                outcome_evidence_connected=True),
+            "latest_control_tick": self.state_store.latest_control_tick(scope),
         }
 
     def _dispatch_outbox(self, scope: str) -> None:

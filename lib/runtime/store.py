@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from ..behavior_state import BehaviorState
+from ..compatibility import MAX_ACTIVE_STATEWORKS
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,7 @@ class RuntimeStateRecord:
     state: BehaviorState
     action_index: int
     application_receipts: Mapping[str, tuple[str, ...]]
+    cfw_signal_cursor: int = 0
 
 
 @dataclass(frozen=True)
@@ -43,7 +45,8 @@ class BehaviorStateStore:
                     scope TEXT PRIMARY KEY,
                     revision INTEGER NOT NULL,
                     action_index INTEGER NOT NULL,
-                    state_json TEXT NOT NULL
+                    state_json TEXT NOT NULL,
+                    cfw_signal_cursor INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS intervention_receipts (
                     scope TEXT NOT NULL,
@@ -69,6 +72,12 @@ class BehaviorStateStore:
                 CREATE TABLE IF NOT EXISTS control_session_provider_identity (
                     scope TEXT PRIMARY KEY,
                     provider_identity_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS control_reconciliation_receipts (
+                    scope TEXT NOT NULL,
+                    tick_id TEXT NOT NULL,
+                    acknowledged_at TEXT NOT NULL,
+                    PRIMARY KEY (scope, tick_id)
                 );
                 CREATE TABLE IF NOT EXISTS control_ticks (
                     scope TEXT NOT NULL,
@@ -108,6 +117,12 @@ class BehaviorStateStore:
                 database.execute(
                     "ALTER TABLE control_ticks ADD COLUMN boundary_sequence "
                     "INTEGER NOT NULL DEFAULT -1")
+            state_columns = {str(row[1]) for row in database.execute(
+                "PRAGMA table_info(behavior_state)").fetchall()}
+            if "cfw_signal_cursor" not in state_columns:
+                database.execute(
+                    "ALTER TABLE behavior_state ADD COLUMN cfw_signal_cursor "
+                    "INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def _connect(self):
@@ -145,17 +160,18 @@ class BehaviorStateStore:
              ) -> RuntimeStateRecord:
         with self._connect() as database:
             row = database.execute(
-                "SELECT revision, action_index, state_json FROM behavior_state WHERE scope=?",
+                "SELECT revision, action_index, state_json, cfw_signal_cursor "
+                "FROM behavior_state WHERE scope=?",
                 (scope,)).fetchone()
             if row is None:
-                return RuntimeStateRecord(initial or BehaviorState(), -1, {})
-            revision, action_index, encoded = row
+                return RuntimeStateRecord(initial or BehaviorState(), -1, {}, 0)
+            revision, action_index, encoded, signal_cursor = row
             state = BehaviorState.from_mapping(json.loads(encoded))
             if state.revision != int(revision):
                 raise RuntimeError("persisted DP state revision does not match its row")
             active_ids = tuple(item.intervention_id for item in state.active_interventions)
             receipts = self._read_receipts(database, scope, active_ids)
-        return RuntimeStateRecord(state, int(action_index), receipts)
+        return RuntimeStateRecord(state, int(action_index), receipts, int(signal_cursor))
 
     def save(self, scope: str, *, expected_revision: int,
              expected_action_index: int, action_index: int, state: BehaviorState,
@@ -164,11 +180,15 @@ class BehaviorStateStore:
              control_tick_id: str | None = None,
              control_tick_result: Mapping[str, Any] | None = None,
              behavioral_action_trace: Mapping[str, Any] | None = None,
-             behavioral_control_transition: Mapping[str, Any] | None = None) -> None:
+             behavioral_control_transition: Mapping[str, Any] | None = None,
+             cfw_signal_cursor: int | None = None) -> None:
         if state.revision != expected_revision + 1:
             raise ValueError("saved DP behavior state must advance exactly one revision")
         if action_index < 0 and control_tick_id is None:
             raise ValueError("host action index must be non-negative")
+        if (cfw_signal_cursor is not None
+                and (type(cfw_signal_cursor) is not int or cfw_signal_cursor < 0)):
+            raise ValueError("CFW signal cursor must be a non-negative integer")
         receipts = dict(application_receipts or {})
         if len(receipts) > 16:
             raise ValueError("intervention application receipt count exceeds its bound")
@@ -244,16 +264,27 @@ class BehaviorStateStore:
                     database.rollback()
                     raise RuntimeError("control transition sequence differs from its tick basis")
             row = database.execute(
-                "SELECT revision, action_index FROM behavior_state WHERE scope=?",
+                "SELECT revision, action_index, cfw_signal_cursor "
+                "FROM behavior_state WHERE scope=?",
                 (scope,)).fetchone()
             actual_revision, actual_action = ((int(row[0]), int(row[1]))
                                               if row is not None else (0, -1))
+            actual_signal_cursor = int(row[2]) if row is not None else 0
             if (actual_revision != expected_revision
                     or actual_action != expected_action_index):
                 database.rollback()
                 raise RuntimeError(
                     "DP runtime compare-and-swap conflict; re-read session state")
             basis = json.loads(tick[1]) if tick is not None else {}
+            committed_signal_cursor = cfw_signal_cursor
+            if committed_signal_cursor is None and tick is not None:
+                committed_signal_cursor = int(basis.get(
+                    "cfw_signal_cursor", actual_signal_cursor))
+            if committed_signal_cursor is None:
+                committed_signal_cursor = actual_signal_cursor
+            if committed_signal_cursor < actual_signal_cursor:
+                database.rollback()
+                raise ValueError("CFW signal cursor cannot move backwards")
             advances_action = basis.get("boundary_kind", basis.get(
                 "boundary_phase", "post_action")) == "post_action"
             valid_action_index = (action_index > actual_action if advances_action
@@ -262,11 +293,14 @@ class BehaviorStateStore:
                 database.rollback()
                 raise ValueError("control boundary action index is inconsistent")
             database.execute(
-                "INSERT INTO behavior_state(scope, revision, action_index, state_json) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(scope) DO UPDATE SET "
+                "INSERT INTO behavior_state(scope, revision, action_index, state_json, "
+                "cfw_signal_cursor) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(scope) DO UPDATE SET "
                 "revision=excluded.revision, action_index=excluded.action_index, "
-                "state_json=excluded.state_json",
-                (scope, state.revision, action_index, state_json))
+                "state_json=excluded.state_json, "
+                "cfw_signal_cursor=excluded.cfw_signal_cursor",
+                (scope, state.revision, action_index, state_json,
+                 committed_signal_cursor))
             for intervention_id, directive_ids in receipts.items():
                 encoded = json.dumps(list(directive_ids), separators=(",", ":"))
                 prior = database.execute(
@@ -341,10 +375,16 @@ class BehaviorStateStore:
             database.commit()
 
     def register_control_session(self, scope: str, descriptor: Mapping[str, Any], *,
-                                  provider_identity: Mapping[str, Any] | None = None) -> None:
+                                  provider_identity: Mapping[str, Any] | None = None,
+                                  initial_state: BehaviorState | None = None) -> None:
         encoded = json.dumps(dict(descriptor), sort_keys=True, separators=(",", ":"))
         encoded_provider = json.dumps(
             dict(provider_identity or {}), sort_keys=True, separators=(",", ":"))
+        seeded_state = initial_state or BehaviorState()
+        if not isinstance(seeded_state, BehaviorState) or seeded_state.revision != 0:
+            raise ValueError("control session initial state must be revision zero")
+        encoded_state = json.dumps(seeded_state.to_dict(), sort_keys=True,
+                                  separators=(",", ":"))
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             row = database.execute(
@@ -373,6 +413,9 @@ class BehaviorStateStore:
                 if provider_row is not None and provider_row[0] != encoded_provider:
                     database.rollback()
                     raise RuntimeError("control session provider identity has changed")
+            database.execute(
+                "INSERT OR IGNORE INTO behavior_state(scope, revision, action_index, state_json) "
+                "VALUES (?, 0, -1, ?)", (scope, encoded_state))
             database.commit()
 
     def control_session(self, scope: str) -> Mapping[str, Any] | None:
@@ -402,6 +445,18 @@ class BehaviorStateStore:
             if session is None or session[0] != "open":
                 database.rollback()
                 raise RuntimeError("control session is unavailable")
+            reconciliation = database.execute(
+                "SELECT 1 FROM control_ticks AS tick "
+                "LEFT JOIN control_reconciliation_receipts AS receipt "
+                "ON receipt.scope=tick.scope AND receipt.tick_id=tick.tick_id "
+                "WHERE tick.scope=? AND tick.status='aborted' "
+                "AND json_extract(tick.detail_json, '$.requires_reconciliation')=1 "
+                "AND receipt.tick_id IS NULL LIMIT 1", (scope,)
+            ).fetchone()
+            if reconciliation is not None:
+                database.rollback()
+                raise RuntimeError(
+                    "control session requires reconciliation before a new control tick")
             existing = database.execute(
                 "SELECT request_digest, decision_json, basis_json, status, result_json, detail_json "
                 "FROM control_ticks WHERE scope=? AND tick_id=?", (scope, tick_id)).fetchone()
@@ -456,6 +511,19 @@ class BehaviorStateStore:
                 "basis": json.loads(row[2]), "status": row[3],
                 "result": json.loads(row[4]) if row[4] else None,
                 "detail": json.loads(row[5]) if row[5] else None}
+
+    def control_reconciliation_required(self, scope: str) -> bool:
+        """Check whether an aborted partial apply still needs host recovery."""
+        with self._connect() as database:
+            row = database.execute(
+                "SELECT 1 FROM control_ticks AS tick "
+                "LEFT JOIN control_reconciliation_receipts AS receipt "
+                "ON receipt.scope=tick.scope AND receipt.tick_id=tick.tick_id "
+                "WHERE tick.scope=? AND tick.status='aborted' "
+                "AND json_extract(tick.detail_json, '$.requires_reconciliation')=1 "
+                "AND receipt.tick_id IS NULL LIMIT 1", (scope,)
+            ).fetchone()
+        return row is not None
 
     def behavioral_action_traces(self, scope: str) -> tuple[Mapping[str, Any], ...]:
         """Read committed-action telemetry, separate from control transitions."""
@@ -532,11 +600,22 @@ class BehaviorStateStore:
                       "result": None, "detail": None, "created_at": row[5]}
                      for row in rows)
 
+    def latest_control_tick(self, scope: str) -> Mapping[str, Any] | None:
+        """Return the durable disposition needed to settle a CSW checkpoint."""
+        with self._connect() as database:
+            row = database.execute(
+                "SELECT tick_id, status FROM control_ticks "
+                "WHERE scope=? ORDER BY created_at DESC LIMIT 1", (scope,)
+            ).fetchone()
+        return ({"tick_id": str(row[0]), "status": str(row[1])}
+                if row is not None else None)
+
     def synchronize_csw_state(self, scope: str, *, expected_revision: int,
                                expected_action_index: int,
                                active_stateworks: Sequence[str]) -> None:
         """Refresh DP's CSW-owned selection projection without changing DP revision."""
-        if len(active_stateworks) > 16 or len(set(active_stateworks)) != len(active_stateworks):
+        if (len(active_stateworks) > MAX_ACTIVE_STATEWORKS
+                or len(set(active_stateworks)) != len(active_stateworks)):
             raise ValueError("authoritative CSW selection is malformed")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
@@ -561,12 +640,107 @@ class BehaviorStateStore:
                      json.dumps(synchronized.to_dict(), sort_keys=True, separators=(",", ":"))))
             database.commit()
 
-    def latest_control_tick_basis(self, scope: str) -> Mapping[str, Any] | None:
+    def latest_control_tick_basis(self, scope: str, *,
+                                  boundary_kind: str | None = None
+                                  ) -> Mapping[str, Any] | None:
         with self._connect() as database:
-            row = database.execute(
-                "SELECT basis_json FROM control_ticks WHERE scope=? AND status='committed' "
-                "ORDER BY boundary_sequence DESC LIMIT 1", (scope,)).fetchone()
+            if boundary_kind is None:
+                row = database.execute(
+                    "SELECT basis_json FROM control_ticks WHERE scope=? AND status='committed' "
+                    "ORDER BY boundary_sequence DESC LIMIT 1", (scope,)).fetchone()
+            else:
+                row = database.execute(
+                    "SELECT basis_json FROM control_ticks WHERE scope=? AND status='committed' "
+                    "AND json_extract(basis_json, '$.boundary_kind')=? "
+                    "ORDER BY boundary_sequence DESC LIMIT 1",
+                    (scope, boundary_kind)).fetchone()
         return json.loads(row[0]) if row is not None else None
+
+    def control_tick_input_basis_matches(self, scope: str, *,
+                                         boundary_kind: str,
+                                         expected_revision: int,
+                                         expected_action_index: int,
+                                         boundary_sequence: int,
+                                         input_digest: str) -> bool:
+        """Atomically validate the unchanged fast-path's state and prior basis."""
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                session = database.execute(
+                    "SELECT status FROM control_sessions WHERE scope=?", (scope,)
+                ).fetchone()
+                state = database.execute(
+                    "SELECT revision, action_index FROM behavior_state WHERE scope=?",
+                    (scope,),
+                ).fetchone()
+                pending = database.execute(
+                    "SELECT 1 FROM control_ticks WHERE scope=? AND status='prepared' LIMIT 1",
+                    (scope,),
+                ).fetchone()
+                reconciliation = database.execute(
+                    "SELECT 1 FROM control_ticks AS tick "
+                    "LEFT JOIN control_reconciliation_receipts AS receipt "
+                    "ON receipt.scope=tick.scope AND receipt.tick_id=tick.tick_id "
+                    "WHERE tick.scope=? AND tick.status='aborted' "
+                    "AND json_extract(tick.detail_json, '$.requires_reconciliation')=1 "
+                    "AND receipt.tick_id IS NULL LIMIT 1", (scope,),
+                ).fetchone()
+                outbox = database.execute(
+                    "SELECT 1 FROM runtime_event_outbox WHERE scope=? LIMIT 1",
+                    (scope,),
+                ).fetchone()
+                latest_boundary = database.execute(
+                    "SELECT COALESCE(MAX(boundary_sequence), -1) "
+                    "FROM control_ticks WHERE scope=?", (scope,),
+                ).fetchone()
+                basis = database.execute(
+                    "SELECT basis_json FROM control_ticks WHERE scope=? "
+                    "AND status='committed' "
+                    "AND json_extract(basis_json, '$.boundary_kind')=? "
+                    "ORDER BY boundary_sequence DESC LIMIT 1",
+                    (scope, boundary_kind),
+                ).fetchone()
+                matches = bool(
+                    session is not None and session[0] == "open"
+                    and state is not None
+                    and int(state[0]) == expected_revision
+                    and int(state[1]) == expected_action_index
+                    and pending is None and reconciliation is None
+                    and outbox is None and latest_boundary is not None
+                    and boundary_sequence > int(latest_boundary[0])
+                    and basis is not None
+                    and json.loads(basis[0]).get("decision_input_digest") == input_digest
+                )
+                database.commit()
+                return matches
+            except Exception:
+                database.rollback()
+                raise
+
+    def acknowledge_control_reconciliation(self, scope: str) -> None:
+        """Record that the host completed reconciliation for aborted partial applies."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                session = database.execute(
+                    "SELECT status FROM control_sessions WHERE scope=?", (scope,)
+                ).fetchone()
+                if session is None or session[0] != "open":
+                    database.rollback()
+                    raise RuntimeError("control session is unavailable")
+                database.execute(
+                    "INSERT OR IGNORE INTO control_reconciliation_receipts "
+                    "(scope, tick_id, acknowledged_at) "
+                    "SELECT tick.scope, tick.tick_id, ? FROM control_ticks AS tick "
+                    "WHERE tick.scope=? AND tick.status='aborted' "
+                    "AND json_extract(tick.detail_json, '$.requires_reconciliation')=1",
+                    (now, scope),
+                )
+                database.commit()
+            except Exception:
+                database.rollback()
+                raise
 
     def latest_boundary_sequence(self, scope: str) -> int:
         with self._connect() as database:

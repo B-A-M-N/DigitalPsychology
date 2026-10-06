@@ -17,6 +17,11 @@ from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
 from ..control_protocol import (ACTION_INDEX_BOUNDARIES,
                                 CANDIDATE_ACTION_BOUNDARIES,
                                 ControlSessionDescriptor, ControlTickRequest)
+from ..compatibility import MAX_CFW_SIGNALS
+from ..runtime.cfw_behavior_contract import (
+    cfw_suppression_modes, validate_directives_against_cfw_contract,
+    validate_state_against_cfw_contract,
+)
 
 
 class _ProvidedOutcomeFacts(OutcomeEvidenceAuthority):
@@ -71,6 +76,8 @@ class ControlDecisionEngine:
             raise ValueError("host goal set must cover the complete control objective")
         if goal_set.revision < descriptor.initial_goal_set.revision:
             raise ValueError("host goal-set revision moved backwards")
+        validate_state_against_cfw_contract(record.state, descriptor,
+                                            label="persisted DP behavior state")
         boundary_kind = request.boundary_kind
         if boundary_kind in ACTION_INDEX_BOUNDARIES:
             expected_candidate_index = max(1, record.action_index + 1)
@@ -106,7 +113,7 @@ class ControlDecisionEngine:
                 raise ValueError("CFW signal criterion escapes the control objective")
         if any(fact.scope != identity.scope for fact in request.outcome_facts):
             raise ValueError("host outcome facts escape the control session")
-        if len(request.cfw_signals) > 32:
+        if len(request.cfw_signals) > MAX_CFW_SIGNALS:
             raise ValueError("CFW signal count exceeds the protocol bound")
 
         attention = schedule_attention(
@@ -183,9 +190,13 @@ class ControlDecisionEngine:
             available_frameworks=descriptor.available_frameworks,
             approach_epoch=request.observation.approach_epoch,
             policy_context=policy_context,
+            cfw_suppression_modes=cfw_suppression_modes(descriptor),
         )
         decision = self._parse_decision(
             self.decision_service.decide_behavior(input_value, judgment=judgment))
+        validate_state_against_cfw_contract(
+            decision.state, descriptor, label="DP policy candidate")
+        validate_directives_against_cfw_contract(decision.directives, descriptor)
         if decision.scope != identity.scope:
             raise RuntimeError("DP decision scope differs from the control session")
         if decision.expected_revision != record.state.revision:

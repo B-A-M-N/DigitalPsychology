@@ -53,10 +53,6 @@ class DigitalPsychologyService:
         self._sink = SQLiteSink(
             self.event_db, busy_timeout_ms=busy_timeout_ms,
             per_origin_daily_write_limit=per_origin_write_limit)
-        self._sink._conn.execute("""CREATE TABLE IF NOT EXISTS authenticated_events (
-            namespace_id TEXT NOT NULL, application_instance_id TEXT NOT NULL,
-            event_id TEXT NOT NULL, PRIMARY KEY(namespace_id, application_instance_id, event_id))""")
-        self._sink._conn.commit()
         attestation = EventAttestationAuthority(
             trusted_producers=trusted_producers,
             legacy_secret=os.environ.get("DIGITALPSYCHOLOGY_INGESTION_SECRET", "").encode())

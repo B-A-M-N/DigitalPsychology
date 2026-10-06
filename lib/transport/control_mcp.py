@@ -9,14 +9,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-try:
-    from mcp.server.mcpserver import MCPServer
-except ImportError:  # transport stays optional for library-only consumers
-    try:
-        from mcp.server.fastmcp import FastMCP as MCPServer
-    except ImportError:
-        MCPServer = None
-
 from ..control.service import ControlPlaneService
 from ..control_protocol import PROTOCOL_VERSION, bounded_control_mapping
 from ..feedback_loop import trusted_state_root
@@ -24,6 +16,7 @@ from ..service import DigitalPsychologyService
 from ..runtime.store import BehaviorStateStore
 from ..system_one_service import SystemOneService
 from .stdio import run_stdio_server
+from .mcp_compat import MCPServer
 
 
 def _control_from_environment() -> ControlPlaneService:

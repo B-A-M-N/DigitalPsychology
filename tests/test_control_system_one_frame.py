@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import subprocess
+import sys
+import threading
 
 import pytest
 
+from lib.compatibility import COMPATIBILITY, CONTROL_LIMITS
 from lib.control.service import ControlPlaneService
+from lib.control.session_registry import (_cached_execution_identity,
+                                          SessionRegistryMethods,
+                                          invalidate_execution_identity_cache)
 from lib.behavior_state import (BehaviorState, CSWBehaviorSnapshot, FrameworkSignal,
                                 GoalItemSnapshot, GoalSetSnapshot, StateWorkOption)
 from lib.control_protocol import (PROTOCOL_VERSION as CONTROL_PROTOCOL_VERSION,
@@ -14,6 +22,7 @@ from lib.runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObser
 from lib.runtime.store import BehaviorStateStore
 from lib.service import DigitalPsychologyService
 from lib.system_one_backends import DisabledSystemOneBackend
+from lib.system_one_backends import ProviderHealthError
 from lib.system_one_contracts import (QuestionAnswer, QuestionProbability,
                                       SystemOneCapability, SystemOneFrame,
                                       SystemOneJudgment)
@@ -23,6 +32,21 @@ from lib.protocol_artifact import (PROTOCOL_HASH, PROTOCOL_VERSION,
 from lib.system_one_service import SystemOneService
 from lib.telemetry.behavioral_trace import (provider_attestation,
                                             runtime_configuration)
+
+
+def test_execution_identity_is_cached_until_explicit_invalidation():
+    invalidate_execution_identity_cache()
+    try:
+        first = SessionRegistryMethods()._execution_identity()
+        after_first = _cached_execution_identity.cache_info()
+        second = SessionRegistryMethods()._execution_identity()
+        after_second = _cached_execution_identity.cache_info()
+
+        assert first == second
+        assert after_second.misses == after_first.misses
+        assert after_second.hits == after_first.hits + 1
+    finally:
+        invalidate_execution_identity_cache()
 
 
 class _ShadowBackend:
@@ -329,6 +353,32 @@ def test_laya_statework_fit_contains_only_bounded_csw_eligible_choices():
     assert set(frame.state.legal_routes) == set(choices)
 
 
+def _test_cfw_behavior_contract():
+    components = ("anchor", "dox", "flow", "fuse", "owl", "sispis", "ward")
+    baselines = {
+        "owl": "normal", "anchor": "passive", "fuse": "normal",
+        "ward": "mandatory", "flow": "off", "sispis": "normal", "dox": "off",
+    }
+    suppression = {
+        component: (["off"] if component == "anchor"
+                    else [] if component in {"flow", "dox"}
+                    else ["off", "passive"])
+        for component in components
+    }
+    body = {
+        "protocol_version": "1.0.0",
+        "pipeline_manifest_version": "test-v1",
+        "pipeline_manifest_hash": "d" * 64,
+        "selected_components": list(components),
+        "baseline_floors": baselines,
+        "suppression_modes": suppression,
+        "transient_operation_modes": {component: [] for component in components},
+    }
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False)
+    return {**body, "contract_hash": hashlib.sha256(encoded.encode("utf-8")).hexdigest()}
+
+
 def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_path):
     identity = RuntimeIdentity(
         namespace_id="tenant-a", application_id="codex",
@@ -359,17 +409,23 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         cfw_authority_identity={
             "adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
             "adapter_protocol_version": "1.2.0",
-            "behavior_projection_version": "2.0.0",
+            "behavior_projection_version": "2.1.0",
+            "task_behavior_contract_hash": _test_cfw_behavior_contract()["contract_hash"],
             "scope_hash": "a" * 64, "capability_hash": "b" * 64},
         csw_authority_identity={
             "adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-            "adapter_protocol_version": "1.1.0", "workflow_port_version": "1.2.0",
+            "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.4.0",
+            "registry_hash": "d" * 64,
             "scope_hash": "b" * 64, "capability_hash": "c" * 64},
         # The host declares real task semantics; DP refuses to guess them.
         host_capabilities={"cfw_connected": True, "csw_connected": True,
+                           "cfw_behavior_contract": _test_cfw_behavior_contract(),
                            "policy_context": {"deliverable_kind": "visual_ui"}},
     )
-    control.open_control_session(descriptor.to_dict())
+    opened = control.open_control_session(descriptor.to_dict())
+    assert opened["capabilities"]["protocol_versions"] == dict(COMPATIBILITY)
+    assert all(opened["capabilities"][name] == limit
+               for name, limit in CONTROL_LIMITS.items())
     observation = RuntimeObservation(
         action_index=1, goal_set=goals,
         criterion_status={"criterion-visual": "in_progress"},
@@ -421,6 +477,228 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
     assert {item["question_id"] for item in audited["result"]["judgment"]["answers"]} == {
         "retry_relation"}
     assert prepared["status"] == "prepared"
+
+
+def test_semantic_provider_outage_falls_back_to_deterministic_dp(tmp_path):
+    from lib.control.fast_loop_input import FastLoopInput
+    from lib.system_one_runtime import ProviderHealthError
+
+    class OfflineBackend(_ShadowBackend):
+        def judge(self, _frame):
+            raise ProviderHealthError("simulated Laya outage")
+
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-laya-outage",
+        session_id="session-laya-outage", task_id="task-laya-outage",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0", agent_id="codex",
+        behavioral_subject="task-laya-outage")
+    goals = GoalSetSnapshot(1, (GoalItemSnapshot(
+        "criterion-visual", status="ACTIVE", equivalent_retry_count=1),))
+    observation = RuntimeObservation(
+        action_index=1, goal_set=goals, equivalent_retry_count=1,
+        criterion_status={"criterion-visual": "in_progress"})
+    system_one = SystemOneService(
+        OfflineBackend(), mode="shadow",
+        enabled_question_families=("retry_relation",))
+    dp = DigitalPsychologyService(
+        event_db=tmp_path / "events.sqlite3", system_one_service=system_one)
+    try:
+        factory = create_system_one_frame_factory(system_one)
+        frame = factory(
+            identity, "Render the requested page", ("criterion-visual",),
+            BehaviorState(), observation, CSWBehaviorSnapshot(revision=0), (),
+            {"deliverable_kind": "visual_ui"})
+        assert frame is not None
+        unavailable = system_one.judge(frame, mode="shadow")
+        assert unavailable.status == "unavailable"
+        assert unavailable.judgment is None
+
+        decision = dp.decide_behavior(FastLoopInput(
+            scope=identity.scope, state=BehaviorState(),
+            csw_snapshot=CSWBehaviorSnapshot(revision=0),
+            objective_criteria=("criterion-visual",),
+            equivalent_retry_count=2, action_completed=True,
+            host_action_index=1),
+            judgment=(unavailable.judgment
+                      if unavailable.status == "ok" else None))
+    finally:
+        dp.close()
+
+    assert decision["state"]["cognitive_mode"] == "RECOVER"
+    assert decision["reason"].startswith("selected recover policy")
+
+
+def test_laya_child_process_termination_during_control_tick_uses_dp_fallback(
+        tmp_path):
+    """A killed semantic worker cannot leak its partial self-report into DP."""
+
+    class ChildProcessLayaBackend(_ShadowBackend):
+        backend_id = "fixture-laya-child-process"
+        model_id = "fixture-laya-child-model"
+        model_revision = "termination-test-v1"
+
+        def __init__(self):
+            self.process = None
+            self.output_ready = threading.Event()
+            self.partial_output = ""
+            self.raw_output = ""
+
+        def judge(self, _frame):
+            if self.process is not None:
+                raise ProviderHealthError("Laya child remains unavailable")
+            partial = json.dumps({
+                "status": "ok",
+                "self_reported_semantic_choice": "must-not-be-imported-7d9c",
+                "selected": "continue",
+            })
+            child_code = (
+                "import sys, time; "
+                "sys.stdout.write(" + repr(partial + chr(10)) + "); "
+                "sys.stdout.flush(); time.sleep(30)"
+            )
+            self.process = subprocess.Popen(
+                [sys.executable, "-u", "-c", child_code],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1,
+            )
+            assert self.process.stdout is not None
+            self.partial_output = self.process.stdout.readline()
+            self.output_ready.set()
+            remainder, _ = self.process.communicate()
+            self.raw_output = self.partial_output + (remainder or "")
+            if self.process.returncode != 0:
+                raise ProviderHealthError(
+                    "Laya child terminated before a complete provider response")
+            raise ProviderHealthError(
+                "Laya child returned without a completion receipt")
+
+        def close(self):
+            if self.process is not None and self.process.poll() is None:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            if (self.process is not None and self.process.stdout is not None
+                    and not self.process.stdout.closed):
+                self.process.stdout.close()
+
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-laya-child",
+        session_id="session-laya-child", task_id="task-laya-child",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0", agent_id="codex",
+        behavioral_subject="task-laya-child", goal_contract_hash="c" * 64,
+    )
+    goals = GoalSetSnapshot(4, (GoalItemSnapshot(
+        "criterion-visual", status="ACTIVE", actions_since_progress=2),))
+    csw = CSWBehaviorSnapshot(
+        revision=3, active_stateworks=("repair",),
+        workflow_states={"repair": "INSPECTING"},
+        snapshot_id=hashlib.sha256(b"csw-laya-child").hexdigest(),
+        workflow_revisions={"repair": 2},
+        eligible_steps={"repair": ("inspect",)},
+    )
+    state_store = BehaviorStateStore(tmp_path / "laya-child-behavior.sqlite3")
+    initial_state = BehaviorState(revision=1, active_stateworks=("repair",))
+    state_store.save(identity.scope, expected_revision=0, expected_action_index=-1,
+                     action_index=0, state=initial_state)
+    backend = ChildProcessLayaBackend()
+    system_one = SystemOneService(
+        backend, mode="shadow", enabled_question_families=("retry_relation",))
+    dp = DigitalPsychologyService(
+        event_db=tmp_path / "laya-child-events.sqlite3",
+        system_one_service=system_one)
+    control = ControlPlaneService(decision_service=dp, state_store=state_store)
+    cfw_contract = _test_cfw_behavior_contract()
+    descriptor = ControlSessionDescriptor(
+        identity=identity, objective="Render the requested page",
+        objective_criteria=("criterion-visual",), initial_goal_set=goals,
+        available_frameworks=("owl", "anchor", "fuse", "ward", "flow",
+                              "sispis", "dox"),
+        cfw_authority_identity={
+            "adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
+            "adapter_protocol_version": "1.2.0",
+            "behavior_projection_version": "2.1.0",
+            "task_behavior_contract_hash": cfw_contract["contract_hash"],
+            "scope_hash": "a" * 64, "capability_hash": "b" * 64,
+        },
+        csw_authority_identity={
+            "adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
+            "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.4.0",
+            "registry_hash": "d" * 64,
+            "scope_hash": "b" * 64, "capability_hash": "c" * 64,
+        },
+        host_capabilities={
+            "cfw_connected": True, "csw_connected": True,
+            "cfw_behavior_contract": cfw_contract,
+            "policy_context": {"deliverable_kind": "visual_ui"},
+        },
+    )
+    control.open_control_session(descriptor.to_dict())
+    observation = RuntimeObservation(
+        action_index=1, goal_set=goals,
+        criterion_status={"criterion-visual": "in_progress"},
+        equivalent_retry_count=1, approach_epoch="hypothesis-2")
+    request = ControlTickRequest(
+        control_session_id=identity.scope, tick_id="laya-child-termination-tick",
+        expected_behavior_revision=1, cfw_lifecycle_revision=2,
+        observation=observation, goal_set=goals,
+        cfw_signals=(FrameworkSignal(
+            source="owl", code="owl.approach_failed", severity="warning",
+            criterion_id="criterion-visual"),),
+        csw_snapshot=csw)
+    outcome = {}
+
+    def prepare_tick():
+        try:
+            outcome["prepared"] = control.prepare_control_tick(request.to_dict())
+        except Exception as exc:  # surfaced in the parent test thread below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=prepare_tick, daemon=True)
+    worker.start()
+    try:
+        assert backend.output_ready.wait(timeout=5), (
+            "control tick did not reach the child Laya provider; "
+            f"worker_alive={worker.is_alive()} outcome={outcome!r}")
+        assert backend.process is not None
+        backend.process.terminate()
+        backend.process.wait(timeout=5)
+        worker.join(timeout=5)
+        assert not worker.is_alive(), "DP did not leave the failed provider call"
+        assert "error" not in outcome, repr(outcome.get("error"))
+
+        prepared = outcome["prepared"]
+        assert prepared["status"] == "prepared"
+        assert backend.partial_output
+        assert "must-not-be-imported-7d9c" in backend.raw_output
+        assert prepared["basis"]["semantic_query_attempted"] is True
+        assert prepared["basis"]["semantic_judgment_returned"] is False
+        assert prepared["basis"]["semantic_judgment_used"] is False
+        assert prepared["basis"]["semantic_query_failed"] is True
+        result = prepared["basis"]["system_one"]["result"]
+        assert result["status"] == "unavailable"
+        assert result["reason"] == "provider_error"
+        assert result["judgment"] is None
+        assert prepared["candidate_behavior_state"]["cognitive_mode"] == "RECOVER"
+        assert prepared["reason_codes"][0].startswith("selected recover policy")
+        assert "must-not-be-imported-7d9c" not in json.dumps(prepared)
+
+        repeated = control.engine.prepare(
+            descriptor, state_store.load(identity.scope), request)
+        repeated_decision = repeated.decision.to_dict()
+        assert repeated_decision["state"] == prepared["candidate_behavior_state"]
+        assert repeated_decision["reason"] == prepared["reason_codes"][0]
+        assert repeated.system_one_query_failed is True
+        assert repeated.system_one_judgment_returned is False
+        assert repeated.semantic_judgment_used is False
+    finally:
+        if backend.process is not None and backend.process.poll() is None:
+            backend.process.terminate()
+            backend.process.wait(timeout=5)
+        worker.join(timeout=5)
+        control.close()
 
 
 # -- P1-9: DP must not invent task semantics ------------------------------
