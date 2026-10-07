@@ -18,7 +18,9 @@ from lib.system_one_backends import (LayaSystemOneBackend, PROVIDER_PROTOCOL_HAS
                                      ProviderHealthError, model_content_digest)
 from lib.system_one_calibration import (CalibrationBundle, CalibrationRecord,
                                         calibration_metrics,
-                                        calibration_record_from_events)
+                                        calibration_record_from_events,
+                                        calibration_task_instance_hashes,
+                                        task_instance_hash)
 from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnswer,
                                       QuestionProbability, QuestionSpec, SemanticState,
                                       SystemOneCapability, SystemOneFrame,
@@ -517,6 +519,18 @@ def test_calibration_uses_later_independent_outcomes_and_fits_temperature():
                 record.holdout_outcome_digest}) == 3
     assert record.holdout_log_loss >= 0
     assert record.qualification_passed
+
+
+def test_calibration_corpus_identity_hashes_only_independently_labeled_task_instances():
+    events = _calibration_events(count=4)
+    hashes = calibration_task_instance_hashes(
+        events, question_id="progress_relation")
+
+    assert len(hashes) == 4
+    assert hashes == tuple(sorted(hashes))
+    assert task_instance_hash("task-0") in hashes
+    assert calibration_task_instance_hashes(
+        events, question_id="retry_relation") == ()
 
 
 def test_calibration_rejects_self_labeled_or_nonlater_outcomes():

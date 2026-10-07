@@ -23,7 +23,8 @@ from .system_one_contracts import (ActivityFact, CriterionState, QuestionSpec,
                                    SystemOneIdentity, SystemOneJudgment,
                                    canonical_hash)
 from .system_one_calibration import (CalibrationBundle, CalibrationRecord, calibration_metrics,
-                                     calibration_record_from_events)
+                                     calibration_record_from_events,
+                                     calibration_task_instance_hashes)
 from .system_one_learning import (CalibrationLifecycleError,
                                   SystemOneCalibrationLifecycle)
 from .system_one_service import SystemOneService
@@ -590,8 +591,11 @@ def load_authenticated_system_one_events(path: str | Path) -> list[Any]:
 
 def _write_candidate(path: Path, record: CalibrationRecord) -> None:
     path = path.expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, temporary = tempfile.mkstemp(prefix=".laya-candidate-", dir=path.parent)
+    parent = _trusted_output_parent(path)
+    target = parent / path.name
+    if target.exists() or target.is_symlink():
+        raise ValueError("candidate output already exists; choose a new path")
+    fd, temporary = tempfile.mkstemp(prefix=".laya-candidate-", dir=parent)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -599,8 +603,10 @@ def _write_candidate(path: Path, record: CalibrationRecord) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
+        if target.exists() or target.is_symlink():
+            raise ValueError("candidate output appeared during qualification")
+        os.replace(temporary, target)
+        directory_fd = os.open(parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
@@ -613,6 +619,58 @@ def _write_candidate(path: Path, record: CalibrationRecord) -> None:
         raise
 
 
+def _write_corpus_manifest(path: Path, *, corpus_id: str, question_family: str,
+                           candidate_digest: str,
+                           task_instance_hashes: tuple[str, ...]) -> dict[str, Any]:
+    task_hashes = list(task_instance_hashes)
+    if (not isinstance(corpus_id, str) or not corpus_id or len(corpus_id) > 256
+            or question_family not in QUESTION_REGISTRY
+            or len(candidate_digest) != 64
+            or any(char not in "0123456789abcdef" for char in candidate_digest)
+            or not task_hashes or len(task_hashes) != len(set(task_hashes))
+            or any(len(value) != 64 or any(char not in "0123456789abcdef"
+                                           for char in value) for value in task_hashes)):
+        raise ValueError("calibration corpus identity is malformed")
+    task_hashes.sort()
+    manifest: dict[str, Any] = {
+        "schema_version": "laya-calibration-corpus/v1",
+        "corpus_id": corpus_id,
+        "question_family": question_family,
+        "candidate_digest": candidate_digest,
+        "task_instance_hashes": task_hashes,
+        "fixture_set_hash": canonical_hash({"task_instance_hashes": task_hashes}),
+    }
+    manifest["manifest_digest"] = canonical_hash(manifest)
+    path = path.expanduser()
+    parent = _trusted_output_parent(path)
+    target = parent / path.name
+    if target.exists() or target.is_symlink():
+        raise ValueError("corpus manifest output already exists; choose a new path")
+    fd, temporary = tempfile.mkstemp(prefix=".laya-corpus-manifest-", dir=parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if target.exists() or target.is_symlink():
+            raise ValueError("corpus manifest output appeared during qualification")
+        os.replace(temporary, target)
+        directory_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return manifest
+
+
 def laya_qualify_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Fit and evaluate one Laya question-family calibration candidate")
@@ -622,6 +680,10 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
                         choices=tuple(QUESTION_REGISTRY))
     parser.add_argument("--output", required=True,
                         help="new candidate CalibrationRecord JSON path")
+    parser.add_argument("--corpus-id",
+                        help="stable identity for the qualification corpus")
+    parser.add_argument("--corpus-manifest-out", type=Path,
+                        help="write a private task-instance manifest for overlap rejection")
     parser.add_argument("--minimum-outcomes", type=int,
                         default=PRODUCTION_MINIMUM_OUTCOMES)
     parser.add_argument("--minimum-trajectories", type=int,
@@ -636,6 +698,10 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
                         default=PRODUCTION_MAXIMUM_ECE)
     parser.add_argument("--minimum-confidence", type=float, default=0.9)
     args = parser.parse_args(argv)
+    if bool(args.corpus_id) != bool(args.corpus_manifest_out):
+        parser.error("--corpus-id and --corpus-manifest-out must be supplied together")
+    if args.corpus_id and len(args.corpus_id) > 256:
+        parser.error("--corpus-id must be at most 256 characters")
     if (args.minimum_outcomes < PRODUCTION_MINIMUM_OUTCOMES
             or args.minimum_trajectories < PRODUCTION_MINIMUM_TRAJECTORIES
             or args.minimum_cohort_trajectories < PRODUCTION_MINIMUM_COHORT_TRAJECTORIES
@@ -661,9 +727,27 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
             maximum_ece=args.maximum_ece,
         )
         output_path = Path(args.output)
-        if output_path.exists():
+        if output_path.exists() or output_path.is_symlink():
             raise ValueError("candidate output already exists; choose a new path")
+        _trusted_output_parent(output_path)
+        manifest_path = (args.corpus_manifest_out.expanduser()
+                         if args.corpus_manifest_out is not None else None)
+        if manifest_path is not None:
+            if manifest_path.absolute() == output_path.expanduser().absolute():
+                raise ValueError("candidate and corpus manifest paths must be distinct")
+            if manifest_path.exists() or manifest_path.is_symlink():
+                raise ValueError("corpus manifest output already exists; choose a new path")
+            _trusted_output_parent(manifest_path)
         _write_candidate(output_path, record)
+        corpus_manifest = None
+        if manifest_path is not None:
+            task_hashes = calibration_task_instance_hashes(
+                events, question_id=args.question_family)
+            corpus_manifest = _write_corpus_manifest(
+                manifest_path, corpus_id=args.corpus_id,
+                question_family=args.question_family,
+                candidate_digest=record.digest,
+                task_instance_hashes=task_hashes)
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         print(f"qualification failed: {exc}", file=sys.stderr)
         return 1
@@ -688,10 +772,12 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
             "holdout": record.holdout_count,
         },
         "activation": "candidate only; requires independent host review",
+        "corpus_manifest": (corpus_manifest if corpus_manifest is not None else None),
     }, sort_keys=True, indent=2))
     return 0
 
 
 __all__ = ["laya_doctor_main", "laya_doctor_report", "laya_qualify_main",
            "laya_activate_main", "laya_smoke_main", "laya_smoke_report",
+           "_write_corpus_manifest",
            "load_authenticated_system_one_events"]

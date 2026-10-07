@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import importlib.machinery
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from lib import system_one_cli
 from lib.system_one_contracts import (QuestionAnswer, QuestionProbability,
-                                      SystemOneJudgment)
+                                      SystemOneJudgment, canonical_hash)
 
 
 def test_laya_doctor_checks_pinned_checkpoint_without_loading_weights(tmp_path, monkeypatch):
@@ -206,3 +207,20 @@ def test_laya_smoke_reports_provider_failure_without_efficacy_claim(monkeypatch)
     assert report["success"] is False
     assert report["efficacy_claim"] is False
     assert "checkpoint unavailable" in report["error"]
+
+
+def test_calibration_corpus_manifest_binds_candidate_and_task_instances(tmp_path):
+    path = tmp_path / "calibration-corpus.json"
+    hashes = ("b" * 64, "a" * 64)
+    manifest = system_one_cli._write_corpus_manifest(
+        path, corpus_id="qualification-2026-10", question_family="progress_relation",
+        candidate_digest="c" * 64, task_instance_hashes=hashes)
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted == manifest
+    assert persisted["task_instance_hashes"] == sorted(hashes)
+    assert persisted["fixture_set_hash"] == canonical_hash(
+        {"task_instance_hashes": sorted(hashes)})
+    assert persisted["manifest_digest"] == canonical_hash({
+        key: value for key, value in persisted.items() if key != "manifest_digest"})
+    assert path.stat().st_mode & 0o777 == 0o600

@@ -358,6 +358,11 @@ activation still requires independent host review through
 `SystemOneCalibrationLifecycle`. Threshold flags may make qualification
 stricter, but cannot weaken those production minimums.
 
+To prepare for a later efficacy study, also pass `--corpus-id ID
+--corpus-manifest-out CORPUS.json` to `laya-qualify`. The private manifest
+contains hashes of the task instances that contributed authenticated
+prediction/label pairs and binds them to the candidate digest.
+
 After independent host review, activate a candidate with
 `digital-psychology-laya-activate --candidate CANDIDATE.json
 --candidate-digest SHA256 --question-family FAMILY --lifecycle STATE.json

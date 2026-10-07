@@ -524,6 +524,21 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
     return rows
 
 
+def task_instance_hash(task_id: str) -> str:
+    """Return the shared opaque identity for one benchmark task instance."""
+    if not isinstance(task_id, str) or not task_id or len(task_id) > 256:
+        raise ValueError("task instance ID must be bounded non-empty text")
+    return canonical_hash({"task_id": task_id})
+
+
+def calibration_task_instance_hashes(events: Iterable[Any], *, question_id: str
+                                     ) -> tuple[str, ...]:
+    """Hash task IDs for authenticated decisions with later independent labels."""
+    return tuple(sorted({task_instance_hash(row["identity"][6])
+                         for row in _paired_rows(events, question_id)
+                         if len(row["identity"]) > 6 and row["identity"][6]}))
+
+
 def calibration_metrics(events: Iterable[Any], *, label: str = "progress_relation") -> dict[str, Any]:
     rows = _paired_rows(events, label)
     correct = [max(row["probabilities"].items(), key=lambda item: item[1])[0]
@@ -669,4 +684,5 @@ def calibration_record_from_events(
 
 
 __all__ = ["CalibrationRecord", "CalibrationBundle", "calibration_metrics",
-           "calibration_record_from_events"]
+           "calibration_record_from_events", "task_instance_hash",
+           "calibration_task_instance_hashes"]
