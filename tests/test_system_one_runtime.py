@@ -229,6 +229,52 @@ def test_environment_factory_keeps_laya_optional_when_disabled():
                 os.environ[key] = value
 
 
+def test_environment_factory_can_finish_laya_warmup_before_host_readiness(monkeypatch):
+    import lib.system_one_service as system_one_service
+    from lib.control.system_one import create_system_one_frame_factory
+    from lib.telemetry.behavioral_trace import provider_attestation
+
+    class FakeLayaProvider:
+        def __init__(self):
+            self.warmup_ms = None
+
+        @classmethod
+        def from_environment(cls):
+            return provider
+
+        def capability(self):
+            return capability(
+                backend="digitalpsychology-laya-native",
+                model="laya-typed-decisions", revision="pinned-revision",
+                content_hash="c" * 64, provider_hash="d" * 64)
+
+        def warmup_and_wait(self):
+            self.warmup_ms = 37
+            return self.warmup_ms
+
+        def warmup(self):
+            raise AssertionError("blocking warmup must not be scheduled in background")
+
+        def close(self):
+            return None
+
+    provider = FakeLayaProvider()
+    monkeypatch.setattr(system_one_service, "LayaProvider", FakeLayaProvider)
+    monkeypatch.setenv("DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER", "laya-native")
+    monkeypatch.setenv("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE", "shadow")
+    monkeypatch.setenv("DIGITALPSYCHOLOGY_SYSTEM_ONE_WARMUP_MODE", "blocking")
+
+    service = system_one_service.SystemOneService.from_environment()
+    try:
+        assert service.runtime_warmed is True
+        assert service.warmup_latency_ms == 37
+        attestation = provider_attestation(create_system_one_frame_factory(service))
+        assert attestation["runtime_warmed"] is True
+        assert attestation["warmup_latency_ms"] == 37
+    finally:
+        service.close()
+
+
 def test_native_laya_adapter_renders_typed_questions_and_pins_local_content(tmp_path):
     for relative, content in {
         "model.safetensors": b"small fake model fixture",

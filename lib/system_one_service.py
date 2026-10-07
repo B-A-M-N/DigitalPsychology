@@ -35,6 +35,8 @@ class SystemOneService:
             raise ValueError(
                 "advisory mode requires at least one active enabled question family")
         self.mode = mode
+        self.warmup_latency_ms: int | None = None
+        self.runtime_warmed = False
         capability = backend.capability()
         self.enabled_question_families = enabled
         self.runtime = SystemOneRuntime(
@@ -91,7 +93,16 @@ class SystemOneService:
                       max_concurrent_requests=int(os.environ.get(
                           "DIGITALPSYCHOLOGY_SYSTEM_ONE_MAX_CONCURRENCY", "4")))
         if isinstance(backend, LayaProvider):
-            backend.warmup()
+            warmup_mode = os.environ.get(
+                "DIGITALPSYCHOLOGY_SYSTEM_ONE_WARMUP_MODE", "background").strip()
+            if warmup_mode == "blocking":
+                service.warmup_latency_ms = backend.warmup_and_wait()
+                service.runtime_warmed = True
+            elif warmup_mode == "background":
+                backend.warmup()
+            else:
+                raise ValueError(
+                    "DIGITALPSYCHOLOGY_SYSTEM_ONE_WARMUP_MODE must be background or blocking")
         return service
 
     @property

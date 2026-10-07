@@ -49,8 +49,22 @@ def provider_attestation(factory: Any) -> dict[str, Any] | None:
             or any(not isinstance(item, str) or not item for item in families)
             or len(families) != len(set(families))):
         return None
-    return {**{name: raw[name] for name in fields},
-            "enabled_question_families": sorted(families)}
+    warmup_latency_ms = raw.get("warmup_latency_ms")
+    runtime_warmed = raw.get("runtime_warmed")
+    if warmup_latency_ms is not None and (
+            type(warmup_latency_ms) is not int or not 0 <= warmup_latency_ms <= 300_000):
+        return None
+    if runtime_warmed is not None and type(runtime_warmed) is not bool:
+        return None
+    if runtime_warmed is True and warmup_latency_ms is None:
+        return None
+    result = {**{name: raw[name] for name in fields},
+              "enabled_question_families": sorted(families)}
+    if runtime_warmed is not None:
+        result["runtime_warmed"] = runtime_warmed
+    if warmup_latency_ms is not None:
+        result["warmup_latency_ms"] = warmup_latency_ms
+    return result
 
 
 def runtime_configuration(*, cfw_connected: bool, csw_connected: bool,

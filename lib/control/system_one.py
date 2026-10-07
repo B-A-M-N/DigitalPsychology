@@ -443,6 +443,8 @@ def create_system_one_frame_factory(system_one_service: Any):
         "calibration_bundle_hash": str(system_one_service.calibration_bundle_hash),
         "enabled_question_families": effective_enabled_questions,
         "provider_mode": str(system_one_service.mode),
+        "runtime_warmed": bool(getattr(system_one_service, "runtime_warmed", False)),
+        "warmup_latency_ms": getattr(system_one_service, "warmup_latency_ms", None),
         "capability_digest": canonical_hash({
             "capability": capability_payload,
             "provider_mode": system_one_service.mode,

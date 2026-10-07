@@ -289,6 +289,11 @@ is installed. Set `DIGITALPSYCHOLOGY_CONTROL_MCP_PYTHON` to that interpreter
 when the host's own Python environment differs. Host MCP calls have a bounded
 60-second deadline to accommodate CPU inference; each Laya inference remains
 bounded to 30 seconds.
+By default, provider initialization runs in the background. A host that must
+exclude model loading from trial timing can set
+`DIGITALPSYCHOLOGY_SYSTEM_ONE_WARMUP_MODE=blocking`; the private DP process
+then waits for model initialization and exposes the completed warmup duration
+in its host-only provider attestation. Other values are rejected.
 
 The ready-to-run checkpoint is `convaiinnovations/laya-typed-decisions` at
 revision `1a793eb568e6718f15941d08f85432581df534e3`. Download that immutable
