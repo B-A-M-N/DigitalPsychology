@@ -318,6 +318,14 @@ evidence. Agent-visible tools do not expose it. The timeout defaults to 30
 seconds for local CPU inference; a timeout causes one provider failure and
 deterministic fallback.
 
+Per-trial reports rebuild semantic telemetry from committed control transitions.
+They distinguish planner opportunities, provider attempts, valid results, and
+advisory use, and include query latency, receipt-linked interventions, and
+independently observed outcomes grouped by question family. Outcomes resolved
+later remain attached to the receipt that caused the intervention. Histories
+without the new fields are reported as unobserved; these metrics do not read
+the process-wide production counters.
+
 A local pinned-checkpoint smoke on 2026-10-07 returned one typed
 `progress_relation` answer through `SystemOneService` in shadow mode. The Laya
 library warned about invalid checkpoint temperatures and uncalibrated

@@ -51,6 +51,8 @@ class DecisionPreparation:
     system_one_frame: Mapping[str, Any] | None
     system_one_result: Mapping[str, Any] | None
     system_one_query_attempted: bool
+    system_one_query_opportunity: bool
+    system_one_opportunity_question_id: str | None
     system_one_judgment_returned: bool
     system_one_query_failed: bool
     semantic_judgment_used: bool
@@ -125,6 +127,8 @@ class ControlDecisionEngine:
         system_one_frame = None
         system_one_result = None
         system_one_query_attempted = False
+        system_one_query_opportunity = False
+        system_one_opportunity_question_id = None
         system_one_judgment_returned = False
         system_one_query_failed = False
         policy_context = {
@@ -139,9 +143,18 @@ class ControlDecisionEngine:
                 record.state, request.observation, request.csw_snapshot,
                 request.cfw_signals, policy_context,
                 descriptor.available_frameworks)
+            query_plan = getattr(self.system_one_frame_factory,
+                                 "last_query_plan", None)
+            planned_question = getattr(query_plan, "question_id", None)
+            if isinstance(planned_question, str) and planned_question:
+                system_one_query_opportunity = True
+                system_one_opportunity_question_id = planned_question
             if frame is not None and not isinstance(frame, SystemOneFrame):
                 raise TypeError("System-1 frame factory must return a validated frame")
             if frame is not None:
+                if not system_one_query_opportunity and frame.questions:
+                    system_one_query_opportunity = True
+                    system_one_opportunity_question_id = frame.questions[0].question_id
                 if frame.identity.to_dict() != self._system_one_identity(identity).to_dict():
                     raise ValueError("System-1 frame identity escapes the control session")
                 system_one_query_attempted = True
@@ -247,10 +260,17 @@ class ControlDecisionEngine:
         self._validate_directives(descriptor, request.csw_snapshot, decision,
                                   prior_state=record.state)
         return DecisionPreparation(
-            decision, system_one_frame, system_one_result,
-            system_one_query_attempted, system_one_judgment_returned,
-            system_one_query_failed, judgment is not None,
-            attention.last_seen, goal_set,
+            decision=decision,
+            system_one_frame=system_one_frame,
+            system_one_result=system_one_result,
+            system_one_query_attempted=system_one_query_attempted,
+            system_one_query_opportunity=system_one_query_opportunity,
+            system_one_opportunity_question_id=system_one_opportunity_question_id,
+            system_one_judgment_returned=system_one_judgment_returned,
+            system_one_query_failed=system_one_query_failed,
+            semantic_judgment_used=judgment is not None,
+            attention_last_seen=attention.last_seen,
+            goal_set=goal_set,
             fairness_bound_actions=attention.fairness_bound_actions,
             starvation_prevented=attention.starvation_prevented,
             semantic_influence_receipt=semantic_influence_receipt,

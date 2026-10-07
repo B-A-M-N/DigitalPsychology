@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Mapping
 
 from .behavioral_trace import JUSTIFICATION_CLASSES
@@ -40,6 +41,11 @@ class ControlTransitionTrace:
     cfw_preflight_decision: str | None = None
     cfw_final_decision: str | None = None
     cfw_gate_receipts: Mapping[str, Any] | None = None
+    semantic_query_opportunity: bool = False
+    semantic_query_opportunity_question_id: str | None = None
+    semantic_latency_ms: float | None = None
+    semantic_influenced_intervention_ids: tuple[str, ...] = ()
+    semantic_intervention_outcomes: tuple[tuple[str, str, str, int], ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("control_session_id", "boundary_kind", "prior_mode",
@@ -60,7 +66,8 @@ class ControlTransitionTrace:
                      "semantic_judgment_used", "semantic_query_failed",
                      "semantic_influenced_decision", "semantic_candidate_change",
                      "semantic_mode_change", "semantic_statework_change",
-                     "goal_drift_detected", "goal_drift_intervention_applied",
+                     "semantic_query_opportunity", "goal_drift_detected",
+                     "goal_drift_intervention_applied",
                      "ward_hard_safety"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"control transition {name} must be a boolean")
@@ -70,6 +77,34 @@ class ControlTransitionTrace:
             raise ValueError("a semantic judgment cannot be used without being returned")
         if self.semantic_query_failed and not self.semantic_query_attempted:
             raise ValueError("a semantic query cannot fail without being attempted")
+        opportunity_question = self.semantic_query_opportunity_question_id
+        if opportunity_question is not None and (
+                not isinstance(opportunity_question, str) or not opportunity_question
+                or len(opportunity_question) > 64
+                or not self.semantic_query_opportunity):
+            raise ValueError("semantic query opportunity question is malformed")
+        if self.semantic_query_attempted and not self.semantic_query_opportunity:
+            raise ValueError("a semantic query attempt requires a recorded opportunity")
+        latency = self.semantic_latency_ms
+        if latency is not None and (
+                isinstance(latency, bool) or not isinstance(latency, (int, float))
+                or not math.isfinite(float(latency)) or latency < 0):
+            raise ValueError("semantic query latency must be finite and non-negative")
+        intervention_ids = tuple(self.semantic_influenced_intervention_ids)
+        if (len(intervention_ids) > 16 or len(intervention_ids) != len(set(intervention_ids))
+                or any(not isinstance(item, str) or not item or len(item) > 128
+                       for item in intervention_ids)):
+            raise ValueError("semantic influenced intervention IDs are malformed")
+        intervention_outcomes = tuple(tuple(item) for item in
+                                      self.semantic_intervention_outcomes)
+        if len(intervention_outcomes) > 16:
+            raise ValueError("semantic intervention outcome links exceed their bound")
+        for item in intervention_outcomes:
+            if (len(item) != 4 or any(not isinstance(value, str) or not value
+                                      for value in item[:3])
+                    or any(len(value) > 128 for value in item[:3])
+                    or type(item[3]) is not int or item[3] < 0):
+                raise ValueError("semantic intervention outcome link is malformed")
         questions = tuple(self.semantic_question_ids)
         if (len(questions) > 8 or len(questions) != len(set(questions))
                 or any(not isinstance(item, str) or not item or len(item) > 64
@@ -108,6 +143,8 @@ class ControlTransitionTrace:
             object.__setattr__(self, "cfw_gate_receipts", dict(self.cfw_gate_receipts))
         object.__setattr__(self, "transition_causes", causes)
         object.__setattr__(self, "semantic_question_ids", questions)
+        object.__setattr__(self, "semantic_influenced_intervention_ids", intervention_ids)
+        object.__setattr__(self, "semantic_intervention_outcomes", intervention_outcomes)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -134,6 +171,18 @@ class ControlTransitionTrace:
             "semantic_influenced_interventions": self.semantic_influenced_interventions,
             "semantic_effective_interventions": self.semantic_effective_interventions,
             "semantic_ineffective_interventions": self.semantic_ineffective_interventions,
+            "semantic_query_opportunity": self.semantic_query_opportunity,
+            "semantic_query_opportunity_question_id": (
+                self.semantic_query_opportunity_question_id),
+            "semantic_latency_ms": self.semantic_latency_ms,
+            "semantic_influenced_intervention_ids": list(
+                self.semantic_influenced_intervention_ids),
+            "semantic_intervention_outcomes": [
+                {"influence_receipt_id": receipt_id,
+                 "intervention_id": intervention_id,
+                 "outcome": outcome, "observed_revision": revision}
+                for receipt_id, intervention_id, outcome, revision
+                in self.semantic_intervention_outcomes],
             "goal_drift_detected": self.goal_drift_detected,
             "goal_drift_intervention_applied": self.goal_drift_intervention_applied,
             "cfw_rejection_stage": self.cfw_rejection_stage,

@@ -166,6 +166,9 @@ def test_unchanged_selection_keeps_audit_receipt_without_linking_intervention():
     assert receipt.changed_statework_preference is False
 
     preparation, prior_state = _prepare_retry_decision(influenced=False)
+    assert preparation.system_one_query_opportunity is True
+    assert preparation.system_one_opportunity_question_id == "retry_relation"
+    assert preparation.system_one_query_attempted is True
     assert preparation.semantic_influence_receipt is not None
     assert preparation.semantic_influence_receipt.influenced is False
     assert preparation.decision.state.active_interventions

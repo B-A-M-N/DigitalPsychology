@@ -19,9 +19,26 @@ def build_control_transition_trace(scope: str, prior_state: BehaviorState,
     raw_receipt = basis.get("semantic_influence_receipt")
     receipt = dict(raw_receipt) if isinstance(raw_receipt, Mapping) else {}
     receipt_id = receipt.get("receipt_id")
-    question_ids = tuple(
+    question_ids = list(
         str(item) for item in receipt.get("question_ids", ())
         if isinstance(item, str))[:8]
+    system_one = basis.get("system_one")
+    system_one = system_one if isinstance(system_one, Mapping) else {}
+    frame = system_one.get("frame")
+    frame = frame if isinstance(frame, Mapping) else {}
+    for question in frame.get("questions", ()):
+        if not isinstance(question, Mapping):
+            continue
+        question_id = question.get("question_id")
+        if isinstance(question_id, str) and question_id and question_id not in question_ids:
+            question_ids.append(question_id)
+            if len(question_ids) >= 8:
+                break
+    opportunity_question_id = basis.get("semantic_query_opportunity_question_id")
+    if (isinstance(opportunity_question_id, str) and opportunity_question_id
+            and opportunity_question_id not in question_ids and len(question_ids) < 8):
+        question_ids.append(opportunity_question_id)
+    question_ids = tuple(question_ids)
     semantic_influenced = any(receipt.get(name) is True for name in (
         "changed_selection", "changed_mode", "changed_statework_preference"))
     semantic_influenced = semantic_influenced or bool(receipt.get("changed_frameworks"))
@@ -35,6 +52,18 @@ def build_control_transition_trace(scope: str, prior_state: BehaviorState,
     effective_interventions = sum(item.outcome == "effective" for item in linked_outcomes)
     ineffective_interventions = sum(
         item.outcome in {"ineffective", "regressed"} for item in linked_outcomes)
+    influenced_intervention_ids = tuple(sorted(
+        item.intervention_id for item in state.active_interventions
+        if receipt_id and item.intervention_id not in old_intervention_ids
+        and item.semantic_influence_receipt_id == receipt_id))
+    semantic_outcome_links = tuple(sorted(
+        (str(item.semantic_influence_receipt_id), str(item.intervention_id),
+         str(item.outcome), int(item.observed_revision))
+        for item in linked_outcomes
+        if item.semantic_influence_receipt_id))
+    raw_result = system_one.get("result")
+    raw_result = raw_result if isinstance(raw_result, Mapping) else {}
+    semantic_latency_ms = raw_result.get("latency_ms")
     from ..telemetry.behavioral_trace import classify_justification
     evidence_classes = []
     if facts.get("evidence_refs"):
@@ -103,6 +132,18 @@ def build_control_transition_trace(scope: str, prior_state: BehaviorState,
         semantic_influenced_interventions=influenced_interventions,
         semantic_effective_interventions=effective_interventions,
         semantic_ineffective_interventions=ineffective_interventions,
+        semantic_query_opportunity=(
+            bool(basis.get("semantic_query_opportunity")) or
+            bool(basis.get("semantic_query_attempted")) or
+            bool(receipt and question_ids)),
+        semantic_query_opportunity_question_id=(
+            str(opportunity_question_id) if isinstance(opportunity_question_id, str)
+            and opportunity_question_id else (question_ids[0] if question_ids else None)),
+        semantic_latency_ms=(float(semantic_latency_ms)
+                             if isinstance(semantic_latency_ms, (int, float))
+                             and not isinstance(semantic_latency_ms, bool) else None),
+        semantic_influenced_intervention_ids=influenced_intervention_ids,
+        semantic_intervention_outcomes=semantic_outcome_links,
         goal_drift_detected=drift_detected,
         goal_drift_intervention_applied=drift_applied,
         cfw_rejection_stage=(str(stage) if stage else None),

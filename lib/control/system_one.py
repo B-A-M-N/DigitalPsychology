@@ -197,6 +197,10 @@ def create_system_one_frame_factory(system_one_service: Any):
         query = query_planner.plan(
             observation, cfw_signals=cfw_signals,
             policy_ambiguity=ambiguity)
+        # The host control engine reads this bounded planner result even when
+        # no provider frame is emitted. This separates a real query opportunity
+        # from a provider call and from a usable answer in per-session telemetry.
+        build.last_query_plan = query
         if not query.should_query or query.question_id not in available_questions:
             return None
         goals = observation.goal_set
@@ -433,6 +437,7 @@ def create_system_one_frame_factory(system_one_service: Any):
         }),
     }
     build.system_one_attestation = attestation
+    build.last_query_plan = None
     return build
 
 

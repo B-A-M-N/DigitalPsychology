@@ -63,8 +63,12 @@ def _record_laya_preparation_metrics(self: Any, preparation: Any,
         for item in frame.get("questions", ())
         if isinstance(item, Mapping) and item.get("question_id") in QUESTION_FAMILIES
     }))
+    opportunity_family = preparation.system_one_opportunity_question_id
+    if (isinstance(opportunity_family, str)
+            and opportunity_family in QUESTION_FAMILIES):
+        _record_laya_event(self, "opportunity",
+                           question_families=(opportunity_family,))
     if preparation.system_one_query_attempted:
-        _record_laya_event(self, "opportunity", question_families=families)
         _record_laya_event(self, "attempt", question_families=families)
         result = dict(preparation.system_one_result or {})
         status = result.get("status")
@@ -431,6 +435,9 @@ class ControlTransactionMethods:
             "goal_set": request.goal_set.to_dict(),
             "attention_fairness_bound_actions": preparation.fairness_bound_actions,
             "attention_starvation_prevented": list(preparation.starvation_prevented),
+            "semantic_query_opportunity": preparation.system_one_query_opportunity,
+            "semantic_query_opportunity_question_id": (
+                preparation.system_one_opportunity_question_id),
             "semantic_query_attempted": preparation.system_one_query_attempted,
             "semantic_judgment_returned": preparation.system_one_judgment_returned,
             "semantic_judgment_used": preparation.semantic_judgment_used,
