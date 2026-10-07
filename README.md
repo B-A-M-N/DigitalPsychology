@@ -338,6 +338,16 @@ checkpoint but does not require calibration. Advisory readiness is reported
 per family: active qualified families may influence DP, while missing or
 shifted families remain shadow-only.
 
+The doctor exits according to the configured mode. Use `--require shadow` or
+`--require advisory` to select an explicit gate. Advisory mode succeeds with
+partial family coverage by default when at least one enabled family is active;
+`--require-all-enabled-families` makes every configured family require an
+active matching calibration. `digital-psychology-laya-smoke --json` loads the
+pinned checkpoint and runs one bounded synthetic frame through a shadow
+inference. The report includes the checkpoint hash, question family, and
+latency. It reports `efficacy_claim: false`; the smoke checks runtime loading
+and typed output only.
+
 `digital-psychology-laya-qualify --event-db PATH --question-family FAMILY
 --output CANDIDATE.json` reads only authenticated System-1 decision and
 outcome events. It keeps the production minimums of 100 outcomes, 30

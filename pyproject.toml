@@ -26,6 +26,7 @@ digital-psychology-mcp = "digital_psychology.mcp_server:main"
 digital-psychology-admin-mcp = "digital_psychology.transport.admin_mcp:main"
 digital-psychology-control-mcp = "digital_psychology.transport.control_mcp:main"
 digital-psychology-laya-doctor = "digital_psychology.system_one_cli:laya_doctor_main"
+digital-psychology-laya-smoke = "digital_psychology.system_one_cli:laya_smoke_main"
 digital-psychology-laya-qualify = "digital_psychology.system_one_cli:laya_qualify_main"
 
 [tool.setuptools]

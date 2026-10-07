@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from lib import system_one_cli
+from lib.system_one_contracts import (QuestionAnswer, QuestionProbability,
+                                      SystemOneJudgment)
 
 
 def test_laya_doctor_checks_pinned_checkpoint_without_loading_weights(tmp_path, monkeypatch):
@@ -86,3 +88,121 @@ def test_laya_qualification_cli_cannot_weaken_production_minimums(tmp_path):
         ])
     assert error.value.code == 2
     assert not (tmp_path / "candidate.json").exists()
+
+
+def test_laya_doctor_advisory_exit_gate_can_require_all_enabled_families(monkeypatch,
+                                                                         capsys):
+    report = {
+        "mode": "advisory", "shadow_readiness": "PASS",
+        "advisory_readiness": "PARTIAL", "qualified_question_families": {},
+        "advisory_shadow_only_families": ["retry_relation"],
+    }
+    monkeypatch.setattr(system_one_cli, "laya_doctor_report", lambda: dict(report))
+
+    assert system_one_cli.laya_doctor_main(["--json"]) == 0
+    default_output = capsys.readouterr().out
+    assert '"required_mode": "advisory"' in default_output
+    assert system_one_cli.laya_doctor_main(["--require-all-enabled-families", "--json"]) == 1
+    strict_output = capsys.readouterr().out
+    assert '"required_readiness_pass": false' in strict_output
+
+
+def test_laya_doctor_can_explicitly_require_shadow_readiness(monkeypatch, capsys):
+    monkeypatch.setattr(system_one_cli, "laya_doctor_report", lambda: {
+        "mode": "advisory", "shadow_readiness": "PASS",
+        "advisory_readiness": "FAIL", "qualified_question_families": {},
+        "advisory_shadow_only_families": [],
+    })
+
+    assert system_one_cli.laya_doctor_main(["--require", "advisory", "--json"]) == 1
+    capsys.readouterr()
+    assert system_one_cli.laya_doctor_main(["--require", "shadow", "--json"]) == 0
+    output = capsys.readouterr().out
+    assert '"required_mode": "shadow"' in output
+
+
+def test_laya_smoke_runs_one_typed_shadow_judgment_and_closes_provider(monkeypatch):
+    content_hash = "a" * 64
+    provider_protocol_hash = system_one_cli.PROVIDER_PROTOCOL_HASH
+
+    class FakeProvider:
+        backend_id = "digitalpsychology-laya-native"
+        model_id = "laya-typed-decisions"
+        model_revision = "pinned-revision"
+        model_content_hash = content_hash
+        device = "cpu"
+        warmed = False
+        closed = False
+
+        def warmup(self):
+            self.warmed = True
+
+        def close(self):
+            self.closed = True
+
+    provider = FakeProvider()
+    monkeypatch.setattr(system_one_cli.LayaProvider, "from_environment",
+                        classmethod(lambda _cls: provider))
+
+    class FakeService:
+        calibration_bundle_hash = ""
+
+        def capability(self):
+            return {
+                "backend_id": provider.backend_id,
+                "model_id": provider.model_id,
+                "model_revision": provider.model_revision,
+                "model_content_hash": provider.model_content_hash,
+                "provider_protocol_hash": provider_protocol_hash,
+            }
+
+        def judge(self, frame, *, mode):
+            assert mode == "shadow"
+            spec = frame.questions[0]
+            labels = tuple(label for label, _description in spec.criteria)
+            answer = QuestionAnswer(
+                question_id=spec.question_id, selected=labels[0],
+                raw_probabilities=tuple(QuestionProbability(label, 1 / len(labels))
+                                         for label in labels),
+            )
+            judgment = SystemOneJudgment(
+                identity=frame.identity, request_id=frame.request_id,
+                sequence=frame.sequence, state_digest=frame.state_digest,
+                question_bundle_digest=frame.question_bundle_digest,
+                request_digest=frame.request_digest, policy_hash=frame.policy_hash,
+                backend_id=frame.backend_id, model_id=frame.model_id,
+                model_revision=frame.model_revision,
+                model_content_hash=frame.model_content_hash,
+                provider_protocol_hash=frame.provider_protocol_hash,
+                calibration_bundle_hash=frame.calibration_bundle_hash,
+                answers=(answer,),
+            )
+            return SimpleNamespace(status="shadow", judgment=judgment)
+
+        def close(self):
+            provider.close()
+
+    monkeypatch.setattr(system_one_cli, "SystemOneService",
+                        lambda *_args, **_kwargs: FakeService())
+    report = system_one_cli.laya_smoke_report("progress_relation")
+
+    assert report["success"] is True
+    assert report["question_family"] == "progress_relation"
+    assert report["checkpoint_hash"] == content_hash
+    assert report["efficacy_claim"] is False
+    assert provider.warmed is True
+    assert provider.closed is True
+
+
+def test_laya_smoke_reports_provider_failure_without_efficacy_claim(monkeypatch):
+    class BrokenProvider:
+        @classmethod
+        def from_environment(cls):
+            raise RuntimeError("checkpoint unavailable")
+
+    monkeypatch.setattr(system_one_cli, "LayaProvider", BrokenProvider)
+    report = system_one_cli.laya_smoke_report()
+
+    assert report["success"] is False
+    assert report["efficacy_claim"] is False
+    assert "checkpoint unavailable" in report["error"]

@@ -9,13 +9,20 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import time
 from typing import Any, Mapping
 
 from .feedback_loop import EventFactory, trusted_state_root
 from .protocol_artifact import QUESTION_REGISTRY
-from .system_one_backends import (PROVIDER_PROTOCOL_HASH, model_content_digest)
+from .system_one_backends import (LayaProvider, PROVIDER_PROTOCOL_HASH,
+                                 model_content_digest)
+from .system_one_contracts import (ActivityFact, CriterionState, QuestionSpec,
+                                   SemanticState, SystemOneFrame,
+                                   SystemOneIdentity, SystemOneJudgment,
+                                   canonical_hash)
 from .system_one_calibration import (CalibrationRecord, calibration_metrics,
                                      calibration_record_from_events)
+from .system_one_service import SystemOneService
 
 
 PRODUCTION_MINIMUM_OUTCOMES = 100
@@ -146,6 +153,11 @@ def _format_doctor(report: Mapping[str, Any]) -> str:
     def state(name: str) -> str:
         return "PASS" if report[name] else "FAIL"
 
+    required_mode = report.get(
+        "required_mode", "advisory" if report["mode"] == "advisory" else "shadow")
+    required_readiness = report.get(
+        "required_readiness", report[f"{required_mode}_readiness"])
+
     lines = [
         f"Laya runtime: {state('laya_import_present')}",
         f"checkpoint directory: {state('checkpoint_directory_exists')}",
@@ -165,7 +177,8 @@ def _format_doctor(report: Mapping[str, Any]) -> str:
         lines.append(f"{family} calibration: {status}")
     lines.extend((f"mode: {report['mode']}",
                   f"shadow readiness: {report['shadow_readiness']}",
-                  f"advisory readiness: {report['advisory_readiness']}"))
+                  f"advisory readiness: {report['advisory_readiness']}",
+                  f"required readiness ({required_mode}): {required_readiness}"))
     if report["advisory_shadow_only_families"]:
         lines.append("advisory shadow-only families: " + ", ".join(
             report["advisory_shadow_only_families"]))
@@ -178,11 +191,178 @@ def _format_doctor(report: Mapping[str, Any]) -> str:
 def laya_doctor_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Check optional Laya runtime readiness")
     parser.add_argument("--json", action="store_true", help="print a machine-readable report")
+    parser.add_argument("--require", choices=("shadow", "advisory"),
+                        help="readiness mode required for a successful exit")
+    parser.add_argument("--require-all-enabled-families", action="store_true",
+                        help="require every configured question family to have active calibration")
     args = parser.parse_args(argv)
     report = laya_doctor_report()
+    if args.require == "shadow" and args.require_all_enabled_families:
+        parser.error("--require-all-enabled-families requires advisory readiness")
+    required_mode = args.require or (
+        "advisory" if args.require_all_enabled_families or report["mode"] == "advisory"
+        else "shadow")
+    required_readiness = report[f"{required_mode}_readiness"]
+    if required_mode == "shadow":
+        required_pass = required_readiness == "PASS"
+    else:
+        required_pass = required_readiness == "PASS" or (
+            required_readiness == "PARTIAL" and not args.require_all_enabled_families)
+    report["required_mode"] = required_mode
+    report["required_readiness"] = required_readiness
+    report["require_all_enabled_families"] = args.require_all_enabled_families
+    report["required_readiness_pass"] = required_pass
     print(json.dumps(report, sort_keys=True, indent=2) if args.json
           else _format_doctor(report))
-    return 0 if report["shadow_readiness"] == "PASS" else 1
+    return 0 if required_pass else 1
+
+
+def _laya_smoke_frame(service: SystemOneService, question_family: str) -> SystemOneFrame:
+    """Build one stable, bounded synthetic frame for checking the native path."""
+    definition = QUESTION_REGISTRY[question_family]
+    capability = service.capability()
+    identity = SystemOneIdentity(
+        namespace_id="digital-psychology-smoke",
+        application_id="digital-psychology",
+        application_instance_id="laya-smoke",
+        agent_id="laya-smoke-agent",
+        agent_instance_id="laya-smoke-agent-1",
+        session_id="laya-smoke-session",
+        task_id="laya-smoke-task",
+        attempt_id="laya-smoke-attempt",
+    )
+    activity = ActivityFact(
+        sequence=1, activity_type="action", action_class="verification",
+        host_declared_relation="ambiguous", target_kind="workspace",
+        proposed_purpose="verify the requested behavior",
+        affected_criterion_ids=("smoke-criterion",), relation_certainty="unknown",
+    )
+    state = SemanticState(
+        task={
+            "objective": "Verify that the requested behavior is implemented.",
+            "work_mode": "delivery", "deliverable_kind": "code_behavior",
+            "task_complexity": "standard", "phase": "verification",
+            "active_segment": "smoke-check", "active_statework": None,
+            "active_flow": None, "non_goals": ["unrelated changes"],
+            "domain_tags": ["software"],
+        },
+        situation={
+            "current_state": "VERIFY", "blockers": [],
+            "actions_since_goal_progress": 1,
+            "actions_since_artifact_change": 1,
+            "verification_actions_since_artifact_change": 0,
+            "recovery_epochs": 0, "repeated_branch_count": 0,
+        },
+        criteria=(CriterionState(
+            "smoke-criterion", "Requested behavior works", "functional"),),
+        activity=(activity,), workflows=(), convergence=(), candidate=activity,
+        legal_routes=("implement", "diagnose", "verify"),
+    )
+    questions = (QuestionSpec(
+        question_id=question_family, family=definition["family"],
+        question_type=definition["type"], instructions=definition["instructions"],
+        criteria=tuple(definition["criteria"].items()),
+    ),)
+    state_digest = canonical_hash(state.to_dict())
+    question_digest = canonical_hash([item.to_dict() for item in questions])
+    policy_hash = canonical_hash({"smoke": "laya-native", "version": 1})
+    sequence = 1
+    request_digest = canonical_hash({
+        "identity": identity.to_dict(), "sequence": sequence,
+        "state_digest": state_digest,
+        "question_bundle_digest": question_digest,
+        "policy_hash": policy_hash,
+    })
+    return SystemOneFrame(
+        identity=identity, request_id="laya-smoke-request", sequence=sequence,
+        state_digest=state_digest, question_bundle_digest=question_digest,
+        request_digest=request_digest, policy_hash=policy_hash,
+        backend_id=str(capability["backend_id"]), model_id=str(capability["model_id"]),
+        model_revision=str(capability["model_revision"]),
+        model_content_hash=str(capability["model_content_hash"]),
+        provider_protocol_hash=str(capability["provider_protocol_hash"]),
+        calibration_bundle_hash=service.calibration_bundle_hash,
+        state=state, questions=questions,
+    )
+
+
+def laya_smoke_report(question_family: str = "progress_relation") -> dict[str, Any]:
+    """Load and exercise one pinned native Laya inference in shadow mode."""
+    started = time.monotonic()
+    provider: LayaProvider | None = None
+    service: SystemOneService | None = None
+    base: dict[str, Any] = {
+        "schema_version": "laya-runtime-smoke/v1",
+        "question_family": question_family,
+        "mode": "shadow",
+        "efficacy_claim": False,
+    }
+    try:
+        if question_family not in QUESTION_REGISTRY:
+            raise ValueError("question family is not registered")
+        provider = LayaProvider.from_environment()
+        base.update({
+            "checkpoint_hash": provider.model_content_hash,
+            "backend_id": provider.backend_id,
+            "model_id": provider.model_id,
+            "model_revision": provider.model_revision,
+            "device": provider.device,
+        })
+        service = SystemOneService(
+            provider, mode="shadow", enabled_question_families=(question_family,))
+        provider.warmup()
+        frame = _laya_smoke_frame(service, question_family)
+        inference_started = time.monotonic()
+        result = service.judge(frame, mode="shadow")
+        base["inference_latency_ms"] = round(
+            (time.monotonic() - inference_started) * 1000)
+        judgment = result.judgment
+        if result.status != "shadow" or not isinstance(judgment, SystemOneJudgment):
+            raise RuntimeError(
+                f"shadow inference did not return a typed judgment (status={result.status})")
+        answer = judgment.answer(question_family)
+        if answer is None or answer.selected not in {
+                label for label, _description in frame.questions[0].criteria}:
+            raise RuntimeError("shadow inference returned an invalid typed answer")
+        base.update({
+            "success": True,
+            "status": result.status,
+            "selected": answer.selected,
+            "latency_ms": round((time.monotonic() - started) * 1000),
+            "calibrated": bool(answer.calibrated_probabilities),
+        })
+    except Exception as exc:
+        base.update({
+            "success": False,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "latency_ms": round((time.monotonic() - started) * 1000),
+        })
+    finally:
+        try:
+            if service is not None:
+                service.close()
+            elif provider is not None:
+                provider.close()
+        except Exception as exc:
+            base["success"] = False
+            base["status"] = "failed"
+            base.setdefault("error", f"provider close failed: {type(exc).__name__}: {exc}")
+    return base
+
+
+def laya_smoke_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Load a pinned Laya checkpoint and run one bounded shadow inference")
+    parser.add_argument("--json", action="store_true", help="print a machine-readable report")
+    parser.add_argument("--question-family", default="progress_relation",
+                        choices=tuple(QUESTION_REGISTRY),
+                        help="registered question family for the smoke frame")
+    args = parser.parse_args(argv)
+    report = laya_smoke_report(args.question_family)
+    print(json.dumps(report, sort_keys=True, indent=2) if args.json else
+          "\n".join(f"{key}: {value}" for key, value in report.items()))
+    return 0 if report["success"] else 1
 
 
 def load_authenticated_system_one_events(path: str | Path) -> list[Any]:
@@ -318,4 +498,5 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
 
 
 __all__ = ["laya_doctor_main", "laya_doctor_report", "laya_qualify_main",
+           "laya_smoke_main", "laya_smoke_report",
            "load_authenticated_system_one_events"]
