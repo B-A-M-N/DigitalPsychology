@@ -364,6 +364,12 @@ class LayaProvider:
         threading.Thread(target=initialize, name="digitalpsychology-laya-load",
                          daemon=True).start()
 
+    def warmup_and_wait(self) -> int:
+        """Load model weights before measurement and return load time in ms."""
+        started = time.monotonic()
+        self._ensure_agent()
+        return round((time.monotonic() - started) * 1000)
+
     def reset_identity(self, identity: SystemOneIdentity) -> None:
         # Native Laya is stateless; no session state crosses calls or identities.
         return None

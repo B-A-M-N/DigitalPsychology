@@ -300,6 +300,8 @@ def laya_smoke_report(question_family: str = "progress_relation") -> dict[str, A
         "schema_version": "laya-runtime-smoke/v1",
         "question_family": question_family,
         "mode": "shadow",
+        "runtime_loaded": False,
+        "typed_judgment": False,
         "efficacy_claim": False,
     }
     try:
@@ -315,7 +317,8 @@ def laya_smoke_report(question_family: str = "progress_relation") -> dict[str, A
         })
         service = SystemOneService(
             provider, mode="shadow", enabled_question_families=(question_family,))
-        provider.warmup()
+        base["warmup_latency_ms"] = provider.warmup_and_wait()
+        base["runtime_loaded"] = True
         frame = _laya_smoke_frame(service, question_family)
         inference_started = time.monotonic()
         result = service.judge(frame, mode="shadow")
@@ -331,6 +334,7 @@ def laya_smoke_report(question_family: str = "progress_relation") -> dict[str, A
             raise RuntimeError("shadow inference returned an invalid typed answer")
         base.update({
             "success": True,
+            "typed_judgment": True,
             "status": result.status,
             "selected": answer.selected,
             "latency_ms": round((time.monotonic() - started) * 1000),

@@ -356,9 +356,9 @@ partial family coverage by default when at least one enabled family is active;
 `--require-all-enabled-families` makes every configured family require an
 active matching calibration. `digital-psychology-laya-smoke --json` loads the
 pinned checkpoint and runs one bounded synthetic frame through a shadow
-inference. The report includes the checkpoint hash, question family, and
-latency. It reports `efficacy_claim: false`; the smoke checks runtime loading
-and typed output only.
+inference. The report separates warmup from inference latency and records
+explicit runtime-loaded and typed-judgment flags. It reports
+`efficacy_claim: false`; the smoke checks runtime loading and typed output only.
 
 `digital-psychology-laya-qualify --event-db PATH --question-family FAMILY
 --output CANDIDATE.json` reads only authenticated System-1 decision and
