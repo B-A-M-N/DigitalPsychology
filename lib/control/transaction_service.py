@@ -172,6 +172,34 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
+def _system_one_decision_refs(event_values: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Expose bounded decision identity and candidate context to the host receipt."""
+    refs = []
+    for item in event_values:
+        if item.get("event_type") != "system_one_decision":
+            continue
+        payload = item.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        legal_routes = payload.get("system_one_legal_routes") or ()
+        domain_tags = payload.get("system_one_domain_tags") or ()
+        refs.append({
+            "event_id": str(item["event_id"]),
+            "decision_id": str(payload.get("system_one_decision_id") or ""),
+            "question_ids": list(payload.get("system_one_question_ids") or ()),
+            "tick_id": str(payload.get("system_one_tick_id") or ""),
+            "boundary_kind": str(payload.get("system_one_boundary_kind") or ""),
+            "boundary_sequence": int(payload.get("system_one_boundary_sequence", 0)),
+            "action_index": int(payload.get("system_one_action_index", 0)),
+            "legal_candidate_count": len(legal_routes),
+            "candidate_set_digest": _digest(sorted(set(legal_routes))),
+            "domain_tag_digest": _digest(sorted(set(domain_tags))),
+            "influence_receipt_id": payload.get(
+                "system_one_semantic_influence_receipt_id"),
+            "influenced": bool(payload.get("system_one_semantic_influenced", False)),
+        })
+    return refs
+
+
 def _decision_input_digest(descriptor: ControlSessionDescriptor,
                            request: ControlTickRequest, state: BehaviorState,
                            provider_identity: Mapping[str, Any], *,
@@ -582,28 +610,7 @@ class ControlTransactionMethods:
             "system_one_decision_event_ids": [
                 str(item["event_id"]) for item in event_values
                 if item.get("event_type") == "system_one_decision"],
-            "system_one_decision_refs": [
-                {
-                    "event_id": str(item["event_id"]),
-                    "decision_id": str((item.get("payload") or {}).get(
-                        "system_one_decision_id") or ""),
-                    "question_ids": list((item.get("payload") or {}).get(
-                        "system_one_question_ids") or ()),
-                    "tick_id": str((item.get("payload") or {}).get(
-                        "system_one_tick_id") or ""),
-                    "boundary_kind": str((item.get("payload") or {}).get(
-                        "system_one_boundary_kind") or ""),
-                    "boundary_sequence": int((item.get("payload") or {}).get(
-                        "system_one_boundary_sequence", 0)),
-                    "action_index": int((item.get("payload") or {}).get(
-                        "system_one_action_index", 0)),
-                    "influence_receipt_id": (item.get("payload") or {}).get(
-                        "system_one_semantic_influence_receipt_id"),
-                    "influenced": bool((item.get("payload") or {}).get(
-                        "system_one_semantic_influenced", False)),
-                }
-                for item in event_values
-                if item.get("event_type") == "system_one_decision"],
+            "system_one_decision_refs": _system_one_decision_refs(event_values),
             "commit_digest": commit_digest,
         }
         action_trace = (build_committed_action_trace(

@@ -15,6 +15,7 @@ from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnsw
                                       SystemOneJudgment, canonical_hash)
 from lib.system_one_events import (SystemOneOutcomeLabeler,
                                    prepare_system_one_decision_event)
+from lib.control.transaction_service import _digest, _system_one_decision_refs
 
 
 def _frame_and_judgment():
@@ -114,6 +115,35 @@ def test_committed_system_one_decision_event_contains_pinned_answers():
     assert event["payload"]["system_one_domain_tags"] == ["software"]
     assert event["payload"]["system_one_semantic_influenced"] is True
     assert EventFactory.from_dict(event).event_type == "system_one_decision"
+
+
+def test_host_decision_reference_binds_candidate_and_domain_context():
+    refs = _system_one_decision_refs([{
+        "event_id": "dp-s1-route",
+        "event_type": "system_one_decision",
+        "payload": {
+            "system_one_decision_id": "request-1",
+            "system_one_question_ids": ["route_preference"],
+            "system_one_tick_id": "tick-1",
+            "system_one_boundary_kind": "post_action",
+            "system_one_boundary_sequence": 4,
+            "system_one_action_index": 2,
+            "system_one_legal_routes": ["infrae", "gitter"],
+            "system_one_domain_tags": ["workflow routing", "repository state"],
+            "system_one_semantic_influenced": True,
+            "system_one_semantic_influence_receipt_id": "sir-1",
+        },
+    }])
+
+    assert refs == [{
+        "event_id": "dp-s1-route", "decision_id": "request-1",
+        "question_ids": ["route_preference"], "tick_id": "tick-1",
+        "boundary_kind": "post_action", "boundary_sequence": 4,
+        "action_index": 2, "legal_candidate_count": 2,
+        "candidate_set_digest": _digest(["gitter", "infrae"]),
+        "domain_tag_digest": _digest(["repository state", "workflow routing"]),
+        "influence_receipt_id": "sir-1", "influenced": True,
+    }]
 
 
 def _stored_decision_event():
