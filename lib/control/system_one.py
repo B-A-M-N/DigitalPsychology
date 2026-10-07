@@ -375,6 +375,7 @@ def create_system_one_frame_factory(system_one_service: Any):
             workflows=workflows,
             convergence=(),
             candidate=activity,
+            failed_approaches=observation.failed_approaches,
             legal_routes=tuple(statework_id for statework_id, _description
                                in legal_stateworks),
         )

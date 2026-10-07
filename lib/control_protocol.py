@@ -10,6 +10,7 @@ from .behavior_state import (CSWBehaviorSnapshot, FrameworkSignal,
                              GoalSetSnapshot, StateWorkOption)
 from .outcomes import HostOutcomeFact
 from .runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
+from .system_one_contracts import AttemptSemanticDescriptor
 from cognitive_runtime_core.harness import HarnessAdapterIdentity
 from .compatibility import (
     DP_CONTROL_PROTOCOL_VERSION as PROTOCOL_VERSION,
@@ -338,6 +339,13 @@ class ControlTickRequest:
                 raise ValueError("candidate_action must be an object or null")
             observation_data["candidate_action"] = ActionCandidate(
                 **dict(candidate))
+        failed_approaches = observation_data.get("failed_approaches", ())
+        if not isinstance(failed_approaches, (tuple, list)) or len(failed_approaches) > 4:
+            raise ValueError("failed_approaches must be bounded to four descriptors")
+        observation_data["failed_approaches"] = tuple(
+            AttemptSemanticDescriptor(**dict(item))
+            if isinstance(item, Mapping) else item
+            for item in failed_approaches)
         observation = RuntimeObservation(**observation_data, goal_set=goal_set)
         signals = _sequence(data["cfw_signals"], "cfw_signals", maximum=MAX_CFW_SIGNALS)
         outcome_facts = _sequence(data["outcome_facts"], "outcome_facts",
@@ -383,6 +391,8 @@ class ControlTickRequest:
                     in self.observation.criterion_evidence_refs.items()},
                 "active_trigger_codes": list(self.observation.active_trigger_codes),
                 "approach_epoch": self.observation.approach_epoch,
+                "failed_approaches": [item.to_dict()
+                                      for item in self.observation.failed_approaches],
                 "candidate_action": (self.observation.candidate_action.to_dict()
                                      if self.observation.candidate_action else None),
                 "candidate_gate_receipts": (

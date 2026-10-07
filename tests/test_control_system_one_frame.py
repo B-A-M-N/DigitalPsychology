@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,7 +24,9 @@ from lib.runtime.store import BehaviorStateStore
 from lib.service import DigitalPsychologyService
 from lib.system_one_backends import DisabledSystemOneBackend
 from lib.system_one_backends import ProviderHealthError
-from lib.system_one_contracts import (QuestionAnswer, QuestionProbability,
+from lib.runtime.transactions import HostTransactionCoordinator
+from lib.system_one_contracts import (AttemptSemanticDescriptor, QuestionAnswer,
+                                      QuestionProbability,
                                       SystemOneCapability, SystemOneFrame,
                                       SystemOneJudgment)
 from lib.protocol_artifact import (PROTOCOL_HASH, PROTOCOL_VERSION,
@@ -113,9 +116,19 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
         claim="Render the requested page at the target viewport.",
         actions_since_progress=2,
         equivalent_retry_count=1),))
+    failed_attempt = AttemptSemanticDescriptor(
+        cause_class="no_criterion_advancement",
+        hypothesis_summary="Render the requested page",
+        mechanism="write a bounded workspace artifact",
+        evidence_target="plan.json", planned_action_class="write",
+        planned_target_kind="workspace",
+        failed_result_class="no_criterion_advancement",
+        premise_digest="a" * 64, action_plan_digest="b" * 64,
+        source="host_observed")
     observation = RuntimeObservation(
         action_index=9, goal_set=goals, progress_made=False,
-        evidence_refs=("host-evidence-1",), approach_epoch="hypothesis-2")
+        evidence_refs=("host-evidence-1",), approach_epoch="hypothesis-2",
+        failed_approaches=(failed_attempt,))
     service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
     try:
         factory = create_system_one_frame_factory(service)
@@ -132,6 +145,7 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
 
     assert restored.sequence == 20
     assert restored.question_ids == ("retry_relation",)
+    assert restored.state.failed_approaches == (failed_attempt,)
     assert restored.state.criteria[0].criterion_id == "criterion-visual"
     assert restored.state.criteria[0].status == "active"
 
@@ -374,9 +388,19 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
         operation="edit_file", target_kind="repository",
         mutating=True, reversible=True, external=False,
         approach_epoch="approach-1")
+    failed_attempt = AttemptSemanticDescriptor(
+        cause_class="no_criterion_advancement",
+        hypothesis_summary="Render the requested page",
+        mechanism="write a bounded workspace artifact",
+        evidence_target="page.html", planned_action_class="file_edit",
+        planned_target_kind="workspace",
+        failed_result_class="no_criterion_advancement",
+        premise_digest="c" * 64, action_plan_digest="d" * 64,
+        source="host_observed")
     observation = RuntimeObservation(
         action_index=10, action_completed=False, goal_set=goals,
-        candidate_action=candidate, equivalent_retry_count=1)
+        candidate_action=candidate, equivalent_retry_count=1,
+        failed_approaches=(failed_attempt,))
     service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
     try:
         factory = create_system_one_frame_factory(service)
@@ -393,6 +417,7 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
     assert frame.state.candidate.action_class == "file_edit"
     assert frame.state.candidate.proposed_purpose == candidate.proposed_purpose
     assert frame.state.candidate.affected_criterion_ids == ("criterion-visual",)
+    assert frame.state.failed_approaches == (failed_attempt,)
 
     request = ControlTickRequest(
         control_session_id=identity.scope, tick_id="pre-action-roundtrip",
@@ -404,6 +429,15 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
     assert restored_request.boundary_kind == "pre_action"
     assert restored_request.boundary_sequence == 37
     assert restored_request.observation.candidate_action == candidate
+    assert restored_request.observation.failed_approaches == (failed_attempt,)
+
+    transaction = HostTransactionCoordinator(SimpleNamespace(
+        _action_index=9, _latest_observation=observation, goal_set=goals))
+    next_candidate = transaction._boundary_observation(
+        "pre_action", candidate_action=candidate)
+    next_other_boundary = transaction._boundary_observation("task_end")
+    assert next_candidate.failed_approaches == (failed_attempt,)
+    assert next_other_boundary.failed_approaches == (failed_attempt,)
 
 
 def test_system_one_frame_uses_host_deliverable_and_truthful_optional_counters():

@@ -242,12 +242,16 @@ class AttemptSemanticDescriptor:
             _bounded_text(getattr(self, name), name, limit)
         _digest(self.premise_digest, "premise_digest")
         _digest(self.action_plan_digest, "action_plan_digest")
-        if len(self.affected_criterion_ids) > 8:
+        if not isinstance(self.affected_criterion_ids, (tuple, list)):
+            raise ValueError("attempt descriptor criterion IDs must be a bounded sequence")
+        criterion_ids = tuple(self.affected_criterion_ids)
+        if len(criterion_ids) > 8:
             raise ValueError("attempt descriptor references too many criteria")
-        for value in self.affected_criterion_ids:
+        for value in criterion_ids:
             _bounded_text(value, "affected criterion id", 128)
         if self.source not in {"model_proposed", "host_observed", "derived"}:
             raise ValueError("unsupported attempt descriptor provenance")
+        object.__setattr__(self, "affected_criterion_ids", criterion_ids)
 
     def to_dict(self) -> dict[str, Any]:
         result = {name: getattr(self, name) for name in (

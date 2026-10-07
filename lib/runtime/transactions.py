@@ -103,6 +103,7 @@ class HostTransactionCoordinator:
                 approach_epoch=(candidate_action.approach_epoch if candidate_action
                                 and candidate_action.approach_epoch else
                                 prior.approach_epoch if prior else ""),
+                failed_approaches=(prior.failed_approaches if prior else ()),
                 candidate_action=candidate_action,
                 candidate_gate_receipts=candidate_gate_receipts,
                 candidate_preflight_result=candidate_preflight_result,
@@ -124,6 +125,7 @@ class HostTransactionCoordinator:
             goal_set=goal_set or self.host.goal_set,
             active_trigger_codes=(prior.active_trigger_codes if prior else ()),
             approach_epoch=prior.approach_epoch if prior else "",
+            failed_approaches=(prior.failed_approaches if prior else ()),
             candidate_action=candidate_action,
             candidate_gate_receipts=candidate_gate_receipts,
             candidate_preflight_result=candidate_preflight_result,

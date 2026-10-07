@@ -16,7 +16,7 @@ from ..behavior_state import (BehaviorDirective, BehaviorState,
                               BehaviorSignalBatch, CSWBehaviorSnapshot,
                               FrameworkSignal, GoalSetSnapshot,
                               StateWorkReleaseResult)
-from ..system_one_contracts import SystemOneFrame
+from ..system_one_contracts import AttemptSemanticDescriptor, SystemOneFrame
 from ..compatibility import CFW_ADAPTER_PROTOCOL_VERSION, MAX_GOAL_CRITERIA
 
 
@@ -174,6 +174,7 @@ class RuntimeObservation:
     evidence_refs: tuple[str, ...] = ()
     active_trigger_codes: tuple[str, ...] = ()
     approach_epoch: str = ""
+    failed_approaches: tuple[AttemptSemanticDescriptor, ...] = ()
     candidate_action: ActionCandidate | None = None
     candidate_gate_receipts: Mapping[str, Any] | None = None
     candidate_preflight_result: str | None = None
@@ -316,6 +317,13 @@ class RuntimeObservation:
         object.__setattr__(self, "criterion_status", statuses)
         if not isinstance(self.approach_epoch, str) or len(self.approach_epoch) > 256:
             raise ValueError("host approach epoch must be bounded text")
+        failed_approaches = self.failed_approaches
+        if (not isinstance(failed_approaches, (tuple, list))
+                or len(failed_approaches) > 4
+                or any(not isinstance(item, AttemptSemanticDescriptor)
+                       for item in failed_approaches)):
+            raise ValueError("host failed approaches must be bounded typed descriptors")
+        object.__setattr__(self, "failed_approaches", tuple(failed_approaches))
         for name, limit in (("evidence_refs", 16), ("active_trigger_codes", 32)):
             values = getattr(self, name)
             if (not isinstance(values, (tuple, list)) or len(values) > limit
