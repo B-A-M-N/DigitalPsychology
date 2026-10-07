@@ -1,14 +1,17 @@
 # DigitalPsychology
 
-> **External cognitive-behavioral control and learning plane.**
-> DP adapts optional behavior during a task and measures intervention outcomes across independent trajectories.
+> **External adaptive behavioral controller and learning plane.**
+> DP adapts optional behavior during a task and evaluates intervention outcomes across independent trajectories.
 
 DigitalPsychology (DP) sits outside the controlled agent's runtime. A trusted
 host calls it automatically at task and action boundaries; the agent does not
-invoke DP. DP owns the meaning and transition policy of `BehaviorState`. Its
-fast loop uses runtime outcomes, CFW signals, CSW snapshots, and optional
-Laya/Jev judgments to choose bounded temporary interventions. Its slow loop
-evaluates those interventions over independent trajectories.
+invoke DP. DP owns its adaptive `BehaviorState` and the policy for bounded
+behavioral adjustments. CFW retains hard and local component/action authority;
+CSW retains workflow state, evidence, and transition authority. DP's fast loop
+uses runtime outcomes, CFW signals, CSW snapshots, and optional Laya/Jev
+semantic evidence to choose bounded temporary interventions. Laya/Jev evidence
+can inform a DP decision but never grants authority. Its slow loop evaluates
+interventions over independent trajectories.
 
 It was originally conceived as another behavioral skill pack. That became the wrong abstraction.
 
@@ -20,13 +23,24 @@ DP does not infer subjective experience. It uses observable behavior to decide w
 
 ## Current implementation
 
-DP supplies the host-side behavioral controller. The private control MCP in
-`lib/transport/control_mcp.py` runs its decision engine out of process;
-`lib/host/` provides the private client, lifecycle bridge, and CFW/CSW adapters.
-The trusted execution host owns the overall agent session. The older
-`RuntimeSession` remains an in-process compatibility adapter. DP does not grant
-permissions, define legal StateWork transitions, validate evidence, or replace
-either system's authority.
+DP supplies the external adaptive behavioral controller and learning plane.
+Its existing `lib/runtime/` and `lib/host/` trees hold the runtime contracts,
+trusted lifecycle bridge, private client, and CFW/CSW adapters. The private
+control MCP in `lib/transport/control_mcp.py` transports decisions from the DP
+engine out of process. The trusted execution host owns the overall agent
+session. `RuntimeSession` remains an in-process compatibility adapter. DP does
+not grant permissions, define legal StateWork transitions, validate evidence,
+or replace CFW's or CSW's authority.
+
+The harness-neutral lifecycle, action, validator, reuse, and completion
+contracts live in the separately versioned and installable
+`cognitive_runtime_core` distribution. The legacy `digital_psychology.runtime`
+paths re-export them for compatibility. Codex and Athena are harness adapters
+to those contracts; neither defines cognitive authority. The package owns
+generic transaction sequencing and cross-system CFW/CSW application with
+rollback. DP still builds its private control requests, commits or aborts its
+behavior decision, and reconciles uncertain authority receipts. Its source is
+currently maintained in this repository.
 
 Implemented capabilities include:
 
@@ -45,11 +59,14 @@ Implemented capabilities include:
 - **Transactional intervention event outbox** that commits authenticated application and outcome events with the DP behavior revision, then retries delivery idempotently after restarts.
 - **Constrained StateWork preferences** ranked only from the eligible choices supplied by CSW. DP cannot commit or legalize a CSW transition.
 - **A versioned private MCP control protocol** with prepare/apply/commit/abort/reconcile transactions, exact directive receipts, and restart recovery against CFW and CSW revisions.
+- **Harness-neutral runtime contracts** in `cognitive_runtime_core/`. `TaskContract`, `ActionProposal`, `RuntimeObservationProjection`, and `CompletionProposal` give product adapters one bounded interface for task intent, actions, outcomes, and completion evidence. DP owns behavioral policy and its private control port; adapters own only their product-specific projection.
+- **Harness identity and capability negotiation** records adapter, host, protocol, and catalog pins. Unverified identities expose no effective capabilities, and unavailable boundaries produce explicit degradation claims. Typed action control payloads cross only when the verified adapter exposes both the pre-action boundary and action blocking; otherwise DP returns a degraded result without forwarding the payload.
+- **Explicit product and harness adapters** normalize CFW/CSW host ports in DP and map Athena's public `TaskSpec` and durable events through `cognitive_runtime_core.integrations.athena`. The Athena adapter imports no cognitive application and cannot block actions, validate, project context, or intercept completion because Athena exposes no such public hooks. `DigitalPsychologyHarnessLifecycle` receives `component_adapter_factory` from the trusted composition root, asks the task handle to create that selection through its generic component port, and never imports or chooses a CFW implementation.
 - **One sequenced control boundary** for task start, pre-model, pre-tool-planning, pre-action, post-action, validator, workflow, operator, and pre-completion observations. Pre-model and pre-tool-planning traces remain distinct at the same action index. Pre-action candidates are bounded and sanitized; non-action boundaries do not age intervention horizons, and action counters advance only after completed host actions.
 - **Separate model and audit projections** so prompts receive replaceable goal guidance while intervention IDs, authority revisions, hashes, and reconciliation metadata remain host-private.
 - **Host failure semantics** that retain the last committed behavior projection when DP is unavailable; CFW hard action gates and CSW legality remain active.
 
-DP's telemetry, experiments, and deterministic controller do not require CFW or CSW packages. The cross-system `RuntimeHost` uses explicit ports to coordinate CFW and CSW. CFW and CSW also remain independently usable; the complete adaptive deployment runs CFW, CSW, and DP together, with each repository retaining its own authority.
+DP's telemetry, experiments, and deterministic controller can operate without CFW or CSW integrations. The cross-system `RuntimeHost` in the existing DP runtime uses explicit ports to coordinate them. CFW and CSW remain independently usable; the complete adaptive deployment runs CFW, CSW, and DP together, with each system retaining its own authority.
 
 Runtime orchestration, directive application, and outcome assessment are trusted-host APIs and are deliberately not exposed through the model's tool registry. `RuntimeHost.open_control_bridge(...)` starts a private MCP child and returns the host lifecycle bridge; the bridge asks CFW to preflight the original action, evaluates a sanitized candidate through DP, then asks CFW for its final action decision and correlation ID. If either CFW gate rejects, DP receives a bounded rejection boundary and the action does not execute. The raw request stays in the host and CFW adapter. The bridge asks CSW to select only registered, eligible workflows. Independent outcome records require host evidence and an applied receipt. See [the fast-loop contract](docs/behavioral-fast-loop.md) and [intervention credit assignment](docs/intervention-outcome-credit.md).
 
@@ -57,7 +74,7 @@ The bridge retains a bounded receipt for the last System-1 query in its
 host-only audit projection. The semantic answer is not copied into model
 context.
 
-The private `digital-psychology-control-mcp` is started by `HostControlBridge` and is not a Codex model-visible MCP server. Before opening a bridge, the trusted host supplies the controlled agent's complete model-visible tool registry; DP rejects a registry that contains its private control or admin tools. An absent or partial registry cannot prove that every agent-facing tool is hidden. The legacy `digital-psychology-mcp` entry point fails closed unless explicitly enabled; `digital-psychology-admin-mcp` is for a trusted operator namespace. Keep the control process on the host side of the tool boundary.
+The private `digital-psychology-control-mcp` is started by `HostControlBridge` and is not exposed in the controlled agent's model-visible tool registry. Before opening a bridge, the trusted host supplies that complete registry; DP rejects a registry that contains its private control or admin tools. An absent or partial registry cannot prove that every agent-facing tool is hidden. The legacy `digital-psychology-mcp` entry point fails closed unless explicitly enabled; `digital-psychology-admin-mcp` is for a trusted operator namespace. Keep the control process on the host side of the tool boundary.
 
 The automated release gate covers structural and cross-system behavior. Claims about improving an external model's reasoning require the real-agent qualification harness with an explicitly configured external model command.
 
@@ -65,9 +82,11 @@ The automated release gate covers structural and cross-system behavior. Claims a
 
 DP can ingest, reconstruct, experiment, and promote a routing profile without CFW or CSW installed.
 
-Install the package and configure the MCP client to launch its stdio command:
+Install the neutral runtime package and DP from this checkout, then configure
+the MCP client to launch its stdio command:
 
 ```bash
+python3 -m pip install -e ./cognitive_runtime_core
 python3 -m pip install -e .
 digital-psychology-admin-mcp
 ```
@@ -130,13 +149,15 @@ and transition against its own registry and revision. The trusted host owns
 tool execution and completion evidence. Optional Laya/Jev judgments can inform
 DP's choice; they do not grant authority.
 
-## Direct Codex qualification
+## Optional Codex adapter qualification
 
-CFW connects directly to the regular packaged Codex CLI through the generic
-App Server protocol. That path is independent of HarvardCodex Control. The
-trusted host registers CFW actions; DP's private control MCP stays on the host
-side and is not placed in the model-visible tool registry. Codex's internal
-inference and planning boundaries are not intercepted.
+CFW can use the separately distributed `cognitive-runtime-codex-adapter` to
+connect to the regular packaged Codex CLI through the generic App Server
+protocol. The adapter is selected by the trusted host; DP's core does not
+depend on Codex or its protocol. The host registers CFW actions, and DP's
+private control MCP stays on the host side, outside the model-visible tool
+registry. Codex's internal inference and planning boundaries are not
+intercepted.
 
 The four-defect coding fixture is an integration and non-regression check. Its
 baseline reached 4/4 on all 10 trials in the recorded run, so it does not leave
@@ -151,7 +172,25 @@ before the host or model turn began. The completed direct sample used
 FreeInference's external-provider Responses route with the regular packaged
 Codex CLI. The recorded host policy exposed zero DP tools to the model. These
 results establish integration for the recorded fixture, not behavioral
-superiority; the baseline was already at the fixture ceiling.
+superiority; the baseline was already at the fixture ceiling. Workspace-routing
+preflight is specific to that Codex authentication/provider path; it is not a
+DP, CFW, or CSW runtime requirement.
+
+## Second-harness acceptance (Athena)
+
+Run `python scripts/acceptance-athena-adapter.py` to exercise DP's structural
+adapter against `AthenaService.in_memory()` through Athena's public task,
+event, and result APIs. The script uses Athena's in-memory fake provider and
+does not add Athena as a DP dependency. Set `ATHENA_ROOT` if its checkout is
+not the sibling `Athena/` directory. This qualifies API interoperability and
+explicit capability degradation; it does not claim control parity or
+behavioral efficacy. Athena's current public surfaces cannot block actions or
+intercept completion, and the local service instance has no independent host
+attestation, so the adapter remains unverified during this check.
+Codex and Athena demonstrate adapter neutrality at the shared-contract level.
+Full-control portability remains unproven until a second harness exposes and
+qualifies pre-action blocking, context projection, and completion interception;
+any such harness can satisfy that requirement.
 
 ### Wiring the trusted runtime host
 
@@ -159,6 +198,10 @@ The host supplies explicit CFW and optional CSW ports to DP. It calls
 `RuntimeHost.open_control_bridge(...)` once per scoped task, invokes
 `before_tool_planning(...)` before asking the model for an action, and calls
 `before_action_candidate(...)` after the host has parsed the proposed action.
+The host may also pass a versioned `harness_adapter_identity`; DP persists the
+pin in the session descriptor and applies only capabilities backed by a
+verified adapter identity. Without a verified identity, the runtime records
+the adapter declaration but treats its capabilities as unavailable.
 The private MCP transport evaluates only a sanitized `ActionCandidate`. In
 CFW+DP mode, pass the original CFW action request separately as
 `cfw_action_request`; the bridge sends it only to CFW for a hard preflight and
@@ -202,8 +245,9 @@ their effects. See [intervention credit assignment](docs/intervention-outcome-cr
 
 ### Optional Laya System-1 provider
 
-Laya support is an optional dependency. Install it with
-`python3 -m pip install 'digital-psychology[laya]'` (the `system-one` extra is
+Laya support is an optional dependency. Install it in a dedicated environment
+with `python3 -m venv .venv-laya` followed by
+`.venv-laya/bin/python -m pip install -e '.[laya]'` (the `system-one` extra is
 an alias). This installs the Laya inference library without its separate HTTP
 serving extras. Ordinary imports and the default DP service keep the provider
 disabled; they do not import Laya, load PyTorch, or download model weights. The
@@ -260,12 +304,49 @@ above covers the checkpoint, encoder configuration, and tokenizer files used
 by the adapter; the checkpoint file itself has SHA-256
 `4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e`. The
 Laya package extra installs the runtime library, while the command downloads
-the model weights and their pinned metadata. Advisory mode requires an active
-calibration bundle; without one, use `shadow` so Laya runs but cannot override
-deterministic DP decisions. Private host control records the typed judgment in
-the durable prepared-tick basis, including in shadow mode; agent-visible tools
-do not expose it. The timeout defaults to 30 seconds for local CPU inference;
-a timeout causes one provider failure and deterministic fallback.
+the model weights and their pinned metadata. Advisory mode requires at least
+one active family calibration; unqualified families stay in shadow mode.
+Private host control records the typed judgment in the durable prepared-tick
+basis and adds an authenticated `system_one_decision` event to the durable
+outbox only when the control tick commits. Aborted or stale preparations do
+not produce committed decision events. Later host, validator, CSW, or operator
+evidence can be recorded through
+`DigitalPsychologyService.record_system_one_outcome`; the service accepts only
+registered family labels and independent authority classes. The provider path
+does not accept Laya answers, DP policy choices, or agent prose as outcome
+evidence. Agent-visible tools do not expose it. The timeout defaults to 30
+seconds for local CPU inference; a timeout causes one provider failure and
+deterministic fallback.
+
+A local pinned-checkpoint smoke on 2026-10-07 returned one typed
+`progress_relation` answer through `SystemOneService` in shadow mode. The Laya
+library warned about invalid checkpoint temperatures and uncalibrated
+confidence; no calibration record was loaded. The
+[smoke record](evaluations/laya-shadow-smoke-2026-10-07.json) proves checkpoint
+loading and adapter output only; it does not establish accuracy or efficacy.
+Laya support is structurally available, but Laya efficacy is not yet qualified:
+the runtime is absent from the current qualification environment, no active
+family calibration is available, and no matched advisory outcome study has
+passed the required gates. Do not claim that Laya improves behavior until that
+evidence exists.
+
+Run `digital-psychology-laya-doctor` in the trusted runtime environment to
+check the optional import, pinned checkpoint hash, provider protocol, current
+mode, and per-family calibration status. It does not print credentials or
+load model weights. Shadow readiness requires the Laya package and verified
+checkpoint but does not require calibration. Advisory readiness is reported
+per family: active qualified families may influence DP, while missing or
+shifted families remain shadow-only.
+
+`digital-psychology-laya-qualify --event-db PATH --question-family FAMILY
+--output CANDIDATE.json` reads only authenticated System-1 decision and
+outcome events. It keeps the production minimums of 100 outcomes, 30
+independent trajectories, and 20 trajectories in each applicable
+work-mode/deliverable cohort. Training, calibration, and holdout data are
+partitioned by trajectory. The command writes a mode-0600 candidate record;
+activation still requires independent host review through
+`SystemOneCalibrationLifecycle`. Threshold flags may make qualification
+stricter, but cannot weaken those production minimums.
 
 ### Generic loopback HTTP provider
 
@@ -284,10 +365,16 @@ DIGITALPSYCHOLOGY_SYSTEM_ONE_PROVIDER_PROTOCOL_SHA256=<protocol-digest>
 The endpoint must be loopback HTTP. The old provider value `jev-http` remains
 as a deprecated alias and emits a `DeprecationWarning`.
 
-Advisory mode requires an active calibration bundle. The host builds a
-candidate from later independent validation outcomes, reviews and activates
-it through `SystemOneCalibrationLifecycle`, then points
+Advisory mode requires at least one active calibration record. The host builds a
+candidate from later independent outcomes split by trajectory into training,
+calibration, and holdout cohorts. It fits temperature on calibration rows and
+qualifies accuracy, Brier score, log loss, calibration error, and per-class
+precision/recall on holdout rows. A host reviews and activates the candidate
+through `SystemOneCalibrationLifecycle`, then points
 `DIGITALPSYCHOLOGY_SYSTEM_ONE_CALIBRATION_PATH` at the exported active bundle.
+Bundles without the three-part split are rejected. Qualification and advisory
+eligibility are per question family; a family without an active matching
+record remains in shadow mode.
 Calibration is bound to one question family, model-content identity, protocol,
 and independent `(work mode, deliverable kind)` trajectory cohorts. Route
 preference calibration also records the exact candidate count, candidate-set
@@ -313,13 +400,17 @@ Public MCP transport ── telemetry/advice tools
 Private DP control MCP (lib/transport/control_mcp.py)
   └── versioned prepare / commit / abort / reconcile API
 
-Trusted DP host runtime (lib/host/)
+Harness-neutral lifecycle contracts (cognitive_runtime_core/)
+  ├── action, validator, evidence-reuse, and completion contracts
+  └── lifecycle events, capability negotiation, and adapter identity
+
+DP controller/host runtime (lib/runtime/ and lib/host/)
   ├── CSW: authoritative state snapshots and legal transitions
   ├── CFW: component signals and validated cognitive actuators
   └── DP: BehaviorState, bounded attention, intervention lifecycle
           ├── optional Laya/Jev semantic judgments
           └── slow-loop experiments and validated behavioral priors
-  applies DP decisions only after revision checks and hard-policy resolution
+  applies DP preferences only after CFW/CSW revision checks and local hard-policy resolution
   scores bounded interventions using independent host evidence
                        │
                        ▼
@@ -622,7 +713,7 @@ DigitalPsychology
                  └──────────────► DP
 ```
 
-CFW provides cognitive components, signals, and enforcement. CSW provides authoritative workflow state and legal transitions. DigitalPsychology owns cross-system behavioral adaptation and measures whether its interventions improve progress toward the user's objective.
+CFW provides cognitive components, signals, and hard/local enforcement. CSW provides authoritative workflow state and legal transitions. DigitalPsychology coordinates bounded cross-system behavioral adaptation and evaluates outcomes from evidence supplied by the trusted host.
 
 Together, they form an **adaptive agent control stack**: not a single giant prompt, not an unconstrained self-modifying agent, but a layered system in which behavior can be prescribed, state can be governed, outcomes can be observed, and future policy can improve from evidence.
 
@@ -637,7 +728,7 @@ python3 scripts/acceptance-runtime-triad.py
 pytest -q tests
 ```
 
-The automated release gate is defined by the sibling CFW repository's [`release-gates.json`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/release-gates.json). Its guard-policy causal check and private-MCP runtime-triad check are separate mandatory gates. The runtime triad exercises current DP, CFW, and CSW authorities together, including a private DP process restart, a CFW final-gate rejection, lease ownership, and twelve-criterion attention coverage. Real-agent improvement claims require CFW's [`acceptance-real-agent.py`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/scripts/acceptance-real-agent.py) with an explicit external model command; deterministic DP tests do not establish that claim.
+The automated release gate is defined by the sibling CFW repository's [`release-gates.json`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/release-gates.json). Its guard-policy causal check and private-MCP runtime-triad check are separate mandatory gates. The runtime triad exercises current DP, CFW, and CSW authorities together, including a private DP process restart, a CFW final-gate rejection, lease ownership, and twelve-criterion attention coverage. Real-agent efficacy has not been established: improvement claims require CFW's [`acceptance-real-agent.py`](https://github.com/B-A-M-N/CognitiveFrameWorks/blob/master/scripts/acceptance-real-agent.py) with an explicit external model command; deterministic DP tests do not establish that claim.
 
 DP's promotion receipts are authoritative for its own experiment artifacts, but real model behavior, tool outcomes, and deployment-specific evaluator quality remain external dependencies. The optional MCP transport is not required for library-only use.
 

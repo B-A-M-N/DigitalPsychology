@@ -139,7 +139,10 @@ class InterventionLifecycle:
                     scope=context.scope, attribution="insufficient",
                     target_criteria=item.target_criteria,
                     condition_id=item.condition_id,
-                    condition_basis_digest=item.condition_basis_digest))
+                    condition_basis_digest=item.condition_basis_digest,
+                    semantic_decision_refs=item.semantic_decision_refs,
+                    semantic_influence_receipt_id=(
+                        item.semantic_influence_receipt_id)))
                 continue
             if elapsed >= item.evaluation_horizon_actions:
                 outcomes.append(InterventionOutcome(
@@ -148,7 +151,10 @@ class InterventionLifecycle:
                     scope=context.scope, attribution="insufficient",
                     target_criteria=item.target_criteria,
                     condition_id=item.condition_id,
-                    condition_basis_digest=item.condition_basis_digest))
+                    condition_basis_digest=item.condition_basis_digest,
+                    semantic_decision_refs=item.semantic_decision_refs,
+                    semantic_influence_receipt_id=(
+                        item.semantic_influence_receipt_id)))
                 expired_causes.add((item.cause, item.target_criteria,
                                     item.condition_id))
                 continue

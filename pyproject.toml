@@ -9,6 +9,7 @@ description = "Host-driven behavioral policy, runtime orchestration, and persist
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
+    "cognitive-runtime-core>=1.5,<2",
     "jsonschema>=4.18",
     "PyYAML>=6.0",
     "mcp>=2.2,<3.0",
@@ -24,6 +25,8 @@ system-one = ["laya==0.3.22", "huggingface_hub>=0.20"]
 digital-psychology-mcp = "digital_psychology.mcp_server:main"
 digital-psychology-admin-mcp = "digital_psychology.transport.admin_mcp:main"
 digital-psychology-control-mcp = "digital_psychology.transport.control_mcp:main"
+digital-psychology-laya-doctor = "digital_psychology.system_one_cli:laya_doctor_main"
+digital-psychology-laya-qualify = "digital_psychology.system_one_cli:laya_qualify_main"
 
 [tool.setuptools]
 packages = ["digital_psychology", "digital_psychology.runtime",

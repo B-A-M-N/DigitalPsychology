@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import time
 from typing import Any, Mapping
 
 from ..attention import schedule_attention
@@ -14,6 +15,7 @@ from ..outcomes import (HostOutcomeFact, InterventionEvaluationFrame,
 from ..runtime.contracts import RuntimeIdentity
 from ..runtime.store import RuntimeStateRecord
 from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
+from .semantic_influence import SemanticInfluenceReceipt, compare_semantic_selection
 from ..control_protocol import (ACTION_INDEX_BOUNDARIES,
                                 CANDIDATE_ACTION_BOUNDARIES,
                                 ControlSessionDescriptor, ControlTickRequest)
@@ -56,6 +58,7 @@ class DecisionPreparation:
     goal_set: GoalSetSnapshot
     fairness_bound_actions: int
     starvation_prevented: tuple[str, ...]
+    semantic_influence_receipt: SemanticInfluenceReceipt | None = None
 
 
 class ControlDecisionEngine:
@@ -127,13 +130,15 @@ class ControlDecisionEngine:
         policy_context = {
             **dict(descriptor.host_capabilities.get("policy_context") or {}),
             **identity.to_dict(),
+            "non_goals": descriptor.non_goals,
         }
         if self.system_one_frame_factory is not None:
             frame = self.system_one_frame_factory(
                 identity, descriptor.objective,
                 attention.lease.criterion_ids if attention.lease else (),
                 record.state, request.observation, request.csw_snapshot,
-                request.cfw_signals, policy_context)
+                request.cfw_signals, policy_context,
+                descriptor.available_frameworks)
             if frame is not None and not isinstance(frame, SystemOneFrame):
                 raise TypeError("System-1 frame factory must return a validated frame")
             if frame is not None:
@@ -141,26 +146,38 @@ class ControlDecisionEngine:
                     raise ValueError("System-1 frame identity escapes the control session")
                 system_one_query_attempted = True
                 system_one_frame = frame.canonical_payload()
-                judgment_result = self.decision_service.judge(frame)
-                if hasattr(judgment_result, "judgment"):
-                    # Only calibrated/advisory output may influence executive
-                    # selection. The typed result is retained in the trusted host
-                    # transaction basis even when it remains in shadow mode.
-                    serialize = getattr(judgment_result, "to_dict", None)
-                    if callable(serialize):
-                        system_one_result = serialize()
-                    system_one_judgment_returned = (
-                        getattr(judgment_result, "judgment", None) is not None)
-                    system_one_query_failed = getattr(
-                        judgment_result, "status", None) in {
-                            "unavailable", "rejected", "stale"}
-                    judgment = (judgment_result.judgment
-                                if getattr(judgment_result, "status", None) == "ok"
-                                else None)
+                started = time.perf_counter()
+                try:
+                    judgment_result = self.decision_service.judge(frame)
+                except Exception:
+                    system_one_result = {
+                        "status": "unavailable", "reason": "provider_exception",
+                        "latency_ms": max(0.0, (time.perf_counter() - started) * 1000.0),
+                    }
+                    system_one_query_failed = True
                 else:
-                    judgment = judgment_result
-                    system_one_judgment_returned = judgment_result is not None
-                    system_one_query_failed = judgment_result is None
+                    latency_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+                    if hasattr(judgment_result, "judgment"):
+                        # Only calibrated/advisory output may influence executive
+                        # selection. Shadow results remain in the trusted audit basis.
+                        serialize = getattr(judgment_result, "to_dict", None)
+                        if callable(serialize):
+                            serialized = serialize()
+                            if isinstance(serialized, Mapping):
+                                system_one_result = {**dict(serialized),
+                                                     "latency_ms": latency_ms}
+                        system_one_judgment_returned = (
+                            getattr(judgment_result, "judgment", None) is not None)
+                        system_one_query_failed = getattr(
+                            judgment_result, "status", None) in {
+                                "unavailable", "rejected", "stale"}
+                        judgment = (judgment_result.judgment
+                                    if getattr(judgment_result, "status", None) == "ok"
+                                    else None)
+                    else:
+                        judgment = judgment_result
+                        system_one_judgment_returned = judgment_result is not None
+                        system_one_query_failed = judgment_result is None
 
         assessments = (self._assess_interventions(
             descriptor, record, request, goal_set, attention.last_seen)
@@ -194,6 +211,30 @@ class ControlDecisionEngine:
         )
         decision = self._parse_decision(
             self.decision_service.decide_behavior(input_value, judgment=judgment))
+        semantic_influence_receipt = None
+        if judgment is not None:
+            # This service call is pure: both decisions use the same host snapshot,
+            # state revision, priors, and legal candidate set. The counterfactual
+            # is retained for diagnosis and is never applied to CFW or CSW.
+            counterfactual = self._parse_decision(
+                self.decision_service.decide_behavior(input_value, judgment=None))
+            semantic_influence_receipt = compare_semantic_selection(
+                judgment, counterfactual, decision)
+            if (semantic_influence_receipt is not None
+                    and semantic_influence_receipt.influenced):
+                prior_intervention_ids = {
+                    item.intervention_id for item in record.state.active_interventions}
+                linked_interventions = tuple(
+                    replace(item,
+                            semantic_decision_refs=(
+                                semantic_influence_receipt.provider_decision_id,),
+                            semantic_influence_receipt_id=semantic_influence_receipt.receipt_id)
+                    if item.intervention_id not in prior_intervention_ids else item
+                    for item in decision.state.active_interventions)
+                decision = replace(
+                    decision,
+                    state=replace(decision.state,
+                                  active_interventions=linked_interventions))
         validate_state_against_cfw_contract(
             decision.state, descriptor, label="DP policy candidate")
         validate_directives_against_cfw_contract(decision.directives, descriptor)
@@ -212,6 +253,7 @@ class ControlDecisionEngine:
             attention.last_seen, goal_set,
             fairness_bound_actions=attention.fairness_bound_actions,
             starvation_prevented=attention.starvation_prevented,
+            semantic_influence_receipt=semantic_influence_receipt,
         )
 
     def _assess_interventions(self, descriptor: ControlSessionDescriptor,
@@ -220,7 +262,10 @@ class ControlDecisionEngine:
                               goal_set: GoalSetSnapshot,
                               attention_last_seen: Mapping[str, int]
                               ) -> list[InterventionOutcome]:
-        evidence_refs = request.observation.evidence_refs
+        # An observation may carry ordinary host evidence for task context or
+        # criterion tracking. Intervention evaluation accepts only references
+        # that the host explicitly typed as outcome facts in this control tick.
+        evidence_refs = tuple(fact.evidence_ref for fact in request.outcome_facts)
         supplied = _ProvidedOutcomeFacts(request.outcome_facts,
                                          scope=descriptor.identity.scope)
         active_ids = {item.intervention_id for item in record.state.active_interventions}
@@ -268,6 +313,7 @@ class ControlDecisionEngine:
                 InterventionOutcome.from_mapping(item)
                 for item in raw.get("intervention_outcomes") or ()),
             reason=str(raw.get("reason") or "no behavioral change required"),
+            selected_candidate_id=raw.get("selected_candidate_id"),
         )
 
     @staticmethod

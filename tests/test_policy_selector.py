@@ -436,6 +436,7 @@ def test_controller_abstention_selects_diagnostic_information_gathering_fallback
         goal_set=goals,
         attention_lease=attention.lease,
         attention_last_seen=attention.last_seen,
+        available_frameworks=ALL_FRAMEWORKS,
         cfw_signals=(FrameworkSignal(
             "fuse", "equivalent_retry", criterion_id="criterion-1"),),
         equivalent_retry_count=2,

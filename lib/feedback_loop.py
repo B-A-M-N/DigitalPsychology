@@ -1200,6 +1200,25 @@ class SQLiteSink:
             loaded.append(EventFactory.from_dict(json.loads(row[0])))
         return loaded
 
+    def load_authenticated_event(self, event_id: str, *, namespace_id: str,
+                                 application_instance_id: str) -> Optional["Event"]:
+        """Load one event only when its complete immutable origin is trusted."""
+        if not isinstance(event_id, str) or not event_id or len(event_id) > 256:
+            raise ValueError("authenticated event ID must be bounded text")
+        if not isinstance(namespace_id, str) or not namespace_id:
+            raise ValueError("authenticated event origin requires namespace_id")
+        if not isinstance(application_instance_id, str) or not application_instance_id:
+            raise ValueError("authenticated event origin requires application_instance_id")
+        row = self._conn.execute(
+            "SELECT e.payload FROM events e JOIN authenticated_events a "
+            "ON a.namespace_id=e.namespace_id "
+            "AND a.application_instance_id=e.application_instance_id "
+            "AND a.event_id=e.event_id "
+            "WHERE e.namespace_id=? AND e.application_instance_id=? AND e.event_id=?",
+            (namespace_id, application_instance_id, event_id),
+        ).fetchone()
+        return EventFactory.from_dict(json.loads(row[0])) if row is not None else None
+
     def close(self) -> None:
         self._conn.close()
 

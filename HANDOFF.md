@@ -2,18 +2,55 @@
 
 **Scope:** DigitalPsychology (DP), CognitiveFrameWorks (CFW), and CognitiveStateWork (CSW).
 
-**Source:** `/home/bamn/.codex/attachments/7b9350eb-bd62-475b-b5ca-b3da2fd5617c/pasted-text-1.txt`.
+**Sources:** `/home/bamn/.codex/attachments/2b522b96-5508-4eb0-bab6-22aa0fe5bbda/pasted-text-1.txt` and `pasted-text-2.txt`.
 
 This handoff records what still needs implementation review, regression evidence, and production qualification. The audit has already driven a large set of changes in all three worktrees. Do not rebuild the host-only control MCP, prepare/apply/commit/reconcile protocol, pre-action boundary, CFW final gate, action-candidate boundary, bounded task set, DP component overlay, CSW lease provenance, replace-only model projection, or the provider boundary. Verify those paths and extend them only when a requirement-level check finds a gap.
 
-## Current state and evidence
+## Current state and evidence (refreshed 2026-10-07)
 
-- DP source now has bounded candidate generation and selection, explicit abstention/evidence classes, semantic candidate support, ambiguity-driven Laya queries, StateWork preference over eligible choices, mode leases, material-progress attention extensions, starvation-risk calculation, and criterion-free diagnostic candidates. Focused regression tests exist for these behaviors.
-- CFW source has a neutral workflow-planner port, resolver responsibility modules, a `runtime_session` package, model-visibility metadata, standalone attention selection, and separate standalone/external behavior authority types. The current edit makes standalone services lazy and lets the DP adapter bind before they are created.
-- CSW source has a workflow planner, registry-owned flow contracts/metadata, explicit lease expiry, extracted stores/authority/controller modules, and provider-owned legal composition.
-- CFW full-suite run with `COGNITIVE_STATEWORK_ROOT=/home/bamn/CognitiveStateWork`: **139 passed, 1 failed**. The failure was the test that asserts default startup ignores a configured provider, while that environment variable was set. Rerunning that test with the variable unset passed. Package-resource validation passed. The new authority boundary tests passed.
-- Previously recorded suite results: DP **151 passed** including the 1000-intervention soak; CSW **31 passed**. Rerun all project suites after final integration changes before sign-off.
-- No qualifying real-agent behavioral cohort has been produced. The DP benchmark explicitly returns `qualification_eligible: false`; the CFW external-agent harness is a single fixture task and does not run the full DP/Laya treatment matrix.
+- Last completed full worktree regression run before this pass (2026-10-05): DP `python -m pytest -q` **294 passed, 1 provider-package warning**; CFW `COGNITIVE_STATEWORK_ROOT=/home/bamn/CognitiveStateWork python -m pytest -q` **268 passed, 2 existing deprecation warnings**; CSW `python -m pytest -q` **57 passed**. CFW's no-provider startup assertion also passes separately (**1 passed**).
+- Final DP verification (2026-10-07): the full suite completed with **393 passed, 1 warning** using `python3 -m pytest -q -p no:unraisableexception`; disabling pytest's unraisable-exception cleanup plugin avoids a shutdown hang after the tests finish. The private-stdio outage test and all five private-MCP crash/restart points pass in that suite.
+- Harness-neutral boundary verification (2026-10-07): DP neutral-runtime/acceptance/import-boundary tests **8 passed**; CFW host-agnostic plus cross-repo wire tests **23 passed**; CSW dependency-boundary tests **3 passed**. This is local contract evidence; it does not qualify Athena as a live controlling harness.
+- CFW evaluation reports mark baseline completion `not_applicable` with no attempts and a null permit. Summary output separates completion applicability from observed permits, so unobserved treatment completion remains unknown (**21 report/live-trial tests passed**).
+- CFW standalone convergence handling now routes a subsequent non-verification, non-blocker-removal action through the bounded changed-hypothesis redirect when the total committed-action limit is exhausted, including host-classified direct actions. Verification remains available. CFW goal-fidelity, standalone-policy, and convergence tests passed (**61 passed**). Historical DeepSeek failures remain undiagnosed because their artifacts lack action-level receipts; this source fix has not been live-qualified.
+- `FastLoopInput.available_frameworks` now defaults to an empty capability set. Hosts must explicitly pass the connected CFW components; a regression test confirms omitted capabilities do not produce framework directives. Tests that model a connected CFW now declare its component set explicitly.
+- Additional local release checks pass: CFW `python scripts/acceptance-adversarial-concurrency.py --agents 16 --events-per-agent 200` reported **3,400 events, 17 origins, 0.410s ordinary-agent forward progress, trust checks pass**; `python -m pytest -q tests/test_telemetry_exporter.py tests/test_real_agent_bounds.py` reported **12 passed**. After the DP persistence edit, both CFW cross-project host-path checks passed (**2 passed**).
+- CFW contract parity and package-resource checks pass. The DP suite includes no-op safeguards for stale boundary sequences, pending outbox delivery, and unresolved partial-apply reconciliation. CSW now also tests durable evidence invalidation across a fresh authority and preserves an unrelated established fact; DP covers both 20- and 256-criterion fairness bounds.
+- The current project Python doctor report finds no Laya import, checkpoint directory/hash, or calibration bundle; shadow and advisory readiness both fail. This supersedes the earlier environment note that a pinned package and cached checkpoint were present. No model inference or Laya cohort trial has been run.
+- `/tmp/real-agent-code-repair-smoke-report.json` is a non-qualifying smoke: four cells, one `code_repair` trial per cell, zero holdout, and no Laya cell. It records `qualification_eligible=false` with blockers `full_agent_tool_registry_not_observable`, `independent_intervention_outcome_attribution_incomplete`, and `cross_cell_real_agent_effect_not_established`.
+- Registered `real-agent-behavioral-v1`, `hostile-integration-v1`, and `operational-performance-v1` result files still say `not_run` and have empty `source_commits`. The local hostile/operational checks above ran on dirty worktrees, so they are recorded as local evidence here rather than immutable release reports.
+- HarvardCodex reports the controller unavailable and delegation disabled; retained qualification attempts are terminal with no workers. FreeCodex authentication failed. Work continued locally in Codex; no production cohort is running.
+- The full five-cell, eight-family, three-trial cohort would run 120 benchmark trials plus up to 24 preflight attempts (3,456 model calls, 36M external tokens, and $1,440 at the configured per-trial caps). It has not been started; the prior OpenRouter transfer approval covered only the bounded no-op task.
+- A concrete DP facade leak was fixed: `DigitalPsychologyService` no longer creates the authenticated-events table through `SQLiteSink._conn`; `SQLiteSink` now owns that schema. No broad refactor or cleanup of unrelated dirty changes was performed.
+- The two audit briefs were reread from their current files in this pass (SHA-256: `bfe8cb364044a3da975b14b6daafe9859cab5e72474506b3607ac810b4560759` and `3fec79fa279b2d3c68feff2061e1b1741f6806d18d20c0c59ea847dd60d573f2`). Current-source review confirmed the distinct `pre_tool_planning` boundary, shared CFW/DP CSW identity check, CFW/CSW policy identity split, task-specific component floors, and durable selective CSW fact invalidation.
+- Closed a regression evidence gap: `test_model_and_tool_planning_boundaries_have_distinct_trace_kinds` now also asserts the model-call and tool-planning boundaries retain action index `0`; the targeted test passed (**1 passed**).
+- Corrected older WARD authority-boundary, cheatsheet, example, and FUSE execution-strategy guidance that still escalated every refusal to ANCHOR recovery. The current contract now keeps `BLOCK_ACTION` on FUSE selection under the same valid approach and reserves ANCHOR recovery for explicit `RECOVER_APPROACH` or independent approach-failure evidence. `CognitiveFrameWorks/integration_tests/test_ward_recovery_contract.py` now guards that distributed instruction contract (**1 passed**); actual agent behavior remains unqualified pending the cohort.
+- Final target-suite verification after the ownership changes: CFW `python3 -m pytest -q tests integration_tests` **350 passed, 2 existing deprecation warnings**; CSW `python3 -m pytest -q` **62 passed**; DP focused cross-system/System-1 batch **163 passed**; DP neutral/runtime boundary batch **33 passed**. CFW package resources pass, and the package matrix passes all eight supported cells; the Laya-extra cell is `BLOCKED_RUNTIME_UNAVAILABLE`.
+- The `cognitive-runtime-core` 1.5.0 distribution remains independent of DP, CFW, CSW, and harnesses. Codex transport and the optional CFW task host now live under `cognitive_runtime_core.integrations.codex`; CFW's `scripts/codex_host` paths are compatibility imports. The Codex and CFW-Codex wheels build, include the expected modules, and the `[cfw]` extra is explicit.
+
+## Final blocked-state rereview (2026-10-07)
+
+The internal architecture and qualification plumbing in the supplied
+blocked-state rereview are implemented and checked. This includes the
+independent runtime-core distribution and dependency tests; CFW local facts,
+standalone fallback, and separate retry enforcement; combined mode binding an
+external authority without constructing standalone policy; neutral action,
+validator, completion, transaction, and harness contracts; Codex ownership;
+Laya doctor/qualification/event/outcome/frame/influence plumbing; cohort
+identity and result categories; and the package and crash-recovery matrices.
+
+The remaining items are evidence or capability blockers:
+
+| Claim | Status | Missing prerequisite |
+|---|---|---|
+| Athena full-control proof | `CAPABILITY_BLOCKED` | Athena has no public pre-action blocking, context projection, or completion-interception hooks. Its adapter remains behavioral-observation only. |
+| Laya qualification and efficacy | `INSUFFICIENT_EVIDENCE` / `BLOCKED_RUNTIME_UNAVAILABLE` | The current qualification environment lacks the pinned runtime/checkpoint/calibration bundle and the required independent outcome/trajectory corpus. No advisory effect is claimed. |
+| Historical CFW 7/10 causal diagnosis | `INCOMPARABLE_COHORT` | The failed historical trials lack action traces; later cohorts differ, and the original auth/routing cohort has not passed preflight. Root cause remains unproven. |
+| Full-control portability across two real harnesses | `INSUFFICIENT_EVIDENCE` | Contract-level adapter neutrality is demonstrated; a second real control-capable harness has not been qualified. It need not be Athena. |
+
+These statuses are not treatment failures. Do not lower Laya thresholds, mark
+Athena control capabilities available, or attribute the historical CFW result
+to a cause without the missing evidence.
 
 Implementation symbols and tests are evidence that work exists; they do not by themselves close the cross-system requirements below.
 
@@ -502,9 +539,16 @@ harness against the live checkout root.
 
 ## Remaining work by project
 
+**Historical snapshot:** The project checklists below record the state before the
+2026-10-05 closeout work and are superseded by the current evidence at the top
+of this handoff. The local regression, hostile, operational, and cross-project
+checks passed, and the 20 local gates are mapped below. The audit remains open:
+registered qualification results are still `not_run`, the worktrees are dirty,
+and the full five-cell real-agent report is absent.
+
 ### DigitalPsychology
 
-- [ ] **P2 naming cleanup:** introduce provider-neutral `SemanticProvider` terminology for new interfaces; keep `SystemOne*` compatibility names where renaming would create churn. Use `Laya` for the implementation name. Search public APIs, schemas, and docs for remaining terminology drift, then update only the non-compatibility surface.
+- [x] **P2 naming cleanup** (complete): new interfaces use provider-neutral `SemanticProvider` terminology and `LayaProvider` for the implementation; legacy `SystemOne*` names remain as compatibility aliases.
 - [ ] **P1-10 facade review:** `DigitalPsychologyService` delegates to extracted attestation, ingestion, prior-store, intervention-event, and experiment services. Review the remaining service code and keep it to construction/orchestration and compatibility forwarding; move any substantive policy or persistence behavior still owned there.
 - [ ] **P1-11 bridge review:** `HostControlBridge` delegates lifecycle, transaction, reconciliation, projection, and degradation work to host collaborators. Verify each helper owns its operation and the bridge remains a composition facade; preserve one end-to-end host path for both MCP and in-process clients.
 - [ ] **DP-specific regression closeout:** rerun the full suite after cross-project changes, including semantic action relation before execution, ambiguous and insufficient-evidence abstention, statework-fit bounds, projection digest/no-op behavior, task fairness and lease extension, outage lease decay with WARD preserved, restart reconciliation, and the 1000-intervention soak.
@@ -526,30 +570,30 @@ harness against the live checkout root.
 
 ## Mandatory acceptance gates
 
-The audit names all 20 gates below. Existing focused tests cover most local invariants; each gate still needs a recorded pass against the final three-project worktree. “Test exists” is not a pass for the integrated matrix.
+The 20 gates below are mapped to passing local worktree tests where available. Local tests and stress checks do not establish live model-tool visibility or behavioral treatment effects; those remain part of the actual-agent qualification.
 
 | Gate | Required evidence | Current disposition |
 |---|---|---|
-| `pre_action_semantic_interception` | Legal but semantically equivalent failed approach is changed before execution; CFW still decides authorization | Focused DP selector test exists; repeat in integrated run |
-| `agent_tool_visibility` | Actual model request/tool registry contains no DP control/admin surface | Fixed-request harness invariant test exists; include in production harness run |
-| `projection_replace_only` | 100 revisions leave one DP guidance slot | DP projection regression test exists; include final suite |
-| `projection_semantic_stability` | Same semantic guidance does not change the projected prompt on a revision-only update | DP projection no-op regression test exists; include final suite |
-| `mode_hysteresis` | Weak oscillating evidence cannot thrash modes; hard interruption still works | DP mode-lease regression test exists; include final suite |
-| `partial_cfw_lease_expiry` | Expiring a target preserves unrelated live controls and WARD floor | CFW partial-overlay test exists; include final suite |
-| `dp_disconnect_lease_expiry` | Temporary controls decay while DP is unavailable and WARD remains mandatory | Host outage and CFW lease tests exist; verify together |
-| `statework_owner_isolation` | DP releases only its own StateWorks; other sessions/operators remain intact | CSW/DP ownership tests exist; verify cross-system path |
-| `20_task_fairness` | A stuck item cannot prevent runnable peers receiving attention within the fairness bound | 256-criterion fairness coverage exists; explicitly report the 20-task scenario |
-| `productive_focus_extension` | Material progress earns bounded continuation | DP attention extension tests exist; include final suite |
-| `microprogress_starvation` | Tiny/non-material progress cannot retain focus indefinitely | DP attention/fairness tests exist; confirm the exact adversarial case |
-| `laya_disabled_parity` | Disabling Laya preserves deterministic safety/correctness | Run and record the no-provider parity path |
-| `laya_semantic_gain` | Laya improves ambiguous retry/drift decisions without taking authority | DP semantic scoring tests exist; show paired baseline/treatment evidence |
-| `statework_semantic_fit` | Laya reorders only CSW-eligible choices | DP statework-fit tests exist; include provider-backed integration case |
-| `subsystem_matrix` | Every valid CFW/CSW/DP combination works independently | Partial subsystem tests exist; complete the explicit matrix below |
-| `no_cross_implementation_imports` | No project imports another project's implementation modules | Static import test exists in DP; run against all three projects |
-| `pre_action_post_action_indexing` | Pre-action preparation/rejection does not advance completed-action index | DP host-bridge regression exists; include final suite |
-| `restart_between_apply_commit` | Restart reconciles a prepared/applied transaction without duplicate actuation | DP host-bridge restart test exists; include final suite |
-| `1000_intervention_soak` | Hot-path time and intervention history stay bounded | DP soak test exists and previously passed; rerun after final changes |
-| `real_agent_behavioral_cohort` | Whole-task correctness improves without increased starvation or mode thrash | **Outstanding: no qualified report** |
+| `pre_action_semantic_interception` | Legal but semantically equivalent failed approach is changed before execution; CFW still decides authorization | **Local pass:** `test_unrelated_laya_action_relation_supports_replanning_before_execution`; actual-agent effect still unqualified |
+| `agent_tool_visibility` | Actual model request/tool registry contains no DP control/admin surface | **Local request-boundary pass:** fixed-request and forbidden-tool assertions pass; live full-registry observability remains a smoke-report blocker |
+| `projection_replace_only` | 100 revisions leave one DP guidance slot | **Local pass:** projection replacement regression |
+| `projection_semantic_stability` | Same semantic guidance does not change the projected prompt on a revision-only update | **Local pass:** revision-only projection no-op regression |
+| `mode_hysteresis` | Weak oscillating evidence cannot thrash modes; hard interruption still works | **Local pass:** weak-oscillation lease and hard-contradiction regression |
+| `partial_cfw_lease_expiry` | Expiring a target preserves unrelated live controls and WARD floor | **Local pass:** CFW target-overlay expiry regression |
+| `dp_disconnect_lease_expiry` | Temporary controls decay while DP is unavailable and WARD remains mandatory | **Local pass:** private-stdio outage/lease recovery path and CFW lease tests |
+| `statework_owner_isolation` | DP releases only its own StateWorks; other sessions/operators remain intact | **Local pass:** owner-isolation tests plus cross-project host-path smoke |
+| `20_task_fairness` | A stuck item cannot prevent runnable peers receiving attention within the fairness bound | **Local pass:** DP now explicitly checks 20 and 256 required criteria |
+| `productive_focus_extension` | Material progress earns bounded continuation | **Local pass:** two bounded extensions then rotation |
+| `microprogress_starvation` | Tiny/non-material progress cannot retain focus indefinitely | **Local pass:** micro-progress causes rotation |
+| `laya_disabled_parity` | Disabling Laya preserves deterministic safety/correctness | **Local pass:** deterministic parity test; no live Laya trial |
+| `laya_semantic_gain` | Laya improves ambiguous retry/drift decisions without taking authority | **Synthetic local pass only:** selector test; live paired treatment evidence is outstanding |
+| `statework_semantic_fit` | Laya reorders only CSW-eligible choices | **Local pass:** selector and provider-boundary tests; no live Laya qualification |
+| `subsystem_matrix` | Every valid CFW/CSW/DP combination works independently | **Local pass:** CFW matrix and DP/CSW cross-system matrix tests |
+| `no_cross_implementation_imports` | No project imports another project's implementation modules | **Local pass:** static boundary regression in the suites |
+| `pre_action_post_action_indexing` | Pre-action preparation/rejection does not advance completed-action index | **Local pass:** separate model/tool-planning trace kinds and boundary-sequence regressions |
+| `restart_between_apply_commit` | Restart reconciles a prepared/applied transaction without duplicate actuation | **Local pass:** host-bridge restart/reconcile regressions |
+| `1000_intervention_soak` | Hot-path time and intervention history stay bounded | **Local pass:** 1000-intervention and boundary-soak regressions |
+| `real_agent_behavioral_cohort` | Whole-task correctness improves without increased starvation or mode thrash | **Outstanding:** smoke is ineligible; full five-cell cohort has no qualified report |
 
 ### Required production qualification matrix
 

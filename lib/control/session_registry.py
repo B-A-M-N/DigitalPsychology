@@ -29,7 +29,8 @@ def _cached_execution_identity(root_name: str,
         "behavior_state.py",
         "control/policy_selector.py",
         "control/candidate_generator.py",
-        "schemas/behavior-state-v1.schema.json",
+        "schemas/behavior-state-v2.schema.json",
+        "schemas/behavioral-decision-v2.schema.json",
         "schemas/behavioral-routing-profile.schema.json",
     ))
     if not implementation_files or any(
@@ -110,6 +111,11 @@ class SessionRegistryMethods:
         self.state_store.register_control_session(
             scope, descriptor.to_dict(), provider_identity=provider_identity,
             initial_state=initial_behavior_state(descriptor))
+        # A prior commit may have left authenticated events in the durable
+        # outbox when the event database was temporarily unavailable.
+        dispatch_outbox = getattr(self, "_dispatch_outbox", None)
+        if callable(dispatch_outbox):
+            dispatch_outbox(scope)
         record = self.state_store.load(scope)
         validate_state_against_cfw_contract(record.state, descriptor)
         return {

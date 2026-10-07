@@ -21,8 +21,8 @@ class SystemOneCalibrationLifecycle:
     """Durably manages one active calibration per System-1 question family.
 
     This API is for the trusted host/service. It is not registered as an MCP
-    tool. Candidate fitting already uses a held-out partition; activation
-    additionally records the host's independent review reference.
+    tool. Candidate fitting now uses independent train, calibration, and
+    holdout partitions; activation records the host's independent review ref.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -30,7 +30,7 @@ class SystemOneCalibrationLifecycle:
         self._lock = threading.RLock()
 
     def _empty(self) -> dict[str, Any]:
-        return {"schema_version": "1.0.0", "revision": 0,
+        return {"schema_version": "2.0.0", "revision": 0,
                 "records": {}, "active": {}, "history": []}
 
     def _read(self) -> dict[str, Any]:
@@ -48,7 +48,7 @@ class SystemOneCalibrationLifecycle:
         if not isinstance(value, dict) or set(value) != {
                 "schema_version", "revision", "records", "active", "history"}:
             raise CalibrationLifecycleError("calibration lifecycle state is malformed")
-        if value["schema_version"] != "1.0.0" or not isinstance(value["revision"], int):
+        if value["schema_version"] != "2.0.0" or not isinstance(value["revision"], int):
             raise CalibrationLifecycleError("calibration lifecycle version is unsupported")
         if not isinstance(value["records"], dict) or not isinstance(value["active"], dict):
             raise CalibrationLifecycleError("calibration lifecycle maps are malformed")
@@ -93,6 +93,9 @@ class SystemOneCalibrationLifecycle:
     def stage(self, record: CalibrationRecord, *, expected_revision: int) -> dict[str, Any]:
         if record.status != "candidate":
             raise CalibrationLifecycleError("only a held-out candidate can be staged")
+        if not record.qualification_passed:
+            raise CalibrationLifecycleError(
+                "calibration candidate does not pass its independent holdout gate")
         with self._lock:
             state = self._read()
             if state["revision"] != expected_revision:
@@ -158,12 +161,12 @@ class SystemOneCalibrationLifecycle:
                 brier = _brier(probabilities)
                 ece = _ece(probabilities, record.temperature)
                 status = "clear"
-                if (accuracy < record.validation_accuracy - maximum_accuracy_drop
-                        or ece > record.validation_ece + maximum_ece_increase
-                        or brier > max(0.4, record.validation_brier + 0.15)):
+                if (accuracy < record.holdout_accuracy - maximum_accuracy_drop
+                        or ece > record.holdout_ece + maximum_ece_increase
+                        or brier > max(0.4, record.holdout_brier + 0.15)):
                     status = "drifted"
-                elif (accuracy < record.validation_accuracy - maximum_accuracy_drop / 2
-                      or ece > record.validation_ece + maximum_ece_increase / 2):
+                elif (accuracy < record.holdout_accuracy - maximum_accuracy_drop / 2
+                      or ece > record.holdout_ece + maximum_ece_increase / 2):
                     status = "warning"
                 if status != record.drift_status:
                     updated = replace(record, drift_status=status)

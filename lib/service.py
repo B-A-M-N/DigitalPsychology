@@ -15,6 +15,8 @@ from .behavior_state import BehaviorIntervention, BehaviorDirective, Interventio
 from .routing_profiles import SharingDecisionAuthority
 from .system_one_contracts import SystemOneFrame, SystemOneIdentity
 from .system_one_service import SystemOneService
+from .system_one_events import (SystemOneOutcomeLabeler,
+                                prepare_system_one_decision_event)
 from .security.attestation import EventAttestationAuthority
 from .telemetry.ingestion import BehaviorEventIngestor
 from .policy_priors.prior_store import BehaviorPolicyPriorStore
@@ -64,6 +66,7 @@ class DigitalPsychologyService:
         self._policy_priors = BehaviorPolicyPriorStore(
             profile_path=self.profile_path, sharing_authority=self._sharing_authority)
         self._intervention_events = InterventionEventService(self._sink)
+        self._system_one_outcomes = SystemOneOutcomeLabeler(self._sink)
         self._experiments = RegisteredExperimentService(
             sink=self._sink, profile_path=self.profile_path,
             promotion_secret=os.environ.get("DIGITALPSYCHOLOGY_PROMOTION_SECRET", "").encode())
@@ -175,6 +178,28 @@ class DigitalPsychologyService:
     def dispatch_runtime_event(self, value: Mapping[str, Any]) -> str:
         """Idempotently deliver a trusted host event from the runtime outbox."""
         return self._intervention_events.dispatch(value)
+
+    @staticmethod
+    def prepare_system_one_decision_event(descriptor: Any,
+                                          basis: Mapping[str, Any]
+                                          ) -> dict[str, Any] | None:
+        """Build a durable provider observation for the committed runtime outbox."""
+        return prepare_system_one_decision_event(descriptor, basis)
+
+    def record_system_one_outcome(self, *, decision_event_id: str,
+                                  namespace_id: str,
+                                  application_instance_id: str,
+                                  question_id: str, label: str,
+                                  authority: str, evidence_ref: str) -> str:
+        """Persist one later label supplied by a trusted evidence authority."""
+        return self._system_one_outcomes.record(
+            decision_event_id=decision_event_id,
+            namespace_id=namespace_id,
+            application_instance_id=application_instance_id,
+            question_id=question_id,
+            label=label,
+            authority=authority,
+            evidence_ref=evidence_ref)
 
     def _record_intervention_event(
             self, event_context: InterventionEventContext, *, category: str,

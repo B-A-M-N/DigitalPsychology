@@ -15,17 +15,18 @@ from ..control_protocol import (CONTROL_BOUNDARY_KINDS, PROTOCOL_VERSION, Contro
                                 ControlTickRequest)
 from ..outcomes import HostOutcomeFact
 from ..runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
+from ..runtime.harness import HarnessAdapterIdentity
 from ..runtime.projection import (AuditProjection, build_behavior_projection,
                                   cached_replace_model_projection)
 from ..runtime.adapters.standalone import NullCSWWorkflowPort
 from ..telemetry.production_metrics import (ProductionMetrics,
                                             default_production_metrics_path)
-from .actuator import ActuationFailure, ControlActuator
+from ..runtime.actuator import ActuationFailure, ControlActuator
 from .mcp_client import MCPControlClient, MCPControlUnavailable
 from .system_one_audit import summarize_system_one_observation
 from .lifecycle_hooks import HostLifecycleHooks
-from .transaction_coordinator import HostTransactionCoordinator
-from .reconciler import HostReconciler
+from ..runtime.transactions import HostTransactionCoordinator
+from ..runtime.reconciliation import HostReconciler
 from .projection_manager import HostProjectionManager
 from .degradation import HostDegradation
 
@@ -41,6 +42,7 @@ class HostControlBridge:
 
     def __init__(self, *, identity: RuntimeIdentity, objective: str,
                  objective_criteria: Sequence[str], initial_goal_set: GoalSetSnapshot,
+                 non_goals: Sequence[str] = (),
                  cfw: Any = None, csw: Any = None,
                  client: Any = None,
                  csw_authority_identity: Mapping[str, str] | None = None,
@@ -48,11 +50,14 @@ class HostControlBridge:
                  host_policy_context: Mapping[str, Any] | None = None,
                  host_has_stable_objective_context: bool = False,
                  fault_handler: Any = None,
-                 production_metrics: ProductionMetrics | None = None) -> None:
+                 production_metrics: ProductionMetrics | None = None,
+                 harness_adapter_identity: HarnessAdapterIdentity | Mapping[str, Any] | None = None
+                 ) -> None:
         self.identity = identity
         self.objective = objective
         self.objective_criteria = tuple(objective_criteria)
         self.initial_goal_set = initial_goal_set
+        self.non_goals = tuple(non_goals)
         self.goal_set = initial_goal_set
         self.cfw = cfw
         self.csw = csw
@@ -65,15 +70,23 @@ class HostControlBridge:
         self.production_metrics = (production_metrics or service_metrics
                                    or ProductionMetrics(metrics_path))
         self.actuator = ControlActuator(
-            cfw=cfw, csw=csw, production_metrics=self.production_metrics)
+            cfw=cfw, csw=csw, production_metrics=self.production_metrics,
+            csw_snapshot_provider=self._csw_snapshot)
         self.outcome_evidence_connected = bool(outcome_evidence_connected)
         self.host_policy_context = dict(host_policy_context or {})
         if len(self.host_policy_context) > 32:
             raise ValueError("host policy context exceeds its field bound")
+        if (len(self.non_goals) > 8
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 256
+                       for item in self.non_goals)
+                or len(self.non_goals) != len(set(self.non_goals))):
+            raise ValueError("host non-goals must be unique bounded text")
         if not isinstance(host_has_stable_objective_context, bool):
             raise ValueError("stable objective context flag must be boolean")
         self.host_has_stable_objective_context = host_has_stable_objective_context
         self.fault_handler = fault_handler
+        self.harness_adapter_identity = self._parse_harness_adapter_identity(
+            harness_adapter_identity)
         self.lifecycle_hooks = HostLifecycleHooks(self)
         self.transaction_coordinator = HostTransactionCoordinator(self)
         self.reconciler = HostReconciler(self)
@@ -100,6 +113,38 @@ class HostControlBridge:
         self._lock = asyncio.Lock()
         self._session_descriptor = self.projection_manager._create_descriptor()
         self._workflow_authority_identity_pin: dict[str, Mapping[str, str]] | None = None
+
+    @staticmethod
+    def _parse_harness_adapter_identity(
+            value: HarnessAdapterIdentity | Mapping[str, Any] | None
+            ) -> HarnessAdapterIdentity:
+        if value is None:
+            return HarnessAdapterIdentity.unidentified()
+        if isinstance(value, HarnessAdapterIdentity):
+            return value
+        if isinstance(value, Mapping):
+            return HarnessAdapterIdentity.from_mapping(value)
+        raise TypeError("harness adapter identity must be a validated identity or mapping")
+
+    def bind_harness_adapter_identity(self, value: Mapping[str, Any]
+                                      ) -> Mapping[str, Any]:
+        """Bind a harness pin, or confirm the identical pin on an open session."""
+        identity = self._parse_harness_adapter_identity(value)
+        current = self.harness_adapter_identity
+        if self._closed:
+            raise RuntimeError("cannot bind a harness identity to a closed DP session")
+        if self._opened or self._remote_open:
+            if current == identity:
+                # A trusted RuntimeHost factory may open the bridge before it
+                # returns it to an outer lifecycle adapter. Accept only the
+                # exact identity already persisted in that session descriptor.
+                return identity.to_dict()
+            raise RuntimeError("harness identity must be bound before DP session open")
+        if (current.harness_id != "unidentified" and current != identity):
+            raise RuntimeError("DP host is already pinned to another harness identity")
+        self.harness_adapter_identity = identity
+        self._session_descriptor = self.projection_manager._create_descriptor()
+        return identity.to_dict()
 
     @property
     def fault(self) -> str | None:

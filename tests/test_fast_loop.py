@@ -16,6 +16,8 @@ from lib.behavior_state import (MAX_ACTIVE_INTERVENTIONS, BehaviorIntervention,
 from lib.fast_loop import BehavioralController, FastLoopInput
 from lib.mcp_server import DigitalPsychologyService
 
+CFW_FRAMEWORKS = ("owl", "anchor", "fuse", "ward", "flow", "sispis", "dox")
+
 
 def test_repeated_equivalent_work_creates_bounded_recovery_and_legal_statework_preference():
     controller = BehavioralController()
@@ -34,6 +36,7 @@ def test_repeated_equivalent_work_creates_bounded_recovery_and_legal_statework_p
         csw_snapshot=csw,
         objective_criteria=("criterion-2",),
         equivalent_retry_count=2,
+        available_frameworks=CFW_FRAMEWORKS,
     ))
 
     assert decision.expected_revision == 0
@@ -50,6 +53,21 @@ def test_repeated_equivalent_work_creates_bounded_recovery_and_legal_statework_p
     }
     assert any(target.target == "statework:repair-flow"
                for target in decision.state.active_interventions[0].targets)
+
+
+def test_omitted_cfw_capabilities_do_not_assume_a_full_framework_installation():
+    context = FastLoopInput(
+        scope="tenant/app/agent/session/task/attempt",
+        state=BehaviorState(),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0),
+        objective_criteria=("criterion-1",),
+        equivalent_retry_count=2,
+    )
+
+    decision = BehavioralController().decide(context)
+
+    assert context.available_frameworks == ()
+    assert not any(item.operation == "set_framework" for item in decision.directives)
 
 
 def test_cfw_only_retry_and_drift_codes_drive_fast_loop_conditions():
@@ -131,6 +149,7 @@ def test_unverified_progress_flag_cannot_assign_intervention_credit():
         state=initial,
         csw_snapshot=CSWBehaviorSnapshot(revision=1),
         equivalent_retry_count=2,
+        available_frameworks=CFW_FRAMEWORKS,
     ))
 
     second = controller.decide(FastLoopInput(
@@ -141,6 +160,7 @@ def test_unverified_progress_flag_cannot_assign_intervention_credit():
         artifact_changed=True,
         action_completed=True,
         evidence_refs=("host-evidence-9",),
+        available_frameworks=CFW_FRAMEWORKS,
     ))
 
     assert second.state.cognitive_mode == "VERIFY"
@@ -449,8 +469,8 @@ def test_service_returns_schema_valid_host_decision_without_exposing_agent_tool(
         service.close()
 
     schemas = Path(__file__).parents[1] / "lib" / "schemas"
-    state_schema = json.loads((schemas / "behavior-state-v1.schema.json").read_text())
-    decision_schema = json.loads((schemas / "behavioral-decision-v1.schema.json").read_text())
+    state_schema = json.loads((schemas / "behavior-state-v2.schema.json").read_text())
+    decision_schema = json.loads((schemas / "behavioral-decision-v2.schema.json").read_text())
     registry = Registry().with_resource(
         state_schema["$id"], Resource.from_contents(state_schema))
     Draft202012Validator(decision_schema, registry=registry).validate(result)
@@ -656,7 +676,8 @@ def test_full_intervention_target_capacity_skips_statework_preference():
         revision=1, eligible_stateworks=(StateWorkOption("repair-flow"),))
     context = FastLoopInput(
         scope=scope, state=BehaviorState(), csw_snapshot=csw,
-        objective_criteria=("criterion-1",), host_action_index=4)
+        objective_criteria=("criterion-1",), host_action_index=4,
+        available_frameworks=CFW_FRAMEWORKS)
     candidate = BehaviorCandidate.from_state(
         BehaviorState(cognitive_mode="RECOVER"), focus_criteria=("criterion-1",),
         statework_preferences=("repair-flow",), reason_codes=("deterministic_rule",),

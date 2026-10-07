@@ -331,6 +331,140 @@ def test_required_laya_query_bypasses_unchanged_shortcut(tmp_path):
     asyncio.run(run())
 
 
+def test_committed_system_one_decision_uses_durable_outbox_once(
+        tmp_path, monkeypatch):
+    async def run():
+        bridge, _client, service, store, goals = _runtime(tmp_path)
+        event = {
+            "event_id": "dp-s1-committed-outbox-test",
+            "category": "decision",
+            "event_type": "system_one_decision",
+            "scope": bridge.identity.scope,
+        }
+        delivered = []
+
+        def dispatch(value):
+            if value.get("event_type") == "system_one_decision":
+                delivered.append(dict(value))
+            return value["event_id"]
+
+        try:
+            assert (await bridge.open())["status"] == "ready"
+            monkeypatch.setattr(
+                service.decision_service,
+                "prepare_system_one_decision_event",
+                lambda descriptor, basis: dict(event)
+                if basis.get("system_one") else None,
+            )
+            monkeypatch.setattr(
+                service.decision_service,
+                "dispatch_runtime_event",
+                dispatch,
+            )
+
+            record = store.load(bridge.identity.scope)
+            observation = bridge._boundary_observation("operator")
+            request = ControlTickRequest(
+                control_session_id=bridge.identity.scope,
+                tick_id="committed-system-one-event",
+                expected_behavior_revision=record.state.revision,
+                cfw_lifecycle_revision=0,
+                observation=observation,
+                goal_set=goals,
+                cfw_signals=(),
+                csw_snapshot=bridge._csw_snapshot()[0],
+                boundary_kind="operator",
+                boundary_sequence=bridge._boundary_sequence + 1,
+            )
+            engine = service.engine
+
+            class _SystemOneAttemptEngine:
+                def prepare(self, descriptor, runtime_record, control_request):
+                    preparation = engine.prepare(
+                        descriptor, runtime_record, control_request)
+                    return replace(
+                        preparation,
+                        system_one_query_attempted=True,
+                        system_one_frame={"request_id": "sys1-outbox-test"},
+                        system_one_result={"status": "shadow"},
+                    )
+
+            service.engine = _SystemOneAttemptEngine()
+            prepared = service.prepare_control_tick(request.to_dict())
+            receipt_result = _commit_prepared(
+                service, prepared, scope=bridge.identity.scope,
+                csw_snapshot=request.csw_snapshot,
+            )
+            assert receipt_result["system_one_decision_event_ids"] == [event["event_id"]]
+            assert delivered == [event]
+            assert store.pending_outbox(bridge.identity.scope) == ()
+
+            retried = _commit_prepared(
+                service, prepared, scope=bridge.identity.scope,
+                csw_snapshot=request.csw_snapshot,
+            )
+            assert retried == receipt_result
+            assert delivered == [event]
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
+def test_aborted_system_one_decision_never_enters_event_outbox(
+        tmp_path, monkeypatch):
+    async def run():
+        bridge, _client, service, store, goals = _runtime(tmp_path)
+        event_preparations = []
+        try:
+            assert (await bridge.open())["status"] == "ready"
+            monkeypatch.setattr(
+                service.decision_service,
+                "prepare_system_one_decision_event",
+                lambda descriptor, basis: event_preparations.append(basis) or {},
+            )
+
+            record = store.load(bridge.identity.scope)
+            request = ControlTickRequest(
+                control_session_id=bridge.identity.scope,
+                tick_id="aborted-system-one-event",
+                expected_behavior_revision=record.state.revision,
+                cfw_lifecycle_revision=0,
+                observation=bridge._boundary_observation("operator"),
+                goal_set=goals,
+                cfw_signals=(),
+                csw_snapshot=bridge._csw_snapshot()[0],
+                boundary_kind="operator",
+                boundary_sequence=bridge._boundary_sequence + 1,
+            )
+            engine = service.engine
+
+            class _SystemOneAttemptEngine:
+                def prepare(self, descriptor, runtime_record, control_request):
+                    preparation = engine.prepare(
+                        descriptor, runtime_record, control_request)
+                    return replace(
+                        preparation,
+                        system_one_query_attempted=True,
+                        system_one_frame={"request_id": "sys1-aborted-test"},
+                        system_one_result={"status": "shadow"},
+                    )
+
+            service.engine = _SystemOneAttemptEngine()
+            prepared = service.prepare_control_tick(request.to_dict())
+            _abort_prepared(
+                service, prepared, scope=bridge.identity.scope,
+                csw_snapshot=request.csw_snapshot,
+            )
+
+            assert event_preparations == []
+            assert store.pending_outbox(bridge.identity.scope) == ()
+        finally:
+            await bridge.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("guard", [
     "starvation_prevented", "directive", "preferred_statework",
     "intervention_outcome", "state_change",

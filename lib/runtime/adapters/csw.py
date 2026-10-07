@@ -91,8 +91,21 @@ class CSWRuntimeAdapter:
                                    for row in active_rows))
         states = {str(row["identity"]["statework_id"]): str(row["current_state"])
                   for row in active_rows}
+        previous_states = {
+            str(row["identity"]["statework_id"]): str(row["previous_state"])
+            for row in active_rows if row.get("previous_state") is not None
+        }
         revisions = {str(row["identity"]["statework_id"]): int(row["revision"])
                      for row in active_rows}
+        legal_next_states = {
+            str(row["identity"]["statework_id"]): tuple(
+                str(state) for state in row.get("legal_next_states") or ())
+            for row in active_rows if row.get("legal_next_states")
+        }
+        workflow_progress_classes = {
+            str(row["identity"]["statework_id"]): str(row["progress_class"])
+            for row in active_rows if row.get("progress_class") is not None
+        }
         steps = {str(row["identity"]["statework_id"]): tuple(
             str(step["step_id"]) for step in row.get("eligible_steps") or ())
             for row in active_rows}
@@ -116,6 +129,9 @@ class CSWRuntimeAdapter:
                 for row in active_rows if row.get("activation_owner") == "dependency"
             },
             registry_hash=str(raw["registry_hash"]),
+            workflow_previous_states=previous_states,
+            legal_next_states=legal_next_states,
+            workflow_progress_classes=workflow_progress_classes,
         )
 
     def expire_leases(self, *, host_action_index: int) -> CSWBehaviorSnapshot:

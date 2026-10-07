@@ -109,7 +109,9 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
         goal_contract_hash="a" * 64,
     )
     goals = GoalSetSnapshot(4, (GoalItemSnapshot(
-        "criterion-visual", status="ACTIVE", actions_since_progress=2,
+        "criterion-visual", status="ACTIVE",
+        claim="Render the requested page at the target viewport.",
+        actions_since_progress=2,
         equivalent_retry_count=1),))
     observation = RuntimeObservation(
         action_index=9, goal_set=goals, progress_made=False,
@@ -132,6 +134,199 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
     assert restored.question_ids == ("retry_relation",)
     assert restored.state.criteria[0].criterion_id == "criterion-visual"
     assert restored.state.criteria[0].status == "active"
+
+
+def test_laya_frame_uses_host_claims_scoped_evidence_and_non_goals():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-semantic-inputs", task_id="task-semantic-inputs",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0", agent_id="codex",
+        behavioral_subject="task-semantic-inputs")
+    goals = GoalSetSnapshot(4, (
+        GoalItemSnapshot("criterion-one", status="ACTIVE",
+                         claim="The page renders the requested heading."),
+        GoalItemSnapshot("criterion-two", status="READY",
+                         claim="The page has an accessible navigation landmark.",
+                         evidence_refs=("evidence-two",)),
+        GoalItemSnapshot("criterion-three", status="READY",
+                         claim="The page works at the target viewport."),
+        GoalItemSnapshot("criterion-four", status="VERIFIED",
+                         claim="The page passes the visual acceptance check."),
+    ))
+    observation = RuntimeObservation(
+        action_index=1, goal_set=goals, equivalent_retry_count=1,
+        evidence_refs=("evidence-one", "evidence-two", "unscoped-evidence",
+                       "verified-visual-evidence"),
+        criterion_evidence_refs={
+            "criterion-one": ("evidence-one",),
+            "criterion-four": ("verified-visual-evidence",)})
+    service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
+    try:
+        frame = create_system_one_frame_factory(service)(
+            identity, "Render the requested page",
+            ("criterion-one", "criterion-two", "criterion-three", "criterion-four"),
+            BehaviorState(), observation, CSWBehaviorSnapshot(revision=0), (),
+            {"deliverable_kind": "visual_ui",
+             "non_goals": ["unrelated refactoring"],
+             "domain_tags": ["frontend", "accessibility"]})
+    finally:
+        service.close()
+
+    criteria = {item.criterion_id: item for item in frame.state.criteria}
+    assert criteria["criterion-one"].claim == (
+        "The page renders the requested heading.")
+    assert criteria["criterion-two"].claim == (
+        "The page has an accessible navigation landmark.")
+    assert criteria["criterion-three"].claim == (
+        "The page works at the target viewport.")
+    assert criteria["criterion-four"].claim == (
+        "The page passes the visual acceptance check.")
+    assert criteria["criterion-one"].evidence_status == "available"
+    assert criteria["criterion-two"].evidence_status == "available"
+    assert criteria["criterion-one"].evidence_ref_digests == (
+        hashlib.sha256(b"evidence-one").hexdigest(),)
+    assert criteria["criterion-two"].evidence_ref_digests == (
+        hashlib.sha256(b"evidence-two").hexdigest(),)
+    assert criteria["criterion-three"].evidence_status == "none"
+    assert criteria["criterion-three"].evidence_ref_digests == ()
+    assert criteria["criterion-four"].evidence_status == "verified"
+    assert criteria["criterion-four"].evidence_ref_digests == (
+        hashlib.sha256(b"verified-visual-evidence").hexdigest(),)
+    assert hashlib.sha256(b"unscoped-evidence").hexdigest() not in {
+        digest for criterion in criteria.values()
+        for digest in criterion.evidence_ref_digests}
+    assert frame.state.task["non_goals"] == ["unrelated refactoring"]
+    assert frame.state.task["domain_tags"] == ["frontend", "accessibility"]
+
+
+def test_laya_candidate_generation_receives_actual_host_framework_ids(monkeypatch):
+    import lib.control.system_one as system_one_module
+
+    received = {}
+    generator_type = system_one_module.BehaviorCandidateGenerator
+
+    class RecordingGenerator:
+        def __init__(self):
+            self.delegate = generator_type()
+
+        def generate(self, *args, **kwargs):
+            received["available_frameworks"] = kwargs["available_frameworks"]
+            return self.delegate.generate(*args, **kwargs)
+
+    monkeypatch.setattr(system_one_module, "BehaviorCandidateGenerator",
+                        RecordingGenerator)
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-host-frameworks", task_id="task-host-frameworks",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0", agent_id="codex",
+        behavioral_subject="task-host-frameworks")
+    service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
+    try:
+        frame = create_system_one_frame_factory(service)(
+            identity, "Render the requested page", ("criterion-visual",),
+            BehaviorState(), RuntimeObservation(
+                action_index=1, equivalent_retry_count=1),
+            CSWBehaviorSnapshot(revision=0), (),
+            {"deliverable_kind": "visual_ui", "criterion_claims": {
+                "criterion-visual": "Render the requested page."}}, ("owl", "fuse"))
+    finally:
+        service.close()
+
+    assert frame is not None
+    assert received["available_frameworks"] == ("owl", "fuse")
+
+
+def test_laya_frame_preserves_authoritative_csw_workflow_facts():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-workflow-facts", task_id="task-workflow-facts",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0", agent_id="codex",
+        behavioral_subject="task-workflow-facts")
+    csw = CSWBehaviorSnapshot(
+        revision=3, active_stateworks=("repair",),
+        eligible_stateworks=(StateWorkOption(
+            "repair", domain="coding", purpose="Repair after inspecting evidence."),),
+        workflow_states={"repair": "INSPECTING"},
+        workflow_previous_states={"repair": "FAILED"},
+        workflow_revisions={"repair": 7},
+        legal_next_states={"repair": ("REPAIRING", "ABORTED")})
+    service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
+    try:
+        frame = create_system_one_frame_factory(service)(
+            identity, "Repair the requested behavior", ("criterion-1",),
+            BehaviorState(cognitive_mode="DIAGNOSE"),
+            RuntimeObservation(action_index=1, equivalent_retry_count=1), csw, (),
+            {"deliverable_kind": "code_behavior", "criterion_claims": {
+                "criterion-1": "Repair the requested behavior."}})
+    finally:
+        service.close()
+
+    workflow, = frame.state.workflows
+    assert workflow.statework_id == "repair"
+    assert workflow.domain == "coding"
+    assert workflow.purpose == "Repair after inspecting evidence."
+    assert workflow.current_state == "INSPECTING"
+    assert workflow.previous_state == "FAILED"
+    assert workflow.revision == 7
+    assert workflow.legal_next_states == ("REPAIRING", "ABORTED")
+    assert workflow.active is True
+    assert workflow.eligible is True
+
+
+def test_dp_wire_round_trips_laya_semantic_inputs():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-1",
+        session_id="session-semantic-wire", task_id="task-semantic-wire",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0", agent_id="codex",
+        behavioral_subject="task-semantic-wire")
+    goals = GoalSetSnapshot(2, (GoalItemSnapshot(
+        "criterion-wire", status="ACTIVE",
+        claim="The host criterion has meaningful text.",
+        evidence_refs=("criterion-evidence",)),))
+    descriptor = ControlSessionDescriptor(
+        identity=identity, objective="Implement the requested change",
+        objective_criteria=("criterion-wire",), initial_goal_set=goals,
+        available_frameworks=(), cfw_authority_identity={},
+        csw_authority_identity={},
+        host_capabilities={"cfw_connected": False, "csw_connected": False},
+        non_goals=("do not reformat unrelated files",))
+    restored_descriptor = ControlSessionDescriptor.from_mapping(descriptor.to_dict())
+    assert restored_descriptor.non_goals == ("do not reformat unrelated files",)
+    assert restored_descriptor.initial_goal_set.items[0].claim == (
+        "The host criterion has meaningful text.")
+    assert restored_descriptor.initial_goal_set.items[0].evidence_refs == (
+        "criterion-evidence",)
+
+    csw = CSWBehaviorSnapshot(
+        revision=5, active_stateworks=("repair",),
+        workflow_states={"repair": "INSPECTING"},
+        workflow_previous_states={"repair": "FAILED"},
+        workflow_revisions={"repair": 9},
+        legal_next_states={"repair": ("REPAIRING",)})
+    observation = RuntimeObservation(
+        action_index=6, goal_set=goals,
+        evidence_refs=("criterion-evidence", "unscoped-evidence"),
+        criterion_evidence_refs={"criterion-wire": ("criterion-evidence",)})
+    request = ControlTickRequest(
+        control_session_id=identity.scope, tick_id="semantic-wire-roundtrip",
+        expected_behavior_revision=3, cfw_lifecycle_revision=0,
+        observation=observation, goal_set=goals, cfw_signals=(), csw_snapshot=csw)
+    restored_request = ControlTickRequest.from_mapping(request.to_dict())
+
+    assert restored_request.observation.criterion_evidence_refs == {
+        "criterion-wire": ("criterion-evidence",)}
+    assert restored_request.csw_snapshot.workflow_previous_states == {
+        "repair": "FAILED"}
+    assert restored_request.csw_snapshot.legal_next_states == {
+        "repair": ("REPAIRING",)}
 
 
 def test_provider_attestation_and_configuration_come_from_capability_handshake():
@@ -169,7 +364,8 @@ def test_system_one_candidate_frame_contains_only_sanitized_upcoming_action():
         segment_id="segment-0", agent_id="codex", behavioral_subject="task-candidate",
     )
     goals = GoalSetSnapshot(4, (GoalItemSnapshot(
-        "criterion-visual", status="READY"),))
+        "criterion-visual", status="READY",
+        claim="Render the requested page at the target viewport."),))
     candidate = ActionCandidate(
         action_class="file_edit",
         proposed_purpose="Implement the requested visual criterion",
@@ -227,7 +423,8 @@ def test_system_one_frame_uses_host_deliverable_and_truthful_optional_counters()
                 actions_since_artifact_change=5,
                 verification_actions_since_artifact_change=2),
             CSWBehaviorSnapshot(revision=0), (),
-            {"task_kind": "deployment"},
+            {"task_kind": "deployment", "criterion_claims": {
+                "criterion-1": "Deploy the service."}},
         )
     finally:
         service.close()
@@ -249,6 +446,7 @@ def test_unbound_diagnostic_candidate_remains_unknown_and_semantic_criteria_prio
         GoalItemSnapshot(
             f"criterion-{index:02d}",
             status="BLOCKED" if index == 20 else "READY",
+            claim=f"Complete requested criterion {index}.",
         ) for index in range(1, 21)))
     candidate = ActionCandidate(
         action_id="diagnostic-read", action_class="read",
@@ -289,7 +487,9 @@ def test_frame_factory_does_not_substitute_an_unplanned_enabled_question():
         subject_ref="repo:example", segment_id="segment-0",
         agent_id="codex", behavioral_subject="task-query-plan")
     goals = GoalSetSnapshot(1, (GoalItemSnapshot(
-        "criterion-visual", status="ACTIVE", equivalent_retry_count=1),))
+        "criterion-visual", status="ACTIVE",
+        claim="Render the requested page at the target viewport.",
+        equivalent_retry_count=1),))
     candidate = ActionCandidate(
         action_id="candidate-query-plan", action_class="file_edit",
         tool_name="apply_patch", operation="edit_file",
@@ -341,7 +541,8 @@ def test_laya_statework_fit_contains_only_bounded_csw_eligible_choices():
             identity, "Repair the requested behavior", ("criterion-1",),
             BehaviorState(cognitive_mode="DIAGNOSE"),
             RuntimeObservation(action_index=1), csw, (),
-            {"deliverable_kind": "code_behavior"})
+            {"deliverable_kind": "code_behavior", "criterion_claims": {
+                "criterion-1": "Repair the requested behavior."}})
     finally:
         service.close()
 
@@ -389,7 +590,9 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         goal_contract_hash="c" * 64,
     )
     goals = GoalSetSnapshot(4, (GoalItemSnapshot(
-        "criterion-visual", status="ACTIVE", actions_since_progress=2),))
+        "criterion-visual", status="ACTIVE",
+        claim="Render the requested page at the target viewport.",
+        actions_since_progress=2),))
     csw = CSWBehaviorSnapshot(
         revision=3, active_stateworks=("repair",), workflow_states={"repair": "INSPECTING"},
         snapshot_id=hashlib.sha256(b"csw-repair").hexdigest(),
@@ -414,7 +617,7 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
             "scope_hash": "a" * 64, "capability_hash": "b" * 64},
         csw_authority_identity={
             "adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-            "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.4.0",
+                "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.6.0",
             "registry_hash": "d" * 64,
             "scope_hash": "b" * 64, "capability_hash": "c" * 64},
         # The host declares real task semantics; DP refuses to guess them.
@@ -495,7 +698,9 @@ def test_semantic_provider_outage_falls_back_to_deterministic_dp(tmp_path):
         subject_ref="repo:example", segment_id="segment-0", agent_id="codex",
         behavioral_subject="task-laya-outage")
     goals = GoalSetSnapshot(1, (GoalItemSnapshot(
-        "criterion-visual", status="ACTIVE", equivalent_retry_count=1),))
+        "criterion-visual", status="ACTIVE",
+        claim="Render the requested page at the target viewport.",
+        equivalent_retry_count=1),))
     observation = RuntimeObservation(
         action_index=1, goal_set=goals, equivalent_retry_count=1,
         criterion_status={"criterion-visual": "in_progress"})
@@ -591,7 +796,9 @@ def test_laya_child_process_termination_during_control_tick_uses_dp_fallback(
         behavioral_subject="task-laya-child", goal_contract_hash="c" * 64,
     )
     goals = GoalSetSnapshot(4, (GoalItemSnapshot(
-        "criterion-visual", status="ACTIVE", actions_since_progress=2),))
+        "criterion-visual", status="ACTIVE",
+        claim="Render the requested page at the target viewport.",
+        actions_since_progress=2),))
     csw = CSWBehaviorSnapshot(
         revision=3, active_stateworks=("repair",),
         workflow_states={"repair": "INSPECTING"},
@@ -625,7 +832,7 @@ def test_laya_child_process_termination_during_control_tick_uses_dp_fallback(
         },
         csw_authority_identity={
             "adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-            "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.4.0",
+            "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.6.0",
             "registry_hash": "d" * 64,
             "scope_hash": "b" * 64, "capability_hash": "c" * 64,
         },

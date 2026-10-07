@@ -24,7 +24,8 @@ from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnsw
                                       SystemOneCapability, SystemOneFrame,
                                       SystemOneIdentity, SystemOneJudgment,
                                       canonical_hash)
-from lib.system_one_learning import SystemOneCalibrationLifecycle
+from lib.system_one_learning import (CalibrationLifecycleError,
+                                     SystemOneCalibrationLifecycle)
 from lib.system_one_runtime import CircuitBreaker, SystemOneRuntime
 from lib.system_one_service import SystemOneService
 
@@ -66,7 +67,8 @@ def frame(*, agent="agent-1", sequence=1, question_ids=("progress_relation",),
               "deliverable_kind": "code_behavior", "task_complexity": "standard",
               "phase": "implementation", "active_segment": "segment-1",
               "active_statework": None, "active_flow": None,
-              "non_goals": ["unrelated refactoring"]},
+              "non_goals": ["unrelated refactoring"],
+              "domain_tags": ["software"]},
         situation={"current_state": "IMPLEMENTED", "blockers": [],
                    "actions_since_goal_progress": 2,
                    "actions_since_artifact_change": 1,
@@ -397,12 +399,22 @@ def calibration_record(question_id="progress_relation", *, status="active"):
         question_id=question_id, backend_id=BACKEND_ID, model_id=MODEL_ID,
         model_revision=MODEL_REVISION, model_content_hash=MODEL_HASH,
         provider_protocol_hash=PROVIDER_HASH, temperature=0.5,
-        minimum_advisory_confidence=0.8, sample_count=100, training_count=80,
-        validation_count=20, training_outcome_digest="d" * 64,
-        validation_outcome_digest="e" * 64, validation_accuracy=0.95,
-        validation_brier=0.05, validation_ece=0.04,
+        minimum_advisory_confidence=0.8, sample_count=100, training_count=60,
+        calibration_count=20, holdout_count=20,
+        training_outcome_digest="d" * 64,
+        calibration_outcome_digest="e" * 64, holdout_outcome_digest="f" * 64,
+        holdout_accuracy=0.95, holdout_brier=0.05, holdout_ece=0.04,
+        holdout_log_loss=0.1,
+        holdout_class_metrics=tuple(
+            (label, 1, 0, 0, 1.0, 1.0)
+            for label in QUESTION_REGISTRY[question_id]["criteria"]),
+        qualification_minimum_accuracy=0.8,
+        qualification_maximum_brier=0.25,
+        qualification_maximum_ece=0.12,
         work_modes=("delivery",), deliverable_kinds=("code_behavior",),
         independent_trajectory_count=30,
+        training_trajectory_count=18, calibration_trajectory_count=6,
+        holdout_trajectory_count=6,
         cohort_counts=(("delivery", "code_behavior", 20),),
         minimum_cohort_trajectories=20,
         minimum_outcomes=20, status=status)
@@ -421,6 +433,21 @@ def test_calibration_is_per_question_family_and_changes_probabilities():
     assert progress.calibrated_probabilities is not None
     assert progress.calibration_hash == bundle.records["progress_relation"].digest
     assert retry.calibrated_probabilities is None
+
+
+def test_advisory_mode_can_enable_only_qualified_question_families():
+    bundle = CalibrationBundle({"progress_relation": calibration_record()})
+    service = SystemOneService(
+        FixedBackend(), mode="advisory", calibration_bundle=bundle,
+        enabled_question_families=("progress_relation", "retry_relation"))
+    try:
+        request = frame(question_ids=("progress_relation", "retry_relation"),
+                        calibration_bundle=bundle)
+        result = service.judge(request)
+        assert result.status == "shadow"
+        assert result.calibrated_question_ids == ("progress_relation",)
+    finally:
+        service.close()
 
 
 def _calibration_events(count=100):
@@ -452,9 +479,12 @@ def _calibration_events(count=100):
                         interaction_id="interaction")
         events.append(SimpleNamespace(
             event_type="system_one_decision", category="decision",
+            actor_id="digitalpsychology_runtime",
+            authority_source="digitalpsychology_system_one",
             payload=payload, timestamp=timestamp.isoformat().replace("+00:00", "Z"), **identity))
         events.append(SimpleNamespace(
             event_type="system_one_outcome", category="validation",
+            actor_id="digitalpsychology_runtime", authority_source="validator",
             payload={"system_one_outcome_for": decision_id,
                      "system_one_outcome_progress_relation": "goal_progress",
                      "system_one_outcome_authority": "validator",
@@ -469,12 +499,24 @@ def test_calibration_uses_later_independent_outcomes_and_fits_temperature():
     events = _calibration_events()
     report = calibration_metrics(events, label="progress_relation")
     assert report["independent_outcomes"] == 100
+    assert report["log_loss"] >= 0
+    assert report["expected_calibration_error"] >= 0
+    assert {item[0] for item in report["per_class"]} == set(
+        QUESTION_REGISTRY["progress_relation"]["criteria"])
     record = calibration_record_from_events(
         events, question_id="progress_relation", minimum_outcomes=100,
         minimum_accuracy=0.99, maximum_brier=0.02, maximum_ece=0.1)
     assert record.status == "candidate"
     assert record.temperature < 1.0
-    assert record.validation_count >= 20
+    assert record.training_count + record.calibration_count + record.holdout_count == 100
+    assert record.calibration_count >= 20
+    assert record.holdout_count >= 20
+    assert (record.training_trajectory_count, record.calibration_trajectory_count,
+            record.holdout_trajectory_count) == (60, 20, 20)
+    assert len({record.training_outcome_digest, record.calibration_outcome_digest,
+                record.holdout_outcome_digest}) == 3
+    assert record.holdout_log_loss >= 0
+    assert record.qualification_passed
 
 
 def test_calibration_rejects_self_labeled_or_nonlater_outcomes():
@@ -486,6 +528,14 @@ def test_calibration_rejects_self_labeled_or_nonlater_outcomes():
     with pytest.raises(ValueError, match="insufficient later independent"):
         calibration_record_from_events(events, question_id="progress_relation",
                                        minimum_outcomes=1)
+
+
+def test_calibration_rejects_outcome_authority_claim_mismatch():
+    events = _calibration_events(count=4)
+    for event in events:
+        if event.event_type == "system_one_outcome":
+            event.authority_source = "agent_prose"
+    assert calibration_metrics(events)["independent_outcomes"] == 0
 
 
 def test_calibration_groups_attempts_and_interactions_into_one_trajectory():
@@ -506,6 +556,10 @@ def test_calibration_groups_attempts_and_interactions_into_one_trajectory():
 def test_calibration_lifecycle_stages_activates_and_exports_active_bundle(tmp_path):
     lifecycle = SystemOneCalibrationLifecycle(tmp_path / "system-one-calibration.json")
     candidate = calibration_record().with_status("candidate")
+    unqualified = replace(candidate, holdout_accuracy=0.5)
+    with pytest.raises(CalibrationLifecycleError, match="holdout gate"):
+        lifecycle.stage(unqualified, expected_revision=0)
+    assert lifecycle.revision() == 0
     staged = lifecycle.stage(candidate, expected_revision=0)
     assert staged["revision"] == 1
     activated = lifecycle.activate(
@@ -517,7 +571,13 @@ def test_calibration_lifecycle_stages_activates_and_exports_active_bundle(tmp_pa
     path_data = json.loads((tmp_path / "system-one-calibration.json").read_text())
     restored = CalibrationBundle.from_mapping(bundle.to_dict())
     assert restored.digest == bundle.digest
+    assert bundle.to_dict()["schema_version"] == "1.2.0"
     assert path_data["revision"] == 2
+    assert path_data["schema_version"] == "2.0.0"
+    legacy = bundle.to_dict()
+    legacy["schema_version"] = "1.1.0"
+    with pytest.raises(ValueError, match="malformed System-1 calibration bundle"):
+        CalibrationBundle.from_mapping(legacy)
 
 
 def test_digital_psychology_service_composes_system_one_without_an_mcp_tool(tmp_path):
@@ -538,6 +598,6 @@ def test_digital_psychology_service_composes_system_one_without_an_mcp_tool(tmp_
 def test_packaged_protocol_schema_is_canonical_copy():
     schema_path = Path(__file__).parents[1] / "lib" / "schemas" / "system-one-protocol.schema.json"
     schema = json.loads(schema_path.read_text())
-    assert schema["protocol_version"] == "2.2.0"
+    assert schema["protocol_version"] == PROTOCOL_VERSION
     assert schema["$defs"]["SystemOneFrame"]["additionalProperties"] is False
     assert schema["x-question-registry"] == QUESTION_REGISTRY

@@ -170,7 +170,7 @@ class ActivityFact:
 class WorkflowFact:
     statework_id: str
     current_state: str
-    progress_class: str
+    progress_class: Optional[str]
     domain: Optional[str] = None
     purpose: Optional[str] = None
     previous_state: Optional[str] = None
@@ -183,13 +183,17 @@ class WorkflowFact:
     normal_path_rank_before: Optional[int] = None
     normal_path_rank_after: Optional[int] = None
     source: str = "csw_authoritative"
+    legal_next_states: Tuple[str, ...] = ()
+    active: bool = False
+    eligible: bool = False
 
     def __post_init__(self) -> None:
-        for name, limit in (("statework_id", 64), ("current_state", 64),
-                            ("progress_class", 32)):
+        for name, limit in (("statework_id", 64), ("current_state", 64)):
             _bounded_text(getattr(self, name), name, limit)
+        if self.progress_class is not None:
+            _bounded_text(self.progress_class, "progress_class", 32)
         if self.progress_class not in {"FORWARD_PROGRESS", "LATERAL", "RECOVERY",
-                                       "INVALIDATION", "REGRESSION", "TERMINAL"}:
+                                       "INVALIDATION", "REGRESSION", "TERMINAL", None}:
             raise ValueError("unsupported StateWork progress class")
         if self.source != "csw_authoritative":
             raise ValueError("workflow facts must have CSW provenance")
@@ -197,12 +201,24 @@ class WorkflowFact:
                             ("edge_id", 128), ("trigger", 64), ("path_class", 64),
                             ("work_class", 64), ("domain_effect", 64)):
             _bounded_text(getattr(self, name), name, limit, optional=True)
+        if not isinstance(self.active, bool) or not isinstance(self.eligible, bool):
+            raise ValueError("workflow active and eligible flags must be boolean")
+        if (not isinstance(self.legal_next_states, (tuple, list))
+                or len(self.legal_next_states) > 16
+                or any(not isinstance(value, str) or not value or len(value) > 128
+                       for value in self.legal_next_states)
+                or len(self.legal_next_states) != len(set(self.legal_next_states))):
+            raise ValueError("legal next states must be a bounded unique sequence")
+        for value in self.legal_next_states:
+            _bounded_text(value, "legal next state", 128)
+        object.__setattr__(self, "legal_next_states", tuple(self.legal_next_states))
 
     def to_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in (
             "statework_id", "domain", "purpose", "current_state", "previous_state", "edge_id",
             "trigger", "path_class", "progress_class", "work_class", "domain_effect",
-            "revision", "normal_path_rank_before", "normal_path_rank_after", "source")}
+            "revision", "normal_path_rank_before", "normal_path_rank_after", "source",
+            "legal_next_states", "active", "eligible")}
 
 
 @dataclass(frozen=True)
@@ -256,7 +272,8 @@ class SemanticState:
 
     def __post_init__(self) -> None:
         required_task = {"objective", "work_mode", "deliverable_kind", "task_complexity", "phase",
-                         "active_segment", "active_statework", "active_flow", "non_goals"}
+                         "active_segment", "active_statework", "active_flow", "non_goals",
+                         "domain_tags"}
         if set(self.task) != required_task:
             raise ValueError("task context does not match the System-1 protocol")
         required_situation = {"current_state", "blockers", "actions_since_goal_progress",
@@ -279,6 +296,12 @@ class SemanticState:
             _bounded_text(self.task[field], field, 64, optional=True)
         if len(self.task["non_goals"]) > 8 or len(self.criteria) > 8 or len(self.activity) > 16:
             raise ValueError("semantic state exceeds projection bounds")
+        domain_tags = self.task["domain_tags"]
+        if (not isinstance(domain_tags, (tuple, list)) or len(domain_tags) > 16
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 128
+                       for item in domain_tags)
+                or len(domain_tags) != len(set(domain_tags))):
+            raise ValueError("task domain tags must be unique bounded text")
         if len(self.workflows) > 8 or len(self.failed_approaches) > 4 or len(self.legal_routes) > 32:
             raise ValueError("semantic state exceeds projection bounds")
 
@@ -417,6 +440,7 @@ class SystemOneFrame:
         task = dict(state_data["task"])
         situation = dict(state_data["situation"])
         task["non_goals"] = tuple(task["non_goals"])
+        task["domain_tags"] = tuple(task["domain_tags"])
         situation["blockers"] = tuple(situation["blockers"])
 
         def criterion(row: Mapping[str, Any]) -> CriterionState:

@@ -5,7 +5,9 @@ from typing import Mapping
 
 from ..behavior_state import BehavioralDecision
 from ..control_protocol import ControlCommitRequest, ControlSessionDescriptor
-from ..host.dependency_closure import expected_csw_active_stateworks
+from cognitive_runtime_core.integrations.triad.dependency_closure import (
+    expected_csw_active_stateworks,
+)
 
 
 def validate_applied_authorities(decision: BehavioralDecision,

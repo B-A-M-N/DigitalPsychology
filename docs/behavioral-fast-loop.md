@@ -142,6 +142,7 @@ from digital_psychology import CFWRuntimeAdapter, RuntimeHost
 from digital_psychology.runtime.adapters import CSWRuntimeAdapter
 from digital_psychology.mcp_server import DigitalPsychologyService
 from digital_psychology.system_one_service import SystemOneService
+from digital_psychology_adapter import CFWBehaviorAdapter
 
 system_one = SystemOneService.from_environment()
 service = DigitalPsychologyService(
@@ -155,7 +156,8 @@ session = host.open_session(
     identity=runtime_identity,
     objective="Render the requested page",
     objective_criteria=("criterion-visual",),
-    cfw=CFWRuntimeAdapter(cfw_task.digital_psychology_adapter()),
+    cfw=CFWRuntimeAdapter(
+        cfw_task.create_component_adapter(CFWBehaviorAdapter)),
     csw=CSWRuntimeAdapter(csw_authority, identity=runtime_identity,
                            bindings=csw_workflow_bindings),
     outcome_evidence_authority=host_evidence_authority,

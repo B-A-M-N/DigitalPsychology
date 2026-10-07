@@ -299,6 +299,7 @@ class LayaProvider:
         path = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_PATH", "")
         revision = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION", "")
         content_hash = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256", "")
+        model_id = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_ID", model_id)
         if not path or not revision or not content_hash:
             raise ValueError(
                 "Laya requires DIGITALPSYCHOLOGY_LAYA_MODEL_PATH, "

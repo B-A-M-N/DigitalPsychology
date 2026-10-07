@@ -1,0 +1,34 @@
+{
+  "schema_version": "laya-shadow-smoke/v1",
+  "trial_id": "laya-shadow-checkpoint-smoke-20261007",
+  "observed_on_utc": "2026-10-07",
+  "scope": "local checkpoint and SystemOneService shadow-path smoke",
+  "synthetic_frame": true,
+  "harness_turn": false,
+  "provider": {
+    "backend_id": "digitalpsychology-laya-native",
+    "model_id": "laya-typed-decisions",
+    "model_revision": "1a793eb568e6718f15941d08f85432581df534e3",
+    "model_content_sha256": "cda55a3e793f4c4268a25066ceb1568aa302fd210d96656e3032756fd722b642",
+    "provider_protocol_sha256": "6db0ed722d297b89728e2ea4d141392272634c8570c198223c9446808884380a",
+    "laya_library_version": "0.3.22",
+    "device": "cpu"
+  },
+  "result": {
+    "mode": "shadow",
+    "status": "shadow",
+    "reason": "shadow_mode",
+    "question_id": "progress_relation",
+    "selected_label": "verification_progress",
+    "calibrated": false,
+    "calibrated_question_ids": [],
+    "latency_ms": 12260
+  },
+  "provider_warning": "laya: this checkpoint ships invalid temperatures or values outside [0.5, 5]; using choice:11+=0.10058280825614929 -> 0.5. Treat confidence from the affected entries as uncalibrated.",
+  "limitations": [
+    "One synthetic host-grounded frame; no real agent task was observed.",
+    "No independent ground-truth outcome was available for this judgment.",
+    "No calibration record was loaded, so the answer remained in shadow mode.",
+    "This smoke verifies checkpoint loading and typed provider output only; it does not establish semantic accuracy, calibration, policy influence, or efficacy."
+  ]
+}

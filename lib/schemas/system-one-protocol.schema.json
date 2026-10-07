@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://cognitivestateframeworks.dev/contracts/system-one-protocol.schema.json",
-  "title": "CFW System-1 protocol",
+  "$id": "https://digitalpsychology.dev/contracts/laya-semantic-protocol.schema.json",
+  "title": "DigitalPsychology Laya semantic protocol",
   "type": "object",
-  "protocol_version": "2.2.0",
+  "protocol_version": "2.5.0",
   "x-question-registry": {
     "action_relation": {
       "family": "action_relation",
@@ -352,10 +352,9 @@
         "normal_path_rank_before",
         "normal_path_rank_after",
         "source",
-        "subject_ref",
-        "engine_kind",
-        "step_id",
-        "completed"
+        "legal_next_states",
+        "active",
+        "eligible"
       ],
       "properties": {
         "statework_id": {
@@ -414,7 +413,12 @@
           "maxLength": 64
         },
         "progress_class": {
+          "type": [
+            "string",
+            "null"
+          ],
           "enum": [
+            null,
             "FORWARD_PROGRESS",
             "LATERAL",
             "RECOVERY",
@@ -461,33 +465,14 @@
         "source": {
           "const": "csw_authoritative"
         },
-        "subject_ref": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "maxLength": 256
+        "legal_next_states": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
         },
-        "engine_kind": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "maxLength": 64
-        },
-        "step_id": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "maxLength": 128
-        },
-        "completed": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        }
+        "active": {"type": "boolean"},
+        "eligible": {"type": "boolean"}
       },
       "additionalProperties": false
     },
@@ -586,7 +571,8 @@
             "active_segment",
             "active_statework",
             "active_flow",
-            "non_goals"
+            "non_goals",
+            "domain_tags"
           ],
           "properties": {
             "objective": {
@@ -644,6 +630,16 @@
               "items": {
                 "type": "string",
                 "maxLength": 256
+              }
+            },
+            "domain_tags": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
               }
             }
           },

@@ -40,8 +40,9 @@ class FastLoopInput:
     intervention_assessments: tuple[InterventionOutcome, ...] = ()
     approach_epoch: str = ""
     policy_context: Mapping[str, Any] = field(default_factory=dict)
-    available_frameworks: tuple[str, ...] = (
-        "owl", "anchor", "fuse", "ward", "flow", "sispis", "dox")
+    # A host must declare connected CFW components. Absence means DP has no
+    # framework actuators available; never assume the full CFW installation.
+    available_frameworks: tuple[str, ...] = ()
     cfw_suppression_modes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

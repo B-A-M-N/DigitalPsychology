@@ -32,6 +32,8 @@ class HostProjectionManager:
             "csw_connected": self.host.csw is not None,
             "outcome_evidence_connected": self.host.outcome_evidence_connected,
             "host_initiated": True,
+            "harness_adapter_identity": (
+                self.host.harness_adapter_identity.to_dict()),
             "policy_context": {
                 **dict(self.host.host_policy_context),
                 "host_has_stable_objective_context": (
@@ -80,6 +82,7 @@ class HostProjectionManager:
             cfw_authority_identity=self.host._cfw_authority_identity(),
             csw_authority_identity=self.host._csw_identity,
             host_capabilities=capabilities,
+            non_goals=self.host.non_goals,
         )
 
     def _project_model_context(self, context: str, projection: Any) -> str:

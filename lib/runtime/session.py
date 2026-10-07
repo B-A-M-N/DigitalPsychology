@@ -197,7 +197,7 @@ class RuntimeSession:
                     self.identity, self.objective,
                     (attention.lease.criterion_ids if attention and attention.lease else ()),
                     record.state, observation, snapshot, signals,
-                    self.policy_context)
+                    self.policy_context, available_frameworks)
                 if frame is not None and not isinstance(frame, SystemOneFrame):
                     raise TypeError("System-1 frame factory must return a validated frame")
                 if frame is not None:
@@ -839,6 +839,7 @@ class RuntimeSession:
             directives=directives,
             preferred_stateworks=tuple(raw.get("preferred_stateworks") or ()),
             intervention_outcomes=outcomes, reason=str(raw.get("reason") or ""),
+            selected_candidate_id=raw.get("selected_candidate_id"),
         )
 
     @staticmethod
@@ -856,6 +857,7 @@ class RuntimeSession:
             preferred_stateworks=decision.preferred_stateworks,
             intervention_outcomes=decision.intervention_outcomes,
             reason=decision.reason,
+            selected_candidate_id=decision.selected_candidate_id,
         )
 
     @staticmethod

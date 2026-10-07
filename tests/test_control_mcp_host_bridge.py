@@ -24,6 +24,8 @@ from lib.system_one_service import SystemOneService
 from lib.telemetry.production_metrics import ProductionMetrics
 from lib.runtime import (ActionCandidate, CFWRuntimeAdapter, RuntimeIdentity,
                          RuntimeObservation)
+from lib.runtime.harness import (HARNESS_ADAPTER_PROTOCOL_VERSION,
+                                 HarnessAdapterIdentity, HarnessCapabilities)
 from lib.runtime.cfw_projection import build_cfw_behavior_projection
 
 
@@ -196,7 +198,7 @@ class _CSWPort:
 
     def authority_identity(self):
         return {"adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-                "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.4.0",
+                "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.6.0",
                 "registry_hash": "d" * 64,
                 "scope_hash": "b" * 64, "capability_hash": "c" * 64}
 
@@ -296,7 +298,8 @@ def _identity(task_id="control-mcp-task"):
 
 def _goal_set(revision=1):
     return GoalSetSnapshot(revision=revision, items=(GoalItemSnapshot(
-        criterion_id="criterion-visual", status="READY"),))
+        criterion_id="criterion-visual", status="READY",
+        claim="Render the requested page at the target viewport."),))
 
 
 class _CapturingControlClient(InProcessControlClient):
@@ -402,6 +405,34 @@ def _bridge(tmp_path, *, identity, goal_set, cfw_port, csw_port, client=None,
     )
 
 
+def test_harness_identity_is_pinned_and_same_open_session_pin_is_idempotent(tmp_path):
+    async def run():
+        harness = HarnessAdapterIdentity(
+            harness_id="codex-app-server", adapter_version="1.0.0",
+            host_version="codex-cli 0.160.0",
+            protocol_version=HARNESS_ADAPTER_PROTOCOL_VERSION,
+            capabilities=HarnessCapabilities(pre_action=True, post_action=True),
+            catalog_pin={"catalog_version": "test"}, verified=False)
+        bridge = _bridge(
+            tmp_path, identity=_identity("harness-pin-task"),
+            goal_set=_goal_set(), cfw_port=_CFWPort(), csw_port=_CSWPort())
+
+        assert bridge.bind_harness_adapter_identity(harness.to_dict()) == harness.to_dict()
+        await bridge.open()
+        persisted = bridge._session_descriptor.host_capabilities[
+            "harness_adapter_identity"]
+        assert persisted == harness.to_dict()
+        assert bridge.bind_harness_adapter_identity(persisted) == persisted
+
+        conflicting = dict(harness.to_dict())
+        conflicting["harness_id"] = "another-harness"
+        with pytest.raises(RuntimeError, match="before DP session open"):
+            bridge.bind_harness_adapter_identity(conflicting)
+        await bridge.close()
+
+    asyncio.run(run())
+
+
 class _UnavailableControlClient:
     async def start(self):
         raise MCPControlUnavailable("server unavailable")
@@ -473,7 +504,9 @@ def test_dp_mcp_outage_keeps_host_runtime_usable(tmp_path):
 def test_dp_host_bridge_subsystem_matrix(tmp_path, cfw_connected, csw_connected):
     async def run():
         goals = GoalSetSnapshot(1, (GoalItemSnapshot(
-            "criterion-visual", status="READY", equivalent_retry_count=2),))
+            "criterion-visual", status="READY",
+            claim="Render the requested page at the target viewport.",
+            equivalent_retry_count=2),))
         cfw = _CFWPort() if cfw_connected else None
         csw = _CSWPort() if csw_connected else None
         if cfw is not None:

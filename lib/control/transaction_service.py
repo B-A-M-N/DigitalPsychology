@@ -23,6 +23,7 @@ from ..control_protocol import (PROTOCOL_VERSION, ControlAbortRequest,
                                 parse_csw_snapshot, parse_goal_set)
 from ..telemetry.trace_builder import (build_committed_action_trace,
                                        build_control_transition_trace)
+from ..telemetry.production_metrics import QUESTION_FAMILIES
 from .authority_receipts import validate_applied_authorities
 
 _LOG = logging.getLogger(__name__)
@@ -36,6 +37,115 @@ def _record_metric(self: Any, operation: str, *args: Any) -> None:
             method(*args)
         except Exception:
             _LOG.warning("could not persist a production metric", exc_info=True)
+
+
+def _record_laya_event(self: Any, event: str, *, amount: int = 1,
+                       question_families: Sequence[str] = ()) -> None:
+    metrics = getattr(self, "production_metrics", None)
+    method = getattr(metrics, "record_laya_event", None)
+    if callable(method):
+        try:
+            method(event, amount=amount)
+            family_method = getattr(metrics, "record_laya_family_event", None)
+            if callable(family_method):
+                for family in sorted(set(question_families) & set(QUESTION_FAMILIES)):
+                    family_method(event, question_family=family, amount=amount)
+        except Exception:
+            _LOG.warning("could not persist a Laya production metric", exc_info=True)
+
+
+def _record_laya_preparation_metrics(self: Any, preparation: Any,
+                                     prior_state: BehaviorState) -> None:
+    """Record bounded provider, causal-influence, and intervention counters."""
+    frame = dict(preparation.system_one_frame or {})
+    families = tuple(sorted({
+        str(item.get("question_id"))
+        for item in frame.get("questions", ())
+        if isinstance(item, Mapping) and item.get("question_id") in QUESTION_FAMILIES
+    }))
+    if preparation.system_one_query_attempted:
+        _record_laya_event(self, "opportunity", question_families=families)
+        _record_laya_event(self, "attempt", question_families=families)
+        result = dict(preparation.system_one_result or {})
+        status = result.get("status")
+        if status in {"ok", "shadow"}:
+            _record_laya_event(self, "valid", question_families=families)
+        if status == "shadow":
+            _record_laya_event(self, "shadow", question_families=families)
+        elif status in {"unavailable", "rejected", "stale"}:
+            _record_laya_event(self, "failure", question_families=families)
+        reason = str(result.get("reason") or "").lower()
+        if "timeout" in reason or "deadline" in reason:
+            _record_laya_event(self, "timeout", question_families=families)
+        if result.get("cache_hit") is True:
+            _record_laya_event(self, "cache_hit", question_families=families)
+        latency = result.get("latency_ms")
+        if isinstance(latency, (int, float)) and not isinstance(latency, bool):
+            _record_metric(self, "observe_duration", "laya_query_latency_ms",
+                           float(latency))
+        if preparation.semantic_judgment_used:
+            _record_laya_event(self, "advisory", question_families=families)
+        else:
+            _record_metric(self, "increment", "laya_fallbacks")
+
+    receipt = preparation.semantic_influence_receipt
+    influence_families = (
+        tuple(item for item in receipt.question_ids if item in QUESTION_FAMILIES)
+        if receipt is not None else ())
+    if receipt is not None and receipt.influenced:
+        _record_laya_event(self, "influenced_decision",
+                           question_families=influence_families)
+        if receipt.changed_selection:
+            _record_laya_event(self, "candidate_change",
+                               question_families=influence_families)
+        if receipt.changed_mode:
+            _record_laya_event(self, "mode_change",
+                               question_families=influence_families)
+        if receipt.changed_frameworks:
+            _record_laya_event(self, "framework_change",
+                               amount=len(receipt.changed_frameworks),
+                               question_families=influence_families)
+        if receipt.changed_statework_preference:
+            _record_laya_event(self, "statework_change",
+                               question_families=influence_families)
+
+
+def _record_laya_commit_metrics(self: Any, basis: Mapping[str, Any],
+                                prior_state: BehaviorState,
+                                decision: BehavioralDecision) -> None:
+    """Count influenced interventions and their outcomes only after commit."""
+    raw_receipt = basis.get("semantic_influence_receipt")
+    if not isinstance(raw_receipt, Mapping):
+        return
+    receipt = dict(raw_receipt)
+    receipt_id = receipt.get("receipt_id")
+    if not isinstance(receipt_id, str) or not receipt_id:
+        return
+    families = tuple(
+        item for item in receipt.get("question_ids", ())
+        if isinstance(item, str) and item in QUESTION_FAMILIES)
+    influenced = any(receipt.get(name) is True for name in (
+        "changed_selection", "changed_mode", "changed_statework_preference"))
+    influenced = influenced or bool(receipt.get("changed_frameworks"))
+    if not influenced:
+        return
+    old_ids = {item.intervention_id for item in prior_state.active_interventions}
+    new_influenced = tuple(
+        item for item in decision.state.active_interventions
+        if item.intervention_id not in old_ids
+        and item.semantic_influence_receipt_id == receipt_id)
+    if new_influenced:
+        _record_laya_event(self, "intervention_created", amount=len(new_influenced),
+                           question_families=families)
+    for outcome in decision.intervention_outcomes:
+        if outcome.semantic_influence_receipt_id != receipt_id:
+            continue
+        if outcome.outcome == "effective":
+            _record_laya_event(self, "intervention_effective",
+                               question_families=families)
+        elif outcome.outcome in {"ineffective", "regressed"}:
+            _record_laya_event(self, "intervention_ineffective",
+                               question_families=families)
 
 
 def _measure(metric_name: str):
@@ -139,6 +249,7 @@ def _decision_from_mapping(value: Mapping[str, Any], *,
         intervention_outcomes=tuple(InterventionOutcome.from_mapping(item)
                                     for item in data.get("intervention_outcomes") or ()),
         reason=str(data.get("reason") or "no behavioral change required"),
+        selected_candidate_id=data.get("selected_candidate_id"),
     )
 
 
@@ -178,12 +289,7 @@ class ControlTransactionMethods:
             raise RuntimeError("control tick behavior revision is stale")
 
         preparation = self.engine.prepare(descriptor, record, request)
-        if preparation.system_one_query_attempted:
-            _record_metric(self, "increment", "laya_query_attempts")
-            if preparation.system_one_judgment_returned:
-                _record_metric(self, "increment", "laya_advisory_results")
-            if not preparation.semantic_judgment_used:
-                _record_metric(self, "increment", "laya_fallbacks")
+        _record_laya_preparation_metrics(self, preparation, record.state)
         if preparation.starvation_prevented:
             _record_metric(self, "increment", "starvation_prevention_events",
                            len(preparation.starvation_prevented))
@@ -301,6 +407,9 @@ class ControlTransactionMethods:
             "semantic_judgment_returned": preparation.system_one_judgment_returned,
             "semantic_judgment_used": preparation.semantic_judgment_used,
             "semantic_query_failed": preparation.system_one_query_failed,
+            "semantic_influence_receipt": (
+                preparation.semantic_influence_receipt.to_dict()
+                if preparation.semantic_influence_receipt is not None else None),
             "model_projection_digest": model_projection.model.semantic_digest,
             "behavioral_facts": {
                 "active_trigger_codes": list(request.observation.active_trigger_codes),
@@ -442,6 +551,12 @@ class ControlTransactionMethods:
         application_events, outcome_events, receipts = self._application_records(
             descriptor, record.state, decision, request.applied_directive_ids)
         event_values = application_events + outcome_events
+        prepare_system_one_event = getattr(
+            self.decision_service, "prepare_system_one_decision_event", None)
+        if callable(prepare_system_one_event):
+            system_one_event = prepare_system_one_event(descriptor, basis)
+            if system_one_event is not None:
+                event_values.append(system_one_event)
         result = {
             "protocol_version": PROTOCOL_VERSION,
             "control_session_id": scope,
@@ -464,6 +579,9 @@ class ControlTransactionMethods:
                                        for item in application_events],
             "outcome_event_ids": [str(item["event_id"])
                                   for item in outcome_events],
+            "system_one_decision_event_ids": [
+                str(item["event_id"]) for item in event_values
+                if item.get("event_type") == "system_one_decision"],
             "commit_digest": commit_digest,
         }
         action_trace = (build_committed_action_trace(
@@ -489,6 +607,7 @@ class ControlTransactionMethods:
                                      if action_trace is not None else None),
             behavioral_control_transition=transition_trace,
         )
+        _record_laya_commit_metrics(self, basis, record.state, decision)
         _record_metric(self, "increment", "control_ticks_committed")
         previous_lease = record.state.attention_lease
         current_lease = committed_state.attention_lease

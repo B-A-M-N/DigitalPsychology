@@ -29,10 +29,11 @@ class SystemOneService:
                                                     for question in enabled):
             raise ValueError("enabled question families must be registered and unique")
         records = calibration_bundle.records if calibration_bundle else {}
-        if mode == "advisory" and (not records or any(
-                question not in records or records[question].status != "active"
-                or records[question].drift_status != "clear" for question in enabled)):
-            raise ValueError("advisory mode requires active calibration for every enabled question")
+        if mode == "advisory" and not any(
+                question in records and records[question].status == "active"
+                and records[question].drift_status == "clear" for question in enabled):
+            raise ValueError(
+                "advisory mode requires at least one active enabled question family")
         self.mode = mode
         capability = backend.capability()
         self.enabled_question_families = enabled

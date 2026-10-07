@@ -362,6 +362,9 @@ class InterventionEvaluator:
             target_criteria=intervention.target_criteria,
             task_set_outcome=task_set_outcome,
             preventive_utility=preventive_utility,
+            semantic_decision_refs=intervention.semantic_decision_refs,
+            semantic_influence_receipt_id=(
+                intervention.semantic_influence_receipt_id),
         )
 
     @staticmethod

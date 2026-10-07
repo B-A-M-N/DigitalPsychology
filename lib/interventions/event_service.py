@@ -53,6 +53,9 @@ class InterventionEventService:
             "behavior_condition_id": intervention.condition_id,
             "behavior_condition_basis_digest": intervention.condition_basis_digest,
             "behavior_recovery_epoch_id": intervention.recovery_epoch_id,
+            "semantic_decision_refs": list(intervention.semantic_decision_refs),
+            "semantic_influence_receipt_id": (
+                intervention.semantic_influence_receipt_id),
         }
         return self._build_event(
             event_context, category="decision", event_type="behavior_intervention_applied",
@@ -83,6 +86,9 @@ class InterventionEventService:
             "behavior_intervention_verification_quality": outcome.verification_quality,
             "behavior_condition_id": outcome.condition_id,
             "behavior_condition_basis_digest": outcome.condition_basis_digest,
+            "semantic_decision_refs": list(outcome.semantic_decision_refs),
+            "semantic_influence_receipt_id": (
+                outcome.semantic_influence_receipt_id),
         }
         return self._build_event(
             event_context, category="validation", event_type="behavior_intervention_assessed",
@@ -96,6 +102,8 @@ class InterventionEventService:
         allowed = {
             ("decision", "behavior_intervention_applied",
              "digitalpsychology_runtime", "digitalpsychology_runtime"),
+            ("decision", "system_one_decision",
+             "digitalpsychology_runtime", "digitalpsychology_system_one"),
             ("validation", "behavior_intervention_assessed",
              "digitalpsychology_runtime", "host_outcome_evaluator"),
         }

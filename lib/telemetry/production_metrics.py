@@ -27,6 +27,20 @@ COUNTERS = (
     "starvation_prevention_events",
     "criterion_local_recoveries",
     "global_blocked_transitions",
+    "laya_query_opportunities",
+    "laya_valid_results",
+    "laya_shadow_results",
+    "laya_failures",
+    "laya_timeouts",
+    "laya_cache_hits",
+    "laya_influenced_decisions",
+    "laya_influenced_interventions",
+    "laya_influenced_candidate_changes",
+    "laya_influenced_mode_changes",
+    "laya_influenced_framework_changes",
+    "laya_influenced_statework_changes",
+    "laya_influenced_intervention_effective",
+    "laya_influenced_intervention_ineffective",
 )
 
 TIMERS = (
@@ -35,6 +49,53 @@ TIMERS = (
     "reconciliation_duration_ms",
     "degraded_period_duration_ms",
     "dp_outage_duration_ms",
+    "laya_query_latency_ms",
+)
+
+# Laya's telemetry dimensions are deliberately finite.  The per-family
+# counters are generated from these fixed allowlists, never from caller text.
+QUESTION_FAMILIES = (
+    "action_relation",
+    "progress_relation",
+    "retry_relation",
+    "goal_drift",
+    "route_preference",
+)
+
+LAYA_EVENTS = {
+    # An opportunity is a planner-emitted System-1 frame; an attempt is a
+    # provider call made for that opportunity.
+    "opportunity": "laya_query_opportunities",
+    "attempt": "laya_query_attempts",
+    "valid": "laya_valid_results",
+    "shadow": "laya_shadow_results",
+    "advisory": "laya_advisory_results",
+    "failure": "laya_failures",
+    "timeout": "laya_timeouts",
+    "cache_hit": "laya_cache_hits",
+    "influenced_decision": "laya_influenced_decisions",
+    "intervention_created": "laya_influenced_interventions",
+    "candidate_change": "laya_influenced_candidate_changes",
+    "mode_change": "laya_influenced_mode_changes",
+    "framework_change": "laya_influenced_framework_changes",
+    "statework_change": "laya_influenced_statework_changes",
+    "intervention_effective": "laya_influenced_intervention_effective",
+    "intervention_ineffective": "laya_influenced_intervention_ineffective",
+}
+
+_FAMILY_EVENT_COUNTERS = {
+    (family, event): f"laya_question_{family}_{event}"
+    for family in QUESTION_FAMILIES
+    for event in LAYA_EVENTS
+}
+COUNTERS = COUNTERS + tuple(_FAMILY_EVENT_COUNTERS.values())
+
+# Each observation is stored in exactly one bucket.  Percentiles are reported
+# as the selected bucket's upper bound; the final bucket is a saturation bound
+# for durations at or above 60 seconds.  This keeps storage constant-sized.
+_LAYA_LATENCY_BUCKET_UPPER_BOUNDS_MS = (
+    1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000,
+    10_000, 30_000, 60_000,
 )
 
 _PERIODS = {
@@ -92,6 +153,13 @@ class ProductionMetrics:
                     name TEXT PRIMARY KEY,
                     started_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS production_metric_timer_buckets (
+                    name TEXT NOT NULL,
+                    bucket_index INTEGER NOT NULL
+                        CHECK(bucket_index >= 0 AND bucket_index < 15),
+                    count INTEGER NOT NULL CHECK(count >= 0),
+                    PRIMARY KEY(name, bucket_index)
+                );
             """)
 
     @contextmanager
@@ -127,12 +195,78 @@ class ProductionMetrics:
         if not math.isfinite(value) or value < 0:
             raise ValueError("production metric duration must be finite and non-negative")
         with self._connect() as database:
+            if name == "laya_query_latency_ms":
+                database.execute("BEGIN IMMEDIATE")
             database.execute(
                 "INSERT INTO production_metric_timers(name,count,total_ms,max_ms) "
                 "VALUES(?,1,?,?) ON CONFLICT(name) DO UPDATE SET "
                 "count=count+1,total_ms=total_ms+excluded.total_ms,"
                 "max_ms=MAX(max_ms,excluded.max_ms)",
                 (name, value, value))
+            if name == "laya_query_latency_ms":
+                bucket_index = next(
+                    (index for index, upper_bound in enumerate(
+                        _LAYA_LATENCY_BUCKET_UPPER_BOUNDS_MS)
+                     if value <= upper_bound),
+                    len(_LAYA_LATENCY_BUCKET_UPPER_BOUNDS_MS) - 1)
+                database.execute(
+                    "INSERT INTO production_metric_timer_buckets"
+                    "(name,bucket_index,count) VALUES(?,?,1) "
+                    "ON CONFLICT(name,bucket_index) DO UPDATE SET "
+                    "count=count+1", (name, bucket_index))
+                database.commit()
+
+    def record_laya_event(self, event: str, *, question_family: str | None = None,
+                          amount: int = 1) -> None:
+        """Record a Laya event globally and, when supplied, by fixed question family.
+
+        ``event`` is one of ``LAYA_EVENTS``.  Family breakdowns use the same
+        event vocabulary and are bounded to ``QUESTION_FAMILIES``. An
+        ``opportunity`` is a planner-emitted System-1 frame; ``attempt`` counts
+        provider calls and may therefore be lower than opportunities.
+        """
+        try:
+            global_counter = LAYA_EVENTS[event]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("Laya production event is not allowlisted") from exc
+        if type(amount) is not int or amount < 0:
+            raise ValueError("production metric increment must be a non-negative integer")
+        counters = [global_counter]
+        if question_family is not None:
+            try:
+                counters.append(_FAMILY_EVENT_COUNTERS[(question_family, event)])
+            except (KeyError, TypeError) as exc:
+                raise ValueError("Laya question family is not allowlisted") from exc
+        with self._connect() as database:
+            if len(counters) > 1:
+                database.execute("BEGIN IMMEDIATE")
+            for counter in counters:
+                database.execute(
+                    "INSERT INTO production_metric_counters(name,value) VALUES(?,?) "
+                    "ON CONFLICT(name) DO UPDATE SET value=value+excluded.value",
+                    (counter, amount))
+            if len(counters) > 1:
+                database.commit()
+
+    def record_laya_family_event(self, event: str, *, question_family: str,
+                                 amount: int = 1) -> None:
+        """Record one question's contribution without incrementing a global total.
+
+        Use this when a frame contains several distinct questions: record the
+        frame-level global event once with :meth:`record_laya_event`, then
+        record each question-family breakdown here.
+        """
+        try:
+            counter = _FAMILY_EVENT_COUNTERS[(question_family, event)]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("Laya event or question family is not allowlisted") from exc
+        if type(amount) is not int or amount < 0:
+            raise ValueError("production metric increment must be a non-negative integer")
+        with self._connect() as database:
+            database.execute(
+                "INSERT INTO production_metric_counters(name,value) VALUES(?,?) "
+                "ON CONFLICT(name) DO UPDATE SET value=value+excluded.value",
+                (counter, amount))
 
     def begin_period(self, name: str) -> bool:
         try:
@@ -197,11 +331,42 @@ class ProductionMetrics:
                            for name, count, total, maximum in database.execute(
                                "SELECT name,count,total_ms,max_ms "
                                "FROM production_metric_timers")})
+            laya_timer = timers["laya_query_latency_ms"]
+            histogram = {int(index): int(count) for index, count in database.execute(
+                "SELECT bucket_index,count FROM production_metric_timer_buckets "
+                "WHERE name='laya_query_latency_ms'")}
+            laya_timer.update(_laya_latency_summary(laya_timer, histogram))
             active_periods = {str(name): True for (name,) in database.execute(
                 "SELECT name FROM production_metric_periods")}
         return {"counters": counters, "timers": timers,
                 "active_periods": active_periods}
 
 
-__all__ = ["COUNTERS", "TIMERS", "ProductionMetrics",
+def _laya_latency_summary(timer: dict[str, Any], histogram: dict[int, int]
+                          ) -> dict[str, float | int | bool | None]:
+    """Summarize Laya latency; p50/p95 are fixed-bucket upper-bound estimates."""
+    count = int(timer["count"])
+    mean = float(timer["total_ms"]) / count if count else 0.0
+
+    def percentile(fraction: float) -> tuple[int | None, bool]:
+        if not count:
+            return None, False
+        rank = math.ceil(count * fraction)
+        seen = 0
+        for index, upper_bound in enumerate(_LAYA_LATENCY_BUCKET_UPPER_BOUNDS_MS):
+            seen += histogram.get(index, 0)
+            if seen >= rank:
+                return upper_bound, index == len(_LAYA_LATENCY_BUCKET_UPPER_BOUNDS_MS) - 1
+        # A mismatched histogram should be visible as unavailable rather than
+        # silently reporting a plausible percentile.
+        return None, False
+
+    p50, p50_saturated = percentile(0.50)
+    p95, p95_saturated = percentile(0.95)
+    return {"mean_ms": mean, "p50_ms": p50, "p95_ms": p95,
+            "p50_saturated": p50_saturated, "p95_saturated": p95_saturated}
+
+
+__all__ = ["COUNTERS", "TIMERS", "QUESTION_FAMILIES", "LAYA_EVENTS",
+           "ProductionMetrics",
            "default_production_metrics_path"]

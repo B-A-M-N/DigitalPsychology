@@ -238,9 +238,11 @@ class DirectiveBuilder:
             decision_id = "decision-" + self.digest({
                 "scope": context.scope, "revision": original.revision,
                 "state": working.to_dict(), "directives": [item.to_dict() for item in directives],
+                "selected_candidate_id": selected_candidate.candidate_id,
             })[:24]
             return BehavioralDecision(
                 decision_id=decision_id, scope=context.scope,
                 expected_revision=original.revision, state=working,
                 directives=tuple(directives), preferred_stateworks=tuple(preference),
-                intervention_outcomes=tuple(outcomes), reason=reason)
+                intervention_outcomes=tuple(outcomes), reason=reason,
+                selected_candidate_id=selected_candidate.candidate_id)

@@ -186,6 +186,7 @@ class RuntimeObservation:
     candidate_rejection_stage: str | None = None
     cfw_preflight_decision: str | None = None
     cfw_final_decision: str | None = None
+    criterion_evidence_refs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.action_index, int) or self.action_index < 0:
@@ -298,7 +299,7 @@ class RuntimeObservation:
         # carry independently produced evidence references.
         if self.candidate_action is not None and (
                 self.progress_made or self.regression_observed or self.artifact_changed
-                or self.evidence_refs):
+                or self.evidence_refs or self.criterion_evidence_refs):
             raise ValueError("candidate observations cannot claim action outcomes")
         statuses = dict(self.criterion_status)
         if len(statuses) > MAX_GOAL_CRITERIA or any(
@@ -329,6 +330,26 @@ class RuntimeObservation:
                            for item in values)):
                 raise ValueError(f"{name} must be a bounded sequence of unique strings")
             object.__setattr__(self, name, tuple(values))
+        scoped_refs = self.criterion_evidence_refs
+        if not isinstance(scoped_refs, Mapping) or len(scoped_refs) > 256:
+            raise ValueError("criterion evidence map must be bounded")
+        known_criteria = ({item.criterion_id for item in self.goal_set.items}
+                          if self.goal_set is not None else set(statuses))
+        normalized_refs = {}
+        for criterion_id, refs in scoped_refs.items():
+            if criterion_id not in known_criteria:
+                raise ValueError("criterion evidence references an unknown criterion")
+            if (not isinstance(refs, (tuple, list)) or len(refs) > 8
+                    or any(not isinstance(ref, str) or not ref or len(ref) > 256
+                           for ref in refs)
+                    or len(refs) != len(set(refs))):
+                raise ValueError("criterion evidence references are malformed")
+            if not set(refs).issubset(set(self.evidence_refs)):
+                raise ValueError("criterion evidence must be included in host evidence refs")
+            if refs:
+                normalized_refs[criterion_id] = tuple(refs)
+        object.__setattr__(self, "criterion_evidence_refs",
+                           MappingProxyType(normalized_refs))
 
 
 class CFWComponentPort(Protocol):
@@ -424,7 +445,7 @@ class CSWWorkflowPort(Protocol):
 SystemOneFrameFactory = Callable[[RuntimeIdentity, str, Sequence[str], BehaviorState,
                                   RuntimeObservation, CSWBehaviorSnapshot,
                                   Sequence[FrameworkSignal],
-                                  Mapping[str, Any]], SystemOneFrame]
+                                  Mapping[str, Any], Sequence[str]], SystemOneFrame]
 
 
 class BehavioralDecisionService(Protocol):

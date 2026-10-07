@@ -128,7 +128,8 @@ def create_system_one_frame_factory(system_one_service: Any):
               attention_criteria: Sequence[str], behavior_state: BehaviorState,
               observation: RuntimeObservation, csw: CSWBehaviorSnapshot,
               cfw_signals: Sequence[FrameworkSignal],
-              policy_context: Mapping[str, Any] | None = None) -> SystemOneFrame | None:
+              policy_context: Mapping[str, Any] | None = None,
+              available_frameworks: Sequence[str] = ()) -> SystemOneFrame | None:
         signals = tuple(signal for signal in cfw_signals if signal.active)
         causes = group_behavioral_causes(signals)
         signal_codes = tuple((source + "." + code).lower()
@@ -185,8 +186,7 @@ def create_system_one_frame_factory(system_one_service: Any):
                     code for cause in causes for code in cause.codes)),
             ),
             csw_snapshot=csw,
-            available_frameworks=("owl", "anchor", "fuse", "ward", "flow",
-                                 "sispis", "dox"),
+            available_frameworks=tuple(available_frameworks),
         )
         ambiguity = (pool.ambiguity(tuple(dict.fromkeys(uncertain_dimensions)))
                      if uncertain_dimensions else statework_policy_ambiguity)
@@ -200,20 +200,51 @@ def create_system_one_frame_factory(system_one_service: Any):
                       if goals is not None else {})
         criterion_ids = _semantic_criterion_ids(
             attention_criteria, candidate, goals, signals, behavior_state)
+        raw_claims = (policy_context or {}).get("criterion_claims", {})
+        if (not isinstance(raw_claims, Mapping) or len(raw_claims) > 256
+                or any(not isinstance(key, str) or not key or len(key) > 128
+                       or not isinstance(value, str) or not value.strip()
+                       or len(value) > 512 for key, value in raw_claims.items())):
+            raise ValueError("host criterion claims must be a bounded mapping")
+
+        def criterion_claim(criterion_id: str) -> str | None:
+            goal = goal_items.get(criterion_id)
+            claim = goal.claim if goal is not None else ""
+            claim = claim or raw_claims.get(criterion_id, "")
+            return claim.strip() or None
+
+        if criterion_ids and any(criterion_claim(item) is None
+                                 for item in criterion_ids):
+            # Criterion IDs alone are not claim text. Skip semantic inference
+            # when the trusted host did not supply the criterion descriptions.
+            return None
         status_map = {
             "READY": "unmet", "ACTIVE": "active", "VERIFIED": "satisfied",
             "BLOCKED": "blocked", "DEPENDENCY_BLOCKED": "blocked",
             "DEFERRED_BY_OPERATOR": "blocked",
         }
+
+        def criterion_evidence_refs(criterion_id: str) -> tuple[str, ...]:
+            return (observation.criterion_evidence_refs.get(criterion_id)
+                    or (goal_items[criterion_id].evidence_refs
+                        if criterion_id in goal_items else ()))
+
         criteria = tuple(CriterionState(
             criterion_id=criterion_id,
-            claim=criterion_id[:512],
+            claim=(criterion_claim(criterion_id) or "")[:512],
             kind="objective",
             status=status_map.get(goal_items[criterion_id].status, "unmet")
             if criterion_id in goal_items else "unmet",
-            evidence_status=("available" if observation.evidence_refs else "none"),
+            evidence_status=(
+                "verified" if (
+                    goal_items.get(criterion_id) is not None
+                    and goal_items[criterion_id].status == "VERIFIED"
+                    and criterion_evidence_refs(criterion_id))
+                else "available" if criterion_evidence_refs(criterion_id)
+                else "none"),
             evidence_ref_digests=tuple(hashlib.sha256(ref.encode()).hexdigest()
-                                       for ref in observation.evidence_refs[:8]),
+                                       for ref in criterion_evidence_refs(
+                                           criterion_id)[:8]),
             last_progress_sequence=(goal_items[criterion_id].last_progress_action
                                     if criterion_id in goal_items else None),
         ) for criterion_id in criterion_ids)
@@ -247,16 +278,43 @@ def create_system_one_frame_factory(system_one_service: Any):
         # Never substitute a different enabled question for a planned query:
         # calibration and operator selection remain specific to each family.
         question_ids = (query.question_id,)
+        options = {item.statework_id: item for item in csw.eligible_stateworks}
+        workflow_ids = tuple(dict.fromkeys((
+            *csw.active_stateworks,
+            *(item.statework_id for item in csw.eligible_stateworks))))[:8]
         workflows = tuple(WorkflowFact(
             statework_id=statework_id,
+            domain=(options[statework_id].domain or None
+                    if statework_id in options else None),
+            purpose=(options[statework_id].purpose or None
+                     if statework_id in options else None),
             current_state=csw.workflow_states.get(statework_id, "UNKNOWN"),
-            progress_class="LATERAL",
+            previous_state=csw.workflow_previous_states.get(statework_id),
+            progress_class=csw.workflow_progress_classes.get(statework_id),
             revision=csw.workflow_revisions.get(statework_id),
-        ) for statework_id in csw.active_stateworks[:8])
-        work_mode = ("diagnose" if behavior_state.cognitive_mode in {
-            "DIAGNOSE", "REINSPECT", "RECOVER", "REPLAN"} else "delivery")
+            legal_next_states=csw.legal_next_states.get(statework_id, ()),
+            active=statework_id in csw.active_stateworks,
+            eligible=statework_id in options,
+        ) for statework_id in workflow_ids)
+        declared_work_mode = (policy_context or {}).get("work_mode")
+        work_mode = (declared_work_mode if declared_work_mode in {
+            "delivery", "diagnose", "review", "research"} else
+            "diagnose" if behavior_state.cognitive_mode in {
+                "DIAGNOSE", "REINSPECT", "RECOVER", "REPLAN"} else "delivery")
         deliverable_kind = _deliverable_kind(
             policy_context or {}, provider_enabled=True)
+        raw_non_goals = (policy_context or {}).get("non_goals", ())
+        if (not isinstance(raw_non_goals, (tuple, list)) or len(raw_non_goals) > 8
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 256
+                       for item in raw_non_goals)
+                or len(set(raw_non_goals)) != len(raw_non_goals)):
+            raise ValueError("host non-goals must be unique bounded text")
+        raw_domain_tags = (policy_context or {}).get("domain_tags", ())
+        if (not isinstance(raw_domain_tags, (tuple, list)) or len(raw_domain_tags) > 16
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 128
+                       for item in raw_domain_tags)
+                or len(set(raw_domain_tags)) != len(raw_domain_tags)):
+            raise ValueError("host domain tags must be unique bounded text")
         semantic_state = SemanticState(
             task={
                 "objective": objective[:1024],
@@ -268,7 +326,8 @@ def create_system_one_frame_factory(system_one_service: Any):
                 "active_statework": csw.active_stateworks[0][:64]
                 if csw.active_stateworks else None,
                 "active_flow": None,
-                "non_goals": [],
+                "non_goals": list(raw_non_goals),
+                "domain_tags": list(raw_domain_tags),
             },
             situation={
                 "current_state": behavior_state.cognitive_mode,

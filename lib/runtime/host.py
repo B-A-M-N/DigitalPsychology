@@ -10,6 +10,7 @@ from ..feedback_loop import trusted_state_root
 from .contracts import (BehavioralDecisionService, CFWComponentPort,
                         CSWWorkflowPort, RuntimeIdentity,
                         SystemOneFrameFactory)
+from cognitive_runtime_core.harness import HarnessAdapterIdentity
 from .adapters.standalone import NullCFWComponentPort, NullCSWWorkflowPort
 from .session import RuntimeSession
 from .store import BehaviorStateStore
@@ -194,7 +195,8 @@ class RuntimeHost:
                                   outcome_evidence_connected: bool = False,
                                   host_policy_context: dict[str, Any] | None = None,
                                   host_has_stable_objective_context: bool = False,
-                                  fault_handler: Any = None):
+                                  fault_handler: Any = None,
+                                  harness_adapter_identity: HarnessAdapterIdentity | Mapping[str, Any] | None = None):
         """Open a host-driven session whose decisions cross the private DP MCP."""
         from ..host.bridge import HostControlBridge
         if self.model_visible_tools is None:
@@ -218,6 +220,7 @@ class RuntimeHost:
             host_policy_context=host_policy_context,
             host_has_stable_objective_context=host_has_stable_objective_context,
             fault_handler=fault_handler,
+            harness_adapter_identity=harness_adapter_identity,
         )
         await bridge.open()
         return bridge

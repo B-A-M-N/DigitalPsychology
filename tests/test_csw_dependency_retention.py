@@ -14,7 +14,7 @@ from lib.behavior_state import (BehaviorDirective, BehaviorIntervention,
                                 GoalItemSnapshot, GoalSetSnapshot,
                                 StateWorkOption,
                                 StateWorkReleaseResult)
-from lib.host.actuator import ActuationFailure, ControlActuator
+from lib.runtime.actuator import ActuationFailure, ControlActuator
 from lib.host.reconciler import HostReconciler
 from lib.control.authority_receipts import validate_applied_authorities
 from lib.control_protocol import ControlCommitRequest, ControlSessionDescriptor
@@ -435,6 +435,8 @@ def test_crash_after_three_level_apply_reconciles_as_committed():
 
     host = SimpleNamespace(
         identity=SimpleNamespace(scope="session"),
+        _state=BehaviorState(revision=0),
+        _cfw_projection_action_index=0,
         goal_set=GoalSetSnapshot(0, (GoalItemSnapshot("criterion"),)),
         _cfw_components=(), actuator=ControlActuator(csw=csw), csw=csw,
         client=Client(),

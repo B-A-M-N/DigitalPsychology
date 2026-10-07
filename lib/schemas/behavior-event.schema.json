@@ -24,7 +24,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "2.9.0"
+      "const": "2.10.0"
     },
     "event_id": {
       "type": "string",
@@ -1038,6 +1038,16 @@
         },
         "behavior_intervention_verification_quality": {
           "enum": ["improved", "unchanged", "degraded", "unknown"]
+        },
+        "semantic_decision_refs": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "semantic_influence_receipt_id": {
+          "type": ["string", "null"],
+          "maxLength": 128
         },
         "source_decision_id": {
           "type": "string",

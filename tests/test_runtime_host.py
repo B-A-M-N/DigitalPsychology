@@ -115,7 +115,7 @@ class _CSWPort:
 
     def authority_identity(self):
         return {"adapter_kind": "csw-workflow-authority", "authority_id": "test-csw",
-                "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.4.0",
+                "adapter_protocol_version": "1.2.0", "workflow_port_version": "1.6.0",
                 "registry_hash": "e" * 64,
                 "scope_hash": "c" * 64, "capability_hash": "d" * 64}
 
@@ -289,7 +289,8 @@ def _system_one_frame(identity):
         task={"objective": "Render the requested page", "work_mode": "delivery",
               "deliverable_kind": "code_behavior", "task_complexity": "standard",
               "phase": "implementation", "active_segment": identity.segment_id,
-              "active_statework": None, "active_flow": None, "non_goals": []},
+              "active_statework": None, "active_flow": None, "non_goals": [],
+              "domain_tags": ["software"]},
         situation={"current_state": "IMPLEMENTING", "blockers": [],
                    "actions_since_goal_progress": 0,
                    "actions_since_artifact_change": 0,
@@ -335,7 +336,7 @@ def _identity():
 
 
 def test_production_csw_adapter_requires_durable_selection_checkpoints():
-    incomplete_authority = SimpleNamespace(workflow_port_version="1.4.0")
+    incomplete_authority = SimpleNamespace(workflow_port_version="1.6.0")
 
     with pytest.raises(ValueError, match="durable selection checkpoint operations"):
         CSWRuntimeAdapter(incomplete_authority, identity=_identity(), bindings={})
@@ -458,6 +459,7 @@ def test_runtime_host_keeps_twelve_item_task_set_complete_and_rotates_attention(
     goal_set = GoalSetSnapshot(revision=7, items=tuple(
         GoalItemSnapshot(
             criterion_id=criterion_id,
+            claim=f"Complete requested criterion {index}.",
             priority=100 if index == 1 else 0,
             status="READY",
             equivalent_retry_count=2 if index == 1 else 0,
@@ -522,8 +524,9 @@ def test_twelve_item_starvation_telemetry_detects_a_broken_scheduler(
     service = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3")
     criteria = tuple(f"criterion-{index}" for index in range(1, 13))
     goal_set = GoalSetSnapshot(revision=9, items=tuple(
-        GoalItemSnapshot(criterion_id=criterion_id, status="READY")
-        for criterion_id in criteria))
+        GoalItemSnapshot(criterion_id=criterion_id, status="READY",
+                         claim=f"Complete requested criterion {index}.")
+        for index, criterion_id in enumerate(criteria, start=1)))
     fixed_focus: tuple[str, ...] = ()
 
     def broken_schedule(goals, state, *, action_index):

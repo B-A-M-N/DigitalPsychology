@@ -61,7 +61,7 @@ def _nonnegative_int(value: Any, name: str) -> int:
 
 @dataclass(frozen=True)
 class GoalItemSnapshot:
-    """Host-owned status and progress facts for one required or optional goal."""
+    """Host-owned status, semantic claim, and progress facts for one goal."""
 
     criterion_id: str
     required: bool = True
@@ -72,9 +72,13 @@ class GoalItemSnapshot:
     equivalent_retry_count: int = 0
     last_progress_action: int | None = None
     material_progress_revision: int = 0
+    evidence_refs: tuple[str, ...] = ()
+    claim: str = ""
 
     def __post_init__(self) -> None:
         _text(self.criterion_id, "criterion_id", limit=128)
+        if self.claim:
+            _text(self.claim, "criterion claim", limit=512)
         if not isinstance(self.required, bool):
             raise ValueError("goal item required flag must be boolean")
         if type(self.priority) is not int or not 0 <= self.priority <= 100:
@@ -97,15 +101,20 @@ class GoalItemSnapshot:
             raise ValueError("last progress action must be non-negative or null")
         _nonnegative_int(self.material_progress_revision,
                          "material progress revision")
+        evidence_refs = _ids(self.evidence_refs, "criterion evidence refs", limit=8,
+                             item_limit=256)
+        object.__setattr__(self, "evidence_refs", evidence_refs)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"criterion_id": self.criterion_id, "required": self.required,
+        return {"criterion_id": self.criterion_id, "claim": self.claim,
+                "required": self.required,
                 "priority": self.priority, "dependencies": list(self.dependencies),
                 "status": self.status,
                 "actions_since_progress": self.actions_since_progress,
                 "equivalent_retry_count": self.equivalent_retry_count,
                 "last_progress_action": self.last_progress_action,
-                "material_progress_revision": self.material_progress_revision}
+                "material_progress_revision": self.material_progress_revision,
+                "evidence_refs": list(self.evidence_refs)}
 
 
 @dataclass(frozen=True)
@@ -327,6 +336,8 @@ class BehaviorIntervention:
     condition_id: str = "legacy-condition"
     condition_basis_digest: str = "legacy-condition"
     recovery_epoch_id: str | None = None
+    semantic_decision_refs: tuple[str, ...] = ()
+    semantic_influence_receipt_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
@@ -337,6 +348,12 @@ class BehaviorIntervention:
         _text(self.condition_basis_digest, "intervention condition digest", limit=128)
         if self.recovery_epoch_id is not None:
             _text(self.recovery_epoch_id, "recovery epoch ID", limit=128)
+        object.__setattr__(self, "semantic_decision_refs",
+                           _ids(self.semantic_decision_refs,
+                                "semantic decision refs", limit=8, item_limit=256))
+        if self.semantic_influence_receipt_id is not None:
+            _text(self.semantic_influence_receipt_id,
+                  "semantic influence receipt ID", limit=128)
         if self.start_revision < 0 or self.expires_after_actions < 1:
             raise ValueError("intervention revision and expiry must be positive bounds")
         if not 0 <= self.actions_elapsed <= self.expires_after_actions:
@@ -415,7 +432,9 @@ class BehaviorIntervention:
                 "baseline_attention_last_seen": dict(self.baseline_attention_last_seen),
                 "condition_id": self.condition_id,
                 "condition_basis_digest": self.condition_basis_digest,
-                "recovery_epoch_id": self.recovery_epoch_id}
+                "recovery_epoch_id": self.recovery_epoch_id,
+                "semantic_decision_refs": list(self.semantic_decision_refs),
+                "semantic_influence_receipt_id": self.semantic_influence_receipt_id}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "BehaviorIntervention":
@@ -423,6 +442,7 @@ class BehaviorIntervention:
         data["targets"] = tuple(InterventionTarget(**item) for item in data["targets"])
         for name in ("target_criteria", "concurrent_intervention_ids"):
             data[name] = tuple(data.get(name, ()))
+        data["semantic_decision_refs"] = tuple(data.get("semantic_decision_refs", ()))
         if data.get("baseline_goal_set") is not None:
             value = data["baseline_goal_set"]
             if not isinstance(value, GoalSetSnapshot):
@@ -491,6 +511,8 @@ class InterventionOutcome:
     condition_id: str = "legacy-condition"
     condition_basis_digest: str = "legacy-condition"
     preventive_utility: tuple[str, ...] = ()
+    semantic_decision_refs: tuple[str, ...] = ()
+    semantic_influence_receipt_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.intervention_id, "intervention_id", limit=128)
@@ -498,6 +520,12 @@ class InterventionOutcome:
         _text(self.scope, "outcome scope", limit=256)
         _text(self.condition_id, "outcome condition ID", limit=128)
         _text(self.condition_basis_digest, "outcome condition digest", limit=128)
+        object.__setattr__(self, "semantic_decision_refs",
+                           _ids(self.semantic_decision_refs,
+                                "semantic decision refs", limit=8, item_limit=256))
+        if self.semantic_influence_receipt_id is not None:
+            _text(self.semantic_influence_receipt_id,
+                  "semantic influence receipt ID", limit=128)
         if self.outcome not in INTERVENTION_OUTCOMES:
             raise ValueError("unsupported intervention outcome")
         if self.attribution not in INTERVENTION_ATTRIBUTIONS:
@@ -548,7 +576,9 @@ class InterventionOutcome:
                                      if self.task_set_outcome is not None else None),
                 "condition_id": self.condition_id,
                 "condition_basis_digest": self.condition_basis_digest,
-                "preventive_utility": list(self.preventive_utility)}
+                "preventive_utility": list(self.preventive_utility),
+                "semantic_decision_refs": list(self.semantic_decision_refs),
+                "semantic_influence_receipt_id": self.semantic_influence_receipt_id}
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "InterventionOutcome":
@@ -561,6 +591,7 @@ class InterventionOutcome:
         data["criterion_ids_progressed"] = tuple(data.get("criterion_ids_progressed", ()))
         data["target_criteria"] = tuple(data.get("target_criteria", ()))
         data["preventive_utility"] = tuple(data.get("preventive_utility", ()))
+        data["semantic_decision_refs"] = tuple(data.get("semantic_decision_refs", ()))
         if data.get("task_set_outcome") is not None:
             data["task_set_outcome"] = (
                 data["task_set_outcome"]
@@ -795,6 +826,9 @@ class CSWBehaviorSnapshot:
     eligible_steps: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     dependency_retention: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     registry_hash: str = ""
+    workflow_previous_states: Mapping[str, str] = field(default_factory=dict)
+    legal_next_states: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    workflow_progress_classes: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, int) or self.revision < 0:
@@ -831,6 +865,40 @@ class CSWBehaviorSnapshot:
                        for value in revisions.values())):
             raise ValueError("workflow revisions must be bounded to active StateWorks")
         object.__setattr__(self, "workflow_revisions", MappingProxyType(revisions))
+        previous_states = dict(self.workflow_previous_states)
+        if (len(previous_states) > MAX_ACTIVE_STATEWORKS
+                or not set(previous_states).issubset(set(self.active_stateworks))):
+            raise ValueError("previous workflow states must be bounded to active StateWorks")
+        object.__setattr__(self, "workflow_previous_states", MappingProxyType({
+            _text(key, "workflow ID", limit=128): _text(value, "previous workflow state", limit=64)
+            for key, value in previous_states.items()}))
+        next_states = {}
+        if (not isinstance(self.legal_next_states, Mapping)
+                or len(self.legal_next_states) > MAX_ACTIVE_STATEWORKS):
+            raise ValueError("legal next-state map must be bounded")
+        for statework_id, states in self.legal_next_states.items():
+            key = _text(statework_id, "workflow ID", limit=128)
+            if key not in self.active_stateworks:
+                raise ValueError("legal next states must be bounded to active StateWorks")
+            next_states[key] = _ids(states, "legal next states", limit=16)
+        object.__setattr__(self, "legal_next_states", MappingProxyType(next_states))
+        allowed_progress_classes = {
+            "FORWARD_PROGRESS", "LATERAL", "RECOVERY", "INVALIDATION",
+            "REGRESSION", "TERMINAL",
+        }
+        if (not isinstance(self.workflow_progress_classes, Mapping)
+                or len(self.workflow_progress_classes) > MAX_ACTIVE_STATEWORKS):
+            raise ValueError("workflow progress classes must be bounded authoritative values")
+        progress_classes = {}
+        for raw_key, value in self.workflow_progress_classes.items():
+            key = _text(raw_key, "workflow ID", limit=128)
+            if (key not in self.active_stateworks
+                    or not isinstance(value, str)
+                    or value not in allowed_progress_classes):
+                raise ValueError("workflow progress classes must be bounded authoritative values")
+            progress_classes[key] = value
+        object.__setattr__(self, "workflow_progress_classes",
+                           MappingProxyType(progress_classes))
         step_map = {}
         if (not isinstance(self.eligible_steps, Mapping)
                 or len(self.eligible_steps) > MAX_ACTIVE_STATEWORKS):
@@ -864,7 +932,11 @@ class CSWBehaviorSnapshot:
                                     for key, value in self.eligible_steps.items()},
                 "dependency_retention": {key: list(value)
                                          for key, value in
-                                         self.dependency_retention.items()}}
+                                         self.dependency_retention.items()},
+                "workflow_previous_states": dict(self.workflow_previous_states),
+                "legal_next_states": {key: list(value)
+                                      for key, value in self.legal_next_states.items()},
+                "workflow_progress_classes": dict(self.workflow_progress_classes)}
 
 
 @dataclass(frozen=True)
@@ -1050,11 +1122,14 @@ class BehavioralDecision:
     preferred_stateworks: tuple[str, ...] = ()
     intervention_outcomes: tuple[InterventionOutcome, ...] = ()
     reason: str = "no behavioral change required"
+    selected_candidate_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.decision_id, "decision_id", limit=128)
         _text(self.scope, "decision scope", limit=256)
         _text(self.reason, "decision reason", limit=512)
+        if self.selected_candidate_id is not None:
+            _text(self.selected_candidate_id, "selected candidate ID", limit=128)
         if self.expected_revision < 0 or self.state.revision != self.expected_revision + 1:
             raise ValueError("decision must advance exactly one behavior revision")
         if (len(self.directives) > MAX_CONTROL_BATCH_ITEMS
@@ -1072,7 +1147,8 @@ class BehavioralDecision:
                 "directives": [item.to_dict() for item in self.directives],
                 "preferred_stateworks": list(self.preferred_stateworks),
                 "intervention_outcomes": [item.to_dict() for item in self.intervention_outcomes],
-                "reason": self.reason}
+                "reason": self.reason,
+                "selected_candidate_id": self.selected_candidate_id}
 
 
 __all__ = [

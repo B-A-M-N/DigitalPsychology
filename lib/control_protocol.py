@@ -10,6 +10,7 @@ from .behavior_state import (CSWBehaviorSnapshot, FrameworkSignal,
                              GoalSetSnapshot, StateWorkOption)
 from .outcomes import HostOutcomeFact
 from .runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
+from cognitive_runtime_core.harness import HarnessAdapterIdentity
 from .compatibility import (
     DP_CONTROL_PROTOCOL_VERSION as PROTOCOL_VERSION,
     MAX_CONTROL_PAYLOAD_BYTES, MAX_GOAL_CRITERIA,
@@ -60,7 +61,9 @@ def parse_csw_snapshot(value: Any) -> CSWBehaviorSnapshot:
     data = dict(_mapping(value, "csw_snapshot"))
     expected = {"revision", "active_stateworks", "eligible_stateworks",
                 "workflow_states", "snapshot_id", "workflow_revisions",
-                "eligible_steps", "dependency_retention", "registry_hash"}
+                "eligible_steps", "dependency_retention", "registry_hash",
+                "workflow_previous_states", "legal_next_states",
+                "workflow_progress_classes"}
     if set(data) != expected:
         raise ValueError("CSW snapshot fields are invalid")
     options = _sequence(data["eligible_stateworks"], "eligible_stateworks",
@@ -79,6 +82,10 @@ def parse_csw_snapshot(value: Any) -> CSWBehaviorSnapshot:
         dependency_retention={key: tuple(ids) for key, ids in
                               dict(data["dependency_retention"]).items()},
         registry_hash=data["registry_hash"],
+        workflow_previous_states=dict(data["workflow_previous_states"]),
+        legal_next_states={key: tuple(states) for key, states in
+                           dict(data["legal_next_states"]).items()},
+        workflow_progress_classes=dict(data["workflow_progress_classes"]),
     )
 
 
@@ -92,6 +99,7 @@ class ControlSessionDescriptor:
     cfw_authority_identity: Mapping[str, str]
     csw_authority_identity: Mapping[str, str]
     host_capabilities: Mapping[str, Any]
+    non_goals: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, RuntimeIdentity):
@@ -99,6 +107,10 @@ class ControlSessionDescriptor:
         if not isinstance(self.objective, str) or not self.objective.strip() \
                 or len(self.objective) > 1024:
             raise ValueError("control session objective must be bounded text")
+        non_goals = _sequence(self.non_goals, "non_goals", maximum=8)
+        if any(not isinstance(item, str) or not item.strip() or len(item) > 256
+               for item in non_goals) or len(non_goals) != len(set(non_goals)):
+            raise ValueError("non_goals must contain unique bounded text")
         criteria = _sequence(self.objective_criteria, "objective_criteria",
                              maximum=MAX_GOAL_CRITERIA)
         if not criteria or len(criteria) != len(set(criteria)) or any(
@@ -131,6 +143,10 @@ class ControlSessionDescriptor:
         capabilities = dict(_mapping(self.host_capabilities, "host_capabilities"))
         if len(capabilities) > 32:
             raise ValueError("host capabilities exceed their bound")
+        harness_identity = capabilities.get("harness_adapter_identity")
+        if harness_identity is not None:
+            capabilities["harness_adapter_identity"] = (
+                HarnessAdapterIdentity.from_mapping(harness_identity).to_dict())
         if not isinstance(capabilities.get("cfw_connected"), bool):
             raise ValueError("host capabilities must declare CFW connectivity")
         if capabilities["cfw_connected"]:
@@ -190,6 +206,7 @@ class ControlSessionDescriptor:
         object.__setattr__(self, "cfw_authority_identity", cfw_authority)
         object.__setattr__(self, "csw_authority_identity", authority)
         object.__setattr__(self, "host_capabilities", capabilities)
+        object.__setattr__(self, "non_goals", tuple(non_goals))
 
     @property
     def control_session_id(self) -> str:
@@ -206,6 +223,7 @@ class ControlSessionDescriptor:
             "cfw_authority_identity": dict(self.cfw_authority_identity),
             "csw_authority_identity": dict(self.csw_authority_identity),
             "host_capabilities": dict(self.host_capabilities),
+            "non_goals": list(self.non_goals),
         }
 
     @classmethod
@@ -213,7 +231,7 @@ class ControlSessionDescriptor:
         data = dict(_mapping(value, "control session"))
         expected = {"protocol_version", "identity", "objective", "objective_criteria",
                     "initial_goal_set", "available_frameworks", "csw_authority_identity",
-                    "cfw_authority_identity", "host_capabilities"}
+                    "cfw_authority_identity", "host_capabilities", "non_goals"}
         if set(data) != expected or data["protocol_version"] != PROTOCOL_VERSION:
             raise ValueError("control session protocol version or fields are invalid")
         return cls(
@@ -225,6 +243,7 @@ class ControlSessionDescriptor:
             cfw_authority_identity=dict(data["cfw_authority_identity"]),
             csw_authority_identity=dict(data["csw_authority_identity"]),
             host_capabilities=dict(data["host_capabilities"]),
+            non_goals=tuple(data["non_goals"]),
         )
 
 
@@ -359,6 +378,9 @@ class ControlTickRequest:
                 "context_pressure": self.observation.context_pressure,
                 "criterion_status": dict(self.observation.criterion_status),
                 "evidence_refs": list(self.observation.evidence_refs),
+                "criterion_evidence_refs": {
+                    key: list(value) for key, value
+                    in self.observation.criterion_evidence_refs.items()},
                 "active_trigger_codes": list(self.observation.active_trigger_codes),
                 "approach_epoch": self.observation.approach_epoch,
                 "candidate_action": (self.observation.candidate_action.to_dict()

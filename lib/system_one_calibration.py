@@ -73,6 +73,33 @@ def _brier(rows: list[tuple[dict[str, float], str]]) -> float:
     return total / len(rows)
 
 
+def _log_loss(rows: list[tuple[dict[str, float], str]]) -> float:
+    if not rows:
+        return 1.0
+    return sum(-math.log(max(probabilities.get(actual, 0.0), 1e-12))
+               for probabilities, actual in rows) / len(rows)
+
+
+def _class_metrics(rows: list[dict[str, Any]], labels: Iterable[str]
+                   ) -> tuple[tuple[str, int, int, int, float, float], ...]:
+    metrics = []
+    for label in sorted(set(labels)):
+        true_positive = false_positive = false_negative = 0
+        for row in rows:
+            predicted = max(row["probabilities"].items(), key=lambda item: item[1])[0]
+            actual = row["actual"]
+            true_positive += int(predicted == label and actual == label)
+            false_positive += int(predicted == label and actual != label)
+            false_negative += int(predicted != label and actual == label)
+        precision = (true_positive / (true_positive + false_positive)
+                     if true_positive + false_positive else 0.0)
+        recall = (true_positive / (true_positive + false_negative)
+                  if true_positive + false_negative else 0.0)
+        metrics.append((label, true_positive, false_positive, false_negative,
+                        precision, recall))
+    return tuple(metrics)
+
+
 def _ece(rows: list[tuple[dict[str, float], str]], temperature: float) -> float:
     if not rows:
         return 1.0
@@ -101,15 +128,25 @@ class CalibrationRecord:
     minimum_advisory_confidence: float
     sample_count: int
     training_count: int
-    validation_count: int
+    calibration_count: int
+    holdout_count: int
     training_outcome_digest: str
-    validation_outcome_digest: str
-    validation_accuracy: float
-    validation_brier: float
-    validation_ece: float
+    calibration_outcome_digest: str
+    holdout_outcome_digest: str
+    holdout_accuracy: float
+    holdout_brier: float
+    holdout_ece: float
+    holdout_log_loss: float
+    holdout_class_metrics: tuple[tuple[str, int, int, int, float, float], ...]
+    qualification_minimum_accuracy: float
+    qualification_maximum_brier: float
+    qualification_maximum_ece: float
     work_modes: tuple[str, ...]
     deliverable_kinds: tuple[str, ...]
     independent_trajectory_count: int = 0
+    training_trajectory_count: int = 0
+    calibration_trajectory_count: int = 0
+    holdout_trajectory_count: int = 0
     cohort_counts: tuple[tuple[str, str, int], ...] = ()
     minimum_cohort_trajectories: int = 20
     candidate_context_counts: tuple[tuple[int, str, str, int], ...] = ()
@@ -130,15 +167,18 @@ class CalibrationRecord:
                 raise ValueError(f"{name} must be bounded non-empty text")
         for name in ("model_content_hash", "provider_protocol_hash", "protocol_hash",
                      "question_registry_hash", "state_projection_schema_hash",
-                     "training_outcome_digest", "validation_outcome_digest"):
+                     "training_outcome_digest", "calibration_outcome_digest",
+                     "holdout_outcome_digest"):
             value = getattr(self, name)
             if (not isinstance(value, str) or len(value) != 64
                     or any(ch not in "0123456789abcdef" for ch in value)):
                 raise ValueError(f"{name} must be a lowercase SHA-256 digest")
         if self.protocol_version != PROTOCOL_VERSION:
             raise ValueError("unsupported calibration protocol")
-        for name in ("temperature", "minimum_advisory_confidence", "validation_accuracy",
-                     "validation_brier", "validation_ece"):
+        for name in ("temperature", "minimum_advisory_confidence", "holdout_accuracy",
+                     "holdout_brier", "holdout_ece", "holdout_log_loss",
+                     "qualification_minimum_accuracy", "qualification_maximum_brier",
+                     "qualification_maximum_ece"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
@@ -147,13 +187,40 @@ class CalibrationRecord:
         if not 0 <= self.minimum_advisory_confidence <= 1:
             raise ValueError("minimum confidence must be between zero and one")
         if any(not 0 <= getattr(self, name) <= 1 for name in (
-                "validation_accuracy", "validation_brier", "validation_ece")):
+                "holdout_accuracy", "holdout_brier", "holdout_ece",
+                "qualification_minimum_accuracy", "qualification_maximum_brier",
+                "qualification_maximum_ece")):
             raise ValueError("calibration metrics must be between zero and one")
-        if min(self.sample_count, self.training_count, self.validation_count,
-               self.minimum_outcomes, self.independent_trajectory_count) < 0:
+        count_fields = (
+            "sample_count", "training_count", "calibration_count", "holdout_count",
+            "minimum_outcomes", "independent_trajectory_count",
+            "training_trajectory_count", "calibration_trajectory_count",
+            "holdout_trajectory_count")
+        if any(type(getattr(self, name)) is not int or getattr(self, name) < 0
+               for name in count_fields):
             raise ValueError("calibration sample counts must be non-negative")
-        if self.training_count + self.validation_count != self.sample_count:
-            raise ValueError("calibration train/validation counts do not add up")
+        if self.holdout_log_loss < 0:
+            raise ValueError("holdout log loss must be non-negative")
+        if (self.training_count + self.calibration_count + self.holdout_count
+                != self.sample_count):
+            raise ValueError("calibration train/calibration/holdout counts do not add up")
+        if (self.training_trajectory_count + self.calibration_trajectory_count
+                + self.holdout_trajectory_count != self.independent_trajectory_count
+                or min(self.training_trajectory_count, self.calibration_trajectory_count,
+                       self.holdout_trajectory_count) < 1):
+            raise ValueError("calibration trajectory partitions do not add up")
+        allowed_labels = set(QUESTION_REGISTRY[self.question_id]["criteria"])
+        if len(self.holdout_class_metrics) != len(allowed_labels):
+            raise ValueError("holdout class metrics must cover the complete question family")
+        metric_labels: set[str] = set()
+        for metric in self.holdout_class_metrics:
+            if (len(metric) != 6 or metric[0] not in allowed_labels
+                    or metric[0] in metric_labels
+                    or any(type(value) is not int or value < 0 for value in metric[1:4])
+                    or any(not isinstance(value, (int, float)) or not math.isfinite(float(value))
+                           or not 0 <= float(value) <= 1 for value in metric[4:6])):
+                raise ValueError("holdout class metrics are malformed")
+            metric_labels.add(metric[0])
         if not self.work_modes or not self.deliverable_kinds:
             raise ValueError("calibration applicability must name work modes and deliverables")
         if self.independent_trajectory_count < 1 or self.minimum_cohort_trajectories < 1:
@@ -192,15 +259,26 @@ class CalibrationRecord:
                 "temperature": float(self.temperature),
                 "minimum_advisory_confidence": float(self.minimum_advisory_confidence),
                 "sample_count": self.sample_count, "training_count": self.training_count,
-                "validation_count": self.validation_count,
+                "calibration_count": self.calibration_count,
+                "holdout_count": self.holdout_count,
                 "training_outcome_digest": self.training_outcome_digest,
-                "validation_outcome_digest": self.validation_outcome_digest,
-                "validation_accuracy": float(self.validation_accuracy),
-                "validation_brier": float(self.validation_brier),
-                "validation_ece": float(self.validation_ece),
+                "calibration_outcome_digest": self.calibration_outcome_digest,
+                "holdout_outcome_digest": self.holdout_outcome_digest,
+                "holdout_accuracy": float(self.holdout_accuracy),
+                "holdout_brier": float(self.holdout_brier),
+                "holdout_ece": float(self.holdout_ece),
+                "holdout_log_loss": float(self.holdout_log_loss),
+                "holdout_class_metrics": [list(item) for item in self.holdout_class_metrics],
+                "qualification_minimum_accuracy": float(
+                    self.qualification_minimum_accuracy),
+                "qualification_maximum_brier": float(self.qualification_maximum_brier),
+                "qualification_maximum_ece": float(self.qualification_maximum_ece),
                 "work_modes": list(self.work_modes),
                 "deliverable_kinds": list(self.deliverable_kinds),
                 "independent_trajectory_count": self.independent_trajectory_count,
+                "training_trajectory_count": self.training_trajectory_count,
+                "calibration_trajectory_count": self.calibration_trajectory_count,
+                "holdout_trajectory_count": self.holdout_trajectory_count,
                 "cohort_counts": [list(item) for item in self.cohort_counts],
                 "minimum_cohort_trajectories": self.minimum_cohort_trajectories,
                 "candidate_context_counts": [list(item)
@@ -216,9 +294,14 @@ class CalibrationRecord:
         fields = {"question_id", "backend_id", "model_id", "model_revision",
                   "model_content_hash", "provider_protocol_hash", "temperature",
                   "minimum_advisory_confidence", "sample_count", "training_count",
-                  "validation_count", "training_outcome_digest", "validation_outcome_digest",
-                  "validation_accuracy", "validation_brier", "validation_ece", "work_modes",
-                  "deliverable_kinds", "independent_trajectory_count", "cohort_counts",
+                  "calibration_count", "holdout_count", "training_outcome_digest",
+                  "calibration_outcome_digest", "holdout_outcome_digest", "holdout_accuracy",
+                  "holdout_brier", "holdout_ece", "holdout_log_loss",
+                  "holdout_class_metrics", "qualification_minimum_accuracy",
+                  "qualification_maximum_brier", "qualification_maximum_ece", "work_modes",
+                  "deliverable_kinds", "independent_trajectory_count",
+                  "training_trajectory_count", "calibration_trajectory_count",
+                  "holdout_trajectory_count", "cohort_counts",
                   "minimum_cohort_trajectories", "candidate_context_counts",
                   "protocol_version", "protocol_hash",
                   "question_registry_hash", "state_projection_schema_hash",
@@ -228,6 +311,11 @@ class CalibrationRecord:
         payload = dict(value)
         payload["work_modes"] = tuple(payload["work_modes"])
         payload["deliverable_kinds"] = tuple(payload["deliverable_kinds"])
+        payload["holdout_class_metrics"] = tuple(
+            (str(label), int(true_positive), int(false_positive), int(false_negative),
+             float(precision), float(recall))
+            for label, true_positive, false_positive, false_negative, precision, recall
+            in payload["holdout_class_metrics"])
         payload["cohort_counts"] = tuple((str(mode), str(kind), int(count))
                                          for mode, kind, count in payload["cohort_counts"])
         payload["candidate_context_counts"] = tuple(
@@ -250,6 +338,7 @@ class CalibrationRecord:
         task = frame.state.task
         return bool(
             self.status == "active" and self.drift_status == "clear"
+            and self.qualification_passed
             and self.question_id in frame.question_ids
             and self.backend_id == frame.backend_id and self.model_id == frame.model_id
             and self.model_revision == frame.model_revision
@@ -259,10 +348,11 @@ class CalibrationRecord:
             and self.protocol_hash == frame.protocol_hash
             and self.question_registry_hash == QUESTION_REGISTRY_HASH
             and self.state_projection_schema_hash == STATE_PROJECTION_SCHEMA_HASH
-            and self.validation_accuracy >= minimum_accuracy
-            and self.validation_brier <= maximum_brier
-            and self.validation_ece <= maximum_ece
-            and self.validation_count >= self.minimum_outcomes
+            and self.holdout_accuracy >= minimum_accuracy
+            and self.holdout_brier <= maximum_brier
+            and self.holdout_ece <= maximum_ece
+            and self.sample_count >= self.minimum_outcomes
+            and self.holdout_count >= max(10, int(self.minimum_outcomes * 0.2))
             and task["work_mode"] in self.work_modes
             and task["deliverable_kind"] in self.deliverable_kinds
             and dict(((mode, kind), count) for mode, kind, count in self.cohort_counts).get(
@@ -276,6 +366,22 @@ class CalibrationRecord:
                               canonical_hash(sorted(frame.state.legal_routes)),
                               canonical_hash(sorted(task.get("domain_tags") or ()))), 0)
                  >= self.minimum_cohort_trajectories))
+
+    @property
+    def qualification_passed(self) -> bool:
+        """Whether the recorded independent holdout satisfies its stored gate."""
+        minimum_train = max(20, int(self.minimum_outcomes * 0.4))
+        minimum_partition = max(10, int(self.minimum_outcomes * 0.2))
+        return bool(
+            self.sample_count >= self.minimum_outcomes
+            and self.training_count >= minimum_train
+            and self.calibration_count >= minimum_partition
+            and self.holdout_count >= minimum_partition
+            and len({self.training_outcome_digest, self.calibration_outcome_digest,
+                     self.holdout_outcome_digest}) == 3
+            and self.holdout_accuracy >= self.qualification_minimum_accuracy
+            and self.holdout_brier <= self.qualification_maximum_brier
+            and self.holdout_ece <= self.qualification_maximum_ece)
 
     def with_status(self, status: str) -> "CalibrationRecord":
         from dataclasses import replace
@@ -296,7 +402,7 @@ class CalibrationBundle:
         return {key: self.records[key].canonical() for key in sorted(self.records)}
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": "1.1.0", "records": self.canonical(),
+        return {"schema_version": "1.2.0", "records": self.canonical(),
                 "bundle_hash": self.digest}
 
     @property
@@ -316,7 +422,7 @@ class CalibrationBundle:
     def from_mapping(cls, value: Mapping[str, Any]) -> "CalibrationBundle":
         if (not isinstance(value, Mapping) or set(value) != {
                 "schema_version", "records", "bundle_hash"}
-                or value.get("schema_version") != "1.1.0"
+                or value.get("schema_version") != "1.2.0"
                 or not isinstance(value.get("records"), Mapping)):
             raise ValueError("malformed System-1 calibration bundle")
         bundle = cls({str(key): CalibrationRecord.from_mapping(item)
@@ -337,6 +443,10 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
         payload = getattr(event, "payload", {}) or {}
         answers = payload.get("system_one_answers")
         if (getattr(event, "event_type", None) != "system_one_decision"
+                or getattr(event, "category", None) != "decision"
+                or getattr(event, "actor_id", None) != "digitalpsychology_runtime"
+                or getattr(event, "authority_source", None)
+                != "digitalpsychology_system_one"
                 or not isinstance(answers, Mapping) or question_id not in answers):
             continue
         decision_id = str(payload.get("system_one_decision_id") or "")
@@ -350,8 +460,11 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
         payload = getattr(outcome, "payload", {}) or {}
         if (getattr(outcome, "event_type", None) != "system_one_outcome"
                 or getattr(outcome, "category", None) != "validation"
+                or getattr(outcome, "actor_id", None) != "digitalpsychology_runtime"
                 or payload.get("system_one_independent_outcome") is not True
                 or payload.get("system_one_outcome_authority") not in VALID_OUTCOME_AUTHORITIES
+                or getattr(outcome, "authority_source", None)
+                != payload.get("system_one_outcome_authority")
                 or not isinstance(payload.get("system_one_outcome_evidence_ref"), str)
                 or not payload.get("system_one_outcome_evidence_ref")
                 or (allowed_labels and payload.get(outcome_key) not in allowed_labels)):
@@ -413,11 +526,17 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
 
 def calibration_metrics(events: Iterable[Any], *, label: str = "progress_relation") -> dict[str, Any]:
     rows = _paired_rows(events, label)
-    correct = [row["selected"] == row["actual"] for row in rows]
-    raw_brier = _brier([(row["probabilities"], row["actual"]) for row in rows])
+    correct = [max(row["probabilities"].items(), key=lambda item: item[1])[0]
+               == row["actual"] for row in rows]
+    probability_rows = [(row["probabilities"], row["actual"]) for row in rows]
+    raw_brier = _brier(probability_rows)
     return {"label": label, "independent_outcomes": len(rows),
             "accuracy": sum(map(int, correct)) / len(rows) if rows else 0.0,
             "brier_score": raw_brier,
+            "log_loss": _log_loss(probability_rows),
+            "expected_calibration_error": _ece(probability_rows, 1.0),
+            "per_class": [list(item) for item in _class_metrics(
+                rows, QUESTION_REGISTRY[label]["criteria"])],
             "calibration_bins": _calibration_bins(rows)}
 
 
@@ -425,7 +544,8 @@ def _calibration_bins(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     bins: list[list[tuple[float, bool]]] = [[] for _ in range(10)]
     for row in rows:
         confidence = max(row["probabilities"].values())
-        bins[min(9, int(confidence * 10))].append((confidence, row["selected"] == row["actual"]))
+        predicted = max(row["probabilities"].items(), key=lambda item: item[1])[0]
+        bins[min(9, int(confidence * 10))].append((confidence, predicted == row["actual"]))
     return [{"lower": index / 10, "upper": (index + 1) / 10,
              "count": len(bucket),
              "mean_confidence": sum(item[0] for item in bucket) / len(bucket),
@@ -441,7 +561,7 @@ def calibration_record_from_events(
     minimum_accuracy: float = 0.8, maximum_brier: float = 0.25,
     maximum_ece: float = 0.12,
 ) -> CalibrationRecord:
-    """Fit a temperature on deterministic training rows and evaluate held-out rows."""
+    """Fit on train, calibrate on calibration, and qualify only on holdout rows."""
     rows = _paired_rows(events, question_id)
     if len(rows) < minimum_outcomes:
         raise ValueError("insufficient later independent outcomes for calibration")
@@ -454,22 +574,36 @@ def calibration_record_from_events(
     model_tuple = next(iter(identities))
     ordered_trajectories = sorted(trajectory_ids, key=lambda item: hashlib.sha256(
         item.encode("utf-8")).digest())
-    validation_trajectories = set(ordered_trajectories[::5])
-    validation = [row for row in rows if row["trajectory_id"] in validation_trajectories]
-    train = [row for row in rows if row["trajectory_id"] not in validation_trajectories]
-    if len(train) < 20 or len(validation) < max(10, int(minimum_outcomes * 0.2)):
-        raise ValueError("calibration requires at least 20 training and 10 held-out outcomes")
+    train_end = max(1, int(len(ordered_trajectories) * 0.6))
+    calibration_end = max(train_end + 1, int(len(ordered_trajectories) * 0.8))
+    calibration_end = min(calibration_end, len(ordered_trajectories) - 1)
+    training_trajectories = set(ordered_trajectories[:train_end])
+    calibration_trajectories = set(ordered_trajectories[train_end:calibration_end])
+    holdout_trajectories = set(ordered_trajectories[calibration_end:])
+    train = [row for row in rows if row["trajectory_id"] in training_trajectories]
+    calibration = [row for row in rows
+                   if row["trajectory_id"] in calibration_trajectories]
+    holdout = [row for row in rows if row["trajectory_id"] in holdout_trajectories]
+    minimum_calibration_rows = max(10, int(minimum_outcomes * 0.2))
+    if (len(train) < max(20, int(minimum_outcomes * 0.4))
+            or len(calibration) < minimum_calibration_rows
+            or len(holdout) < minimum_calibration_rows):
+        raise ValueError(
+            "calibration requires independent train, calibration, and holdout cohorts")
     train_rows = [(row["probabilities"], row["actual"]) for row in train]
+    calibration_rows = [(row["probabilities"], row["actual"]) for row in calibration]
     temperature = min(_TEMPERATURES, key=lambda item: (_brier([
         (_apply_temperature(probabilities, item), actual)
-        for probabilities, actual in train_rows]), item))
-    validation_rows = [(row["probabilities"], row["actual"]) for row in validation]
+        for probabilities, actual in calibration_rows]), item))
+    holdout_rows = [(row["probabilities"], row["actual"]) for row in holdout]
     calibrated_rows = [(_apply_temperature(probabilities, temperature), actual)
-                       for probabilities, actual in validation_rows]
+                       for probabilities, actual in holdout_rows]
     accuracy = sum(int(max(probs.items(), key=lambda item: item[1])[0] == actual)
                    for probs, actual in calibrated_rows) / len(calibrated_rows)
     brier = _brier(calibrated_rows)
-    ece = _ece(validation_rows, temperature)
+    ece = _ece(holdout_rows, temperature)
+    log_loss = _log_loss(calibrated_rows)
+    per_class = _class_metrics(holdout, QUESTION_REGISTRY[question_id]["criteria"])
     if accuracy < minimum_accuracy or brier > maximum_brier or ece > maximum_ece:
         raise ValueError("held-out System-1 calibration failed its accuracy, Brier, or ECE floor")
 
@@ -512,16 +646,26 @@ def calibration_record_from_events(
         model_revision=model_tuple[2], model_content_hash=model_tuple[3],
         provider_protocol_hash=model_tuple[4], temperature=temperature,
         minimum_advisory_confidence=minimum_confidence,
-        sample_count=len(rows), training_count=len(train), validation_count=len(validation),
-        training_outcome_digest=digest(train), validation_outcome_digest=digest(validation),
-        validation_accuracy=accuracy, validation_brier=brier, validation_ece=ece,
+        sample_count=len(rows), training_count=len(train),
+        calibration_count=len(calibration), holdout_count=len(holdout),
+        training_outcome_digest=digest(train),
+        calibration_outcome_digest=digest(calibration),
+        holdout_outcome_digest=digest(holdout),
+        holdout_accuracy=accuracy, holdout_brier=brier, holdout_ece=ece,
+        holdout_log_loss=log_loss, holdout_class_metrics=per_class,
+        qualification_minimum_accuracy=minimum_accuracy,
+        qualification_maximum_brier=maximum_brier,
+        qualification_maximum_ece=maximum_ece,
         work_modes=tuple(sorted({mode for mode, _kind, _count in applicable_cohorts})),
         deliverable_kinds=tuple(sorted({kind for _mode, kind, _count in applicable_cohorts})),
         independent_trajectory_count=len(trajectory_ids),
+        training_trajectory_count=len(training_trajectories),
+        calibration_trajectory_count=len(calibration_trajectories),
+        holdout_trajectory_count=len(holdout_trajectories),
         cohort_counts=applicable_cohorts,
         minimum_cohort_trajectories=minimum_cohort_trajectories,
         candidate_context_counts=candidate_context_counts,
-        minimum_outcomes=max(10, int(minimum_outcomes * 0.2)))
+        minimum_outcomes=minimum_outcomes)
 
 
 __all__ = ["CalibrationRecord", "CalibrationBundle", "calibration_metrics",

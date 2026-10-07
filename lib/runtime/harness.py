@@ -1,0 +1,27 @@
+"""Compatibility imports for :mod:`cognitive_runtime_core.harness`."""
+from cognitive_runtime_core.harness import (HARNESS_ADAPTER_PROTOCOL_VERSION,
+                                       HARNESS_IDENTITY_SCHEMA_VERSION,
+                                       ActionProposal, CompletionProposal,
+                                       CallbackCognitiveHarnessLifecycle,
+                                       CognitiveHarnessLifecycle,
+                                       CognitiveRuntimeHarnessSession,
+                                       HarnessAdapterIdentity,
+                                       HarnessBoundary, HarnessBoundaryEvent,
+                                       HarnessCapabilities,
+                                       HarnessDispatchSummary,
+                                       ModelBoundaryProjection,
+                                       RuntimeObservationProjection,
+                                       ValidatorCompletionEvidence,
+                                       TaskContract,
+                                       dispatch_harness_events)
+
+__all__ = ["HARNESS_ADAPTER_PROTOCOL_VERSION",
+           "HARNESS_IDENTITY_SCHEMA_VERSION", "ActionProposal",
+           "CompletionProposal", "CallbackCognitiveHarnessLifecycle",
+           "CognitiveHarnessLifecycle",
+           "CognitiveRuntimeHarnessSession", "HarnessAdapterIdentity",
+           "HarnessBoundary", "HarnessBoundaryEvent", "HarnessCapabilities",
+           "HarnessDispatchSummary", "ModelBoundaryProjection",
+           "RuntimeObservationProjection",
+           "TaskContract", "ValidatorCompletionEvidence",
+           "dispatch_harness_events"]

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cognitive-runtime-codex-adapter"
+version = "0.2.0"
+description = "Optional Codex App Server adapter for cognitive-runtime-core"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = ["cognitive-runtime-core>=1.3,<2"]
+
+[project.optional-dependencies]
+cfw = ["cognitive-frameworks-runtime>=1.4,<2"]
+
+[tool.setuptools]
+packages = [
+    "cognitive_runtime_core.integrations.codex",
+    "cognitive_runtime_core.integrations.codex.cfw_host",
+]
+
+[tool.setuptools.package-dir]
+"cognitive_runtime_core.integrations.codex" = "."
+"cognitive_runtime_core.integrations.codex.cfw_host" = "cfw_host"

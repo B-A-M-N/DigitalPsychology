@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cognitive-runtime-core"
+version = "1.5.0"
+description = "Harness-neutral lifecycle, authority, and transaction contracts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = ["jsonschema>=4.18"]
+
+[tool.setuptools]
+packages = [
+    "cognitive_runtime_core",
+    "cognitive_runtime_core.integrations",
+    "cognitive_runtime_core.integrations.athena",
+    "cognitive_runtime_core.integrations.cfw",
+    "cognitive_runtime_core.integrations.triad",
+    "cognitive_runtime_core.integrations.reference",
+]
+package-dir = {"cognitive_runtime_core" = "."}
