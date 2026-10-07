@@ -27,6 +27,7 @@ from .system_one_calibration import (CalibrationBundle, CalibrationRecord, calib
                                      calibration_task_instance_hashes)
 from .system_one_learning import (CalibrationLifecycleError,
                                   SystemOneCalibrationLifecycle)
+from .laya_configuration import model_settings
 from .system_one_service import SystemOneService
 
 
@@ -55,11 +56,12 @@ def laya_doctor_report(environment: Mapping[str, str] | None = None) -> dict[str
     except (ImportError, ValueError):
         laya_import = False
 
-    model_path_value = env.get("DIGITALPSYCHOLOGY_LAYA_MODEL_PATH", "")
-    revision = env.get("DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION", "")
-    expected_hash = env.get("DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256", "")
-    model_id = env.get("DIGITALPSYCHOLOGY_LAYA_MODEL_ID", "laya-typed-decisions")
-    device = env.get("DIGITALPSYCHOLOGY_LAYA_DEVICE", "cpu")
+    model_config = model_settings(env)
+    model_path_value = model_config["model_path"]
+    revision = model_config["model_revision"]
+    expected_hash = model_config["model_content_sha256"]
+    model_id = model_config["model_id"]
+    device = model_config["device"]
     checkpoint_path = Path(model_path_value).expanduser() if model_path_value else None
     checkpoint_directory = bool(checkpoint_path and checkpoint_path.is_dir())
     computed_hash: str | None = None
@@ -489,11 +491,11 @@ def laya_activate_main(argv: list[str] | None = None) -> int:
             raise ValueError("candidate was not qualified for the native Laya provider")
         if candidate.provider_protocol_hash != PROVIDER_PROTOCOL_HASH:
             raise ValueError("candidate provider protocol differs from this runtime")
+        model_config = model_settings()
         identity_pins = {
-            "model_id": os.environ.get(
-                "DIGITALPSYCHOLOGY_LAYA_MODEL_ID", "laya-typed-decisions"),
-            "model_revision": os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION", ""),
-            "model_content_hash": os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256", ""),
+            "model_id": model_config["model_id"],
+            "model_revision": model_config["model_revision"],
+            "model_content_hash": model_config["model_content_sha256"],
         }
         if (not identity_pins["model_revision"]
                 or len(identity_pins["model_content_hash"]) != 64

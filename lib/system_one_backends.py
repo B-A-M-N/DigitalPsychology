@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 from .protocol_artifact import (PROTOCOL_HASH, PROTOCOL_VERSION,
                                 QUESTION_REGISTRY, QUESTION_REGISTRY_HASH,
                                 STATE_PROJECTION_SCHEMA_HASH)
+from .laya_configuration import model_settings
 from .system_one_contracts import (QuestionAnswer, QuestionProbability,
                                    SystemOneCapability, SystemOneFrame,
                                    SystemOneIdentity, SystemOneJudgment,
@@ -292,21 +293,16 @@ class LayaProvider:
 
     @classmethod
     def from_environment(cls, *, model_id: str = "laya-typed-decisions") -> LayaProvider:
-        """Construct only from explicit, predownloaded model identity settings."""
+        """Construct only from a locally present, content-pinned checkpoint."""
         if importlib.util.find_spec("laya") is None:
             raise RuntimeError(
                 "Laya System-1 support is optional; install digital-psychology[laya]")
-        path = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_PATH", "")
-        revision = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION", "")
-        content_hash = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256", "")
-        model_id = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_ID", model_id)
-        if not path or not revision or not content_hash:
-            raise ValueError(
-                "Laya requires DIGITALPSYCHOLOGY_LAYA_MODEL_PATH, "
-                "DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION, and DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256")
-        return cls(path, model_id=model_id, model_revision=revision,
-                   expected_model_content_hash=content_hash,
-                   device=os.environ.get("DIGITALPSYCHOLOGY_LAYA_DEVICE", "cpu"),
+        settings = model_settings()
+        selected_model_id = os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_ID", model_id)
+        return cls(settings["model_path"], model_id=selected_model_id,
+                   model_revision=settings["model_revision"],
+                   expected_model_content_hash=settings["model_content_sha256"],
+                   device=settings["device"],
                    max_latency_ms=int(os.environ.get(
                        "DIGITALPSYCHOLOGY_LAYA_TIMEOUT_MS", str(MAX_SYSTEM_ONE_LATENCY_MS))))
 

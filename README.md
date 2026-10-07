@@ -254,13 +254,17 @@ disabled; they do not import Laya, load PyTorch, or download model weights. The
 Laya adapter uses the public `Agent.decide` API and is available only to a
 trusted host through `SystemOneService`; it is not an agent-facing MCP tool.
 
-The checkpoint must already exist on disk and be pinned by its library
-revision and content hash. Set these variables before constructing the
+The checkpoint must already exist on disk and match its pinned revision and
+content hash. The bundled checkpoint downloaded by `scripts/download_laya_model.py`
+is recognized at its default cache path, so the path, revision, hash, device,
+and timeout variables below are optional unless you use a different local
+checkpoint or device. Select the provider and mode before constructing the
 service with `SystemOneService.from_environment()`:
 
 ```text
 DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER=laya-native
 DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE=shadow
+# Optional overrides when using a non-default local setup:
 DIGITALPSYCHOLOGY_LAYA_MODEL_PATH=/local/path/to/pinned-checkpoint
 DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION=1a793eb568e6718f15941d08f85432581df534e3
 DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256=cda55a3e793f4c4268a25066ceb1568aa302fd210d96656e3032756fd722b642
@@ -278,17 +282,19 @@ the remaining criterion.
 It skips routine reversible actions, host-confirmed progress/regression,
 already-established repeated attempts, and critical WARD vetoes. At most one
 question is sent per boundary; a disabled question family is never replaced
-with a different one. For predictable CPU latency, set `OMP_NUM_THREADS=1`
-and `MKL_NUM_THREADS=1` in the trusted host environment.
+with a different one. Leave PyTorch's CPU thread defaults intact unless local
+latency measurements justify a different setting; forcing one thread can
+push task-frame inference over the provider's bounded deadline.
 
 The private `control_mcp` entrypoint constructs `SystemOneService` from these
 environment variables automatically. `MCPControlClient` launches that process
 as a separate host-owned child; set the variables in the host process
 environment and use the Python interpreter where `digital-psychology[laya]`
 is installed. Set `DIGITALPSYCHOLOGY_CONTROL_MCP_PYTHON` to that interpreter
-when the host's own Python environment differs. Host MCP calls have a bounded
-60-second deadline to accommodate CPU inference; each Laya inference remains
-bounded to 30 seconds.
+when the host's own Python environment differs. In shadow or advisory mode,
+the private client gives `prepare_control_tick` a 45-second deadline for a
+native Laya query; the provider itself remains bounded to 30 seconds. Other
+control operations keep their shorter defaults.
 By default, provider initialization runs in the background. A host that must
 exclude model loading from trial timing can set
 `DIGITALPSYCHOLOGY_SYSTEM_ONE_WARMUP_MODE=blocking`; the private DP process
@@ -335,17 +341,18 @@ later remain attached to the receipt that caused the intervention. Histories
 without the new fields are reported as unobserved; these metrics do not read
 the process-wide production counters.
 
-A local pinned-checkpoint smoke on 2026-10-07 returned one typed
-`progress_relation` answer through `SystemOneService` in shadow mode. The Laya
-library warned about invalid checkpoint temperatures and uncalibrated
-confidence; no calibration record was loaded. The
-[smoke record](evaluations/laya-shadow-smoke-2026-10-07.json) proves checkpoint
-loading and adapter output only; it does not establish accuracy or efficacy.
-Laya support is structurally available, but Laya efficacy is not yet qualified:
-the runtime is absent from the current qualification environment, no active
-family calibration is available, and no matched advisory outcome study has
-passed the required gates. Do not claim that Laya improves behavior until that
-evidence exists.
+A local pinned-checkpoint smoke on 2026-10-07 returned a typed
+`progress_relation` answer through `SystemOneService` in shadow mode. A second
+run exercised a real CFW/CSW/DP host session over a complete benchmark fixture:
+four host actions passed, the independent evaluator passed, Laya produced one
+valid shadow judgment, and the host recorded its later independent outcome.
+The [standalone smoke record](evaluations/laya-shadow-smoke-2026-10-07.json)
+and [live cohort record](evaluations/laya-live-cohort-shadow-2026-10-07.json)
+document these checks. The runtime is available in this local environment, but
+no family has an active calibration and shadow cannot influence behavior.
+The checkpoint also reports an invalid temperature for one choice, so affected
+confidence is uncalibrated. No matched advisory study has passed; these runs do
+not establish that Laya improves task outcomes.
 
 Run `digital-psychology-laya-doctor` in the trusted runtime environment to
 check the optional import, pinned checkpoint hash, provider protocol, current

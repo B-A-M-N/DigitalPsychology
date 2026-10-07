@@ -90,12 +90,12 @@ def _runtime_identity():
         application_instance_id="app-1", agent_instance_id="agent-instance",
         session_id="session", task_id="task", attempt_id="attempt",
         segment_id="segment", agent_id="agent", behavioral_subject="subject",
-        goal_contract_hash=None)
+        goal_contract_hash=None, scope="scope-1")
 
 
 def test_committed_system_one_decision_event_contains_pinned_answers():
     frame, judgment = _frame_and_judgment()
-    descriptor = SimpleNamespace(identity=_runtime_identity(), scope="scope-1")
+    descriptor = SimpleNamespace(identity=_runtime_identity())
     event = prepare_system_one_decision_event(descriptor, {
         "system_one": {
             "frame": frame.canonical_payload(),

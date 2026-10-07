@@ -38,6 +38,7 @@ _DEFAULT_TOOL_TIMEOUTS = {
     "read_behavioral_trial_record": 5.0,
     "record_system_one_outcome": 5.0,
 }
+_LAYA_PREPARE_CONTROL_TIMEOUT_SECONDS = 45.0
 
 
 @asynccontextmanager
@@ -100,6 +101,14 @@ class MCPControlClient:
         if legacy_timeout is not None:
             self.operation_timeouts = {
                 name: legacy_timeout for name in self.operation_timeouts}
+        else:
+            child_environment = env if env is not None else os.environ
+            if (child_environment.get("DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER")
+                    == "laya-native"
+                    and child_environment.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE")
+                    in {"shadow", "advisory"}):
+                self.operation_timeouts["prepare_control_tick"] = (
+                    _LAYA_PREPARE_CONTROL_TIMEOUT_SECONDS)
         if operation_timeouts is not None:
             if not isinstance(operation_timeouts, Mapping):
                 raise TypeError("MCP operation timeouts must be a mapping")

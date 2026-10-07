@@ -12,15 +12,10 @@ from huggingface_hub import snapshot_download
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from lib.laya_configuration import (DEFAULT_DESTINATION, MODEL_CONTENT_SHA256,
+                                    MODEL_REPOSITORY, MODEL_REVISION,
+                                    WEIGHTS_SHA256)
 from lib.system_one_backends import model_content_digest
-
-
-MODEL_REPOSITORY = "convaiinnovations/laya-typed-decisions"
-MODEL_REVISION = "1a793eb568e6718f15941d08f85432581df534e3"
-MODEL_CONTENT_SHA256 = "cda55a3e793f4c4268a25066ceb1568aa302fd210d96656e3032756fd722b642"
-WEIGHTS_SHA256 = "4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e"
-DEFAULT_DESTINATION = (
-    Path.home() / ".cache/laya/convaiinnovations-laya-typed-decisions-1a793eb")
 
 
 def main() -> int:

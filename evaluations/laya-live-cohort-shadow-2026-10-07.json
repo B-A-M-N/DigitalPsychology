@@ -1,0 +1,57 @@
+{
+  "schema_version": "laya-live-cohort-shadow-smoke/v1",
+  "observed_on_utc": "2026-10-07",
+  "scope": "real CFW plus CSW plus DP host actions with native Laya in shadow mode",
+  "synthetic_frame": false,
+  "agent_model_run": false,
+  "task": {
+    "task_family": "semantic_progress_relation",
+    "trajectory_count": 1,
+    "host_actions": 4,
+    "host_actions_authorized": 4,
+    "independent_evaluator_completion_success": true,
+    "final_host_check_score": 2,
+    "required_host_check_count": 2
+  },
+  "provider": {
+    "backend_id": "digitalpsychology-laya-native",
+    "model_id": "laya-typed-decisions",
+    "model_revision": "1a793eb568e6718f15941d08f85432581df534e3",
+    "model_content_sha256": "cda55a3e793f4c4268a25066ceb1568aa302fd210d96656e3032756fd722b642",
+    "provider_protocol_sha256": "6db0ed722d297b89728e2ea4d141392272634c8570c198223c9446808884380a",
+    "laya_library_version": "0.3.22",
+    "device": "cpu",
+    "mode": "shadow",
+    "enabled_question_families": ["progress_relation"],
+    "warmup_latency_ms": 21743
+  },
+  "semantic_observation": {
+    "query_opportunities": 3,
+    "query_attempts": 1,
+    "valid_results": 1,
+    "query_failures": 0,
+    "advisory_results": 0,
+    "influenced_decisions": 0,
+    "progress_relation_query_opportunities": 1,
+    "progress_relation_valid_results": 1,
+    "progress_relation_mean_latency_ms": 22558.359,
+    "independent_outcome_receipt_status": "recorded",
+    "independent_outcome_label": "goal_progress"
+  },
+  "control_path": {
+    "dp_boundary_status": "ready",
+    "private_control_mcp": true,
+    "mcp_prepare_control_tick_calls": 9,
+    "mcp_prepare_control_tick_max_latency_ms": 22701.2,
+    "mcp_prepare_control_tick_total_latency_ms": 23519.278,
+    "private_trial_database_retained": false
+  },
+  "provider_warning": "The checkpoint reports an invalid temperature for one choice; confidence from the affected entries is uncalibrated.",
+  "limitations": [
+    "This is one real host-controlled task trajectory, not a calibration corpus.",
+    "No agent model generated the actions; the host integration and evaluator were exercised directly.",
+    "Shadow judgments are persisted but cannot change the deterministic behavior selection.",
+    "No active per-family calibration was loaded, so this run does not establish advisory efficacy or system improvement.",
+    "Only progress_relation was enabled; the remaining families were not efficacy-screened here."
+  ]
+}

@@ -93,7 +93,7 @@ def prepare_system_one_decision_event(
             receipt.get("changed_statework_preference", False)),
     }
     event_id = "dp-s1-" + hashlib.sha256(
-        f"{descriptor.scope}|{judgment.request_id}".encode("utf-8")).hexdigest()[:40]
+        f"{identity.scope}|{judgment.request_id}".encode("utf-8")).hexdigest()[:40]
     event = Event(
         event_id=event_id,
         timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -111,7 +111,7 @@ def prepare_system_one_decision_event(
         event_type="system_one_decision",
         actor_id="digitalpsychology_runtime",
         authority_source="digitalpsychology_system_one",
-        scope=descriptor.scope,
+        scope=identity.scope,
         goal_contract_hash=identity.goal_contract_hash,
         interaction_id=frame.identity.interaction_id,
         provider_id=judgment.backend_id,

@@ -5,6 +5,10 @@
   "scope": "local checkpoint and SystemOneService shadow-path smoke",
   "synthetic_frame": true,
   "harness_turn": false,
+  "runtime_loaded": true,
+  "typed_judgment": true,
+  "warmup_latency_ms": 23219,
+  "total_latency_ms": 41639,
   "provider": {
     "backend_id": "digitalpsychology-laya-native",
     "model_id": "laya-typed-decisions",
@@ -22,7 +26,7 @@
     "selected_label": "verification_progress",
     "calibrated": false,
     "calibrated_question_ids": [],
-    "latency_ms": 12260
+    "latency_ms": 15885
   },
   "provider_warning": "laya: this checkpoint ships invalid temperatures or values outside [0.5, 5]; using choice:11+=0.10058280825614929 -> 0.5. Treat confidence from the affected entries as uncalibrated.",
   "limitations": [

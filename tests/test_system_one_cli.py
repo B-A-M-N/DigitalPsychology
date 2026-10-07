@@ -138,6 +138,10 @@ def test_laya_smoke_runs_one_typed_shadow_judgment_and_closes_provider(monkeypat
         def warmup(self):
             self.warmed = True
 
+        def warmup_and_wait(self):
+            self.warmed = True
+            return 1
+
         def close(self):
             self.closed = True
 
