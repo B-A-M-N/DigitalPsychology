@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import importlib.util
 import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -20,8 +22,10 @@ from .system_one_contracts import (ActivityFact, CriterionState, QuestionSpec,
                                    SemanticState, SystemOneFrame,
                                    SystemOneIdentity, SystemOneJudgment,
                                    canonical_hash)
-from .system_one_calibration import (CalibrationRecord, calibration_metrics,
+from .system_one_calibration import (CalibrationBundle, CalibrationRecord, calibration_metrics,
                                      calibration_record_from_events)
+from .system_one_learning import (CalibrationLifecycleError,
+                                  SystemOneCalibrationLifecycle)
 from .system_one_service import SystemOneService
 
 
@@ -365,6 +369,197 @@ def laya_smoke_main(argv: list[str] | None = None) -> int:
     return 0 if report["success"] else 1
 
 
+def _read_private_json(path: Path, *, description: str) -> Any:
+    supplied = path.expanduser()
+    if supplied.is_symlink():
+        raise ValueError(f"{description} must not be a symlink")
+    try:
+        info = supplied.stat()
+    except OSError as exc:
+        raise ValueError(f"{description} is unavailable") from exc
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        raise ValueError(f"{description} must be a user-owned mode-0600 regular file")
+    try:
+        return json.loads(supplied.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{description} contains invalid JSON") from exc
+
+
+def _trusted_output_parent(path: Path) -> Path:
+    parent = path.expanduser().absolute().parent
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if any(ancestor.is_symlink() for ancestor in (parent, *parent.parents)):
+        raise ValueError("private JSON output directory must not traverse symlinks")
+    if (parent.stat().st_uid != os.getuid() or parent.stat().st_mode & 0o022):
+        raise ValueError("private JSON output directory is not trusted")
+    return parent
+
+
+def _bundle_file_digest(path: Path) -> str:
+    raw = _read_private_json(path, description="existing active bundle")
+    return CalibrationBundle.from_mapping(raw).digest
+
+
+def _write_active_bundle(path: Path, bundle: CalibrationBundle, *,
+                         expected_file_hash: str | None) -> None:
+    """Atomically export an active bundle if its current file still matches."""
+    parent = _trusted_output_parent(path)
+    target = parent / path.name
+
+    def check_precondition() -> None:
+        if target.is_symlink():
+            raise ValueError("active bundle output must not be a symlink")
+        if target.exists():
+            if expected_file_hash is None:
+                raise ValueError("active bundle output appeared during activation")
+            if _bundle_file_digest(target) != expected_file_hash:
+                raise ValueError("active bundle output changed during activation")
+        elif expected_file_hash is not None:
+            raise ValueError("active bundle output disappeared during activation")
+
+    check_precondition()
+    fd, temporary = tempfile.mkstemp(prefix=".laya-active-bundle-", dir=parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(bundle.to_dict(), stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        check_precondition()
+        os.replace(temporary, target)
+        directory_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def laya_activate_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Activate a qualified Laya calibration candidate after host review")
+    parser.add_argument("--candidate", required=True,
+                        help="mode-0600 candidate CalibrationRecord JSON")
+    parser.add_argument("--candidate-digest", required=True,
+                        help="expected SHA-256 digest printed by laya-qualify")
+    parser.add_argument("--question-family", required=True,
+                        choices=tuple(QUESTION_REGISTRY))
+    parser.add_argument("--lifecycle", required=True,
+                        help="mode-0600 calibration lifecycle state path")
+    parser.add_argument("--output", required=True,
+                        help="runtime active bundle path to create or replace")
+    parser.add_argument("--authority-ref", required=True,
+                        help="independent host review reference for this activation")
+    parser.add_argument("--expected-prior-hash", required=True,
+                        help="current active bundle digest, or 'none' when no family is active")
+    args = parser.parse_args(argv)
+
+    try:
+        candidate_path = Path(args.candidate).expanduser()
+        lifecycle_path = Path(args.lifecycle).expanduser()
+        output_path = Path(args.output).expanduser()
+        if not args.authority_ref or len(args.authority_ref) > 256:
+            raise ValueError("activation requires a bounded independent host review reference")
+        path_keys = {str(path.absolute()) for path in
+                     (candidate_path, lifecycle_path, output_path)}
+        if len(path_keys) != 3:
+            raise ValueError("candidate, lifecycle, and active bundle paths must be distinct")
+
+        raw_candidate = _read_private_json(candidate_path, description="calibration candidate")
+        candidate = CalibrationRecord.from_mapping(raw_candidate)
+        if candidate.digest != args.candidate_digest:
+            raise ValueError("candidate digest does not match --candidate-digest")
+        if candidate.status != "candidate" or candidate.question_id != args.question_family:
+            raise ValueError("candidate status or question family is not eligible")
+        if not candidate.qualification_passed or candidate.drift_status != "clear":
+            raise ValueError("candidate does not pass the independent qualification gate")
+        if candidate.backend_id != "digitalpsychology-laya-native":
+            raise ValueError("candidate was not qualified for the native Laya provider")
+        if candidate.provider_protocol_hash != PROVIDER_PROTOCOL_HASH:
+            raise ValueError("candidate provider protocol differs from this runtime")
+        identity_pins = {
+            "model_id": os.environ.get(
+                "DIGITALPSYCHOLOGY_LAYA_MODEL_ID", "laya-typed-decisions"),
+            "model_revision": os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION", ""),
+            "model_content_hash": os.environ.get("DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256", ""),
+        }
+        if (not identity_pins["model_revision"]
+                or len(identity_pins["model_content_hash"]) != 64
+                or any(char not in "0123456789abcdef"
+                       for char in identity_pins["model_content_hash"])):
+            raise ValueError("activation requires a pinned Laya model revision and SHA-256")
+        for field, expected in identity_pins.items():
+            if getattr(candidate, field) != expected:
+                raise ValueError(f"candidate {field} differs from the configured Laya pin")
+
+        _trusted_output_parent(lifecycle_path)
+        _trusted_output_parent(output_path)
+        lifecycle = SystemOneCalibrationLifecycle(lifecycle_path)
+        revision = lifecycle.revision()
+        before_bundle = lifecycle.active_bundle()
+        prior_hash = before_bundle.digest
+        if args.expected_prior_hash == "none":
+            supplied_prior = ""
+        elif len(args.expected_prior_hash) == 64 and not any(
+                char not in "0123456789abcdef" for char in args.expected_prior_hash):
+            supplied_prior = args.expected_prior_hash
+        else:
+            raise ValueError("expected prior hash must be a lowercase SHA-256 digest or 'none'")
+        if supplied_prior != prior_hash:
+            raise ValueError("expected prior hash differs from the active lifecycle bundle")
+
+        output_exists = output_path.exists() or output_path.is_symlink()
+        output_prior_hash: str | None = None
+        if output_exists:
+            output_prior_hash = _bundle_file_digest(output_path)
+            if output_prior_hash != prior_hash:
+                raise ValueError("exported active bundle differs from lifecycle state")
+
+        staged = lifecycle.stage(candidate, expected_revision=revision)
+        activation = lifecycle.activate(
+            staged["candidate_id"], question_id=args.question_family,
+            authority_ref=args.authority_ref, expected_revision=staged["revision"])
+        active_bundle = lifecycle.active_bundle()
+        active_record = active_bundle.records.get(args.question_family)
+        expected_active = candidate.with_status("active")
+        if (active_record is None or active_record.digest != expected_active.digest
+                or active_record.status != "active" or not active_record.qualification_passed
+                or active_record.drift_status != "clear"):
+            raise CalibrationLifecycleError("activated bundle failed post-activation validation")
+        _write_active_bundle(output_path, active_bundle,
+                             expected_file_hash=output_prior_hash)
+        receipt = {
+            "schema_version": "laya-activation-receipt/v1",
+            "success": True,
+            "activated_at": datetime.now(timezone.utc).isoformat(),
+            "question_family": args.question_family,
+            "candidate_digest": candidate.digest,
+            "model_id": active_record.model_id,
+            "model_revision": active_record.model_revision,
+            "checkpoint_hash": active_record.model_content_hash,
+            "active_calibration_digest": active_record.digest,
+            "prior_bundle_hash": prior_hash or None,
+            "active_bundle_hash": active_bundle.digest,
+            "lifecycle_revision": activation["revision"],
+            "authority_ref": args.authority_ref,
+            "lifecycle_path": str(lifecycle_path),
+            "active_bundle_path": str(output_path),
+            "active_bundle_mode": "0600",
+        }
+        print(json.dumps(receipt, sort_keys=True, indent=2))
+        return 0
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        print(f"activation failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def load_authenticated_system_one_events(path: str | Path) -> list[Any]:
     """Read only authenticated decision/outcome events from the event store."""
     supplied_path = Path(path).expanduser()
@@ -498,5 +693,5 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
 
 
 __all__ = ["laya_doctor_main", "laya_doctor_report", "laya_qualify_main",
-           "laya_smoke_main", "laya_smoke_report",
+           "laya_activate_main", "laya_smoke_main", "laya_smoke_report",
            "load_authenticated_system_one_events"]

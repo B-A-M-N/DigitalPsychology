@@ -358,6 +358,19 @@ activation still requires independent host review through
 `SystemOneCalibrationLifecycle`. Threshold flags may make qualification
 stricter, but cannot weaken those production minimums.
 
+After independent host review, activate a candidate with
+`digital-psychology-laya-activate --candidate CANDIDATE.json
+--candidate-digest SHA256 --question-family FAMILY --lifecycle STATE.json
+--output ACTIVE.json --authority-ref REVIEW_ID
+--expected-prior-hash none`. For later updates, pass the current active bundle
+hash instead of `none`. The command verifies the candidate digest, status,
+qualification, provider protocol, and configured model pins; checks any
+existing exported active bundle against lifecycle state; and emits a JSON receipt
+on stdout after writing the active bundle atomically with mode 0600. Set
+`DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION` and
+`DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256` to the target checkpoint pins before
+activation; the candidate identity must match them.
+
 ### Generic loopback HTTP provider
 
 Hosts that run the provider in a separate local process can select the generic

@@ -580,6 +580,56 @@ def test_calibration_lifecycle_stages_activates_and_exports_active_bundle(tmp_pa
         CalibrationBundle.from_mapping(legacy)
 
 
+def test_laya_activation_cli_checks_prior_hash_and_writes_private_active_bundle(
+        tmp_path, monkeypatch, capsys):
+    from lib import system_one_cli
+
+    candidate = replace(
+        calibration_record(status="candidate"),
+        backend_id="digitalpsychology-laya-native",
+        provider_protocol_hash=system_one_cli.PROVIDER_PROTOCOL_HASH,
+    )
+    monkeypatch.setenv("DIGITALPSYCHOLOGY_LAYA_MODEL_ID", candidate.model_id)
+    monkeypatch.setenv("DIGITALPSYCHOLOGY_LAYA_MODEL_REVISION", candidate.model_revision)
+    monkeypatch.setenv("DIGITALPSYCHOLOGY_LAYA_MODEL_SHA256", candidate.model_content_hash)
+    candidate_path = tmp_path / "candidate.json"
+    lifecycle_path = tmp_path / "lifecycle.json"
+    bundle_path = tmp_path / "active.json"
+    system_one_cli._write_candidate(candidate_path, candidate)
+    args = [
+        "--candidate", str(candidate_path),
+        "--candidate-digest", candidate.digest,
+        "--question-family", "progress_relation",
+        "--lifecycle", str(lifecycle_path),
+        "--output", str(bundle_path),
+        "--authority-ref", "host-review-42",
+        "--expected-prior-hash", "none",
+    ]
+
+    bad_digest_args = list(args)
+    bad_digest_args[bad_digest_args.index(candidate.digest)] = "0" * 64
+    assert system_one_cli.laya_activate_main(bad_digest_args) == 1
+    capsys.readouterr()
+    assert not lifecycle_path.exists()
+
+    assert system_one_cli.laya_activate_main(args) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    active_bundle = CalibrationBundle.from_mapping(
+        json.loads(bundle_path.read_text(encoding="utf-8")))
+    assert receipt["candidate_digest"] == candidate.digest
+    assert receipt["prior_bundle_hash"] is None
+    assert receipt["active_bundle_hash"] == active_bundle.digest
+    assert receipt["active_bundle_mode"] == "0600"
+    assert active_bundle.records["progress_relation"].status == "active"
+    assert bundle_path.stat().st_mode & 0o777 == 0o600
+    assert lifecycle_path.stat().st_mode & 0o777 == 0o600
+
+    revision_before = SystemOneCalibrationLifecycle(lifecycle_path).revision()
+    assert system_one_cli.laya_activate_main(args) == 1
+    capsys.readouterr()
+    assert SystemOneCalibrationLifecycle(lifecycle_path).revision() == revision_before
+
+
 def test_digital_psychology_service_composes_system_one_without_an_mcp_tool(tmp_path):
     from lib.mcp_server import DigitalPsychologyService
 
