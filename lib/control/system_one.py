@@ -155,14 +155,18 @@ def create_system_one_frame_factory(system_one_service: Any):
         uncertain_dimensions: list[str] = []
         candidate_action_uncertain = bool(
             candidate is not None
-            and (candidate.relation_certainty == "unknown" or candidate.external
-                 or (candidate.mutating and not candidate.reversible)))
+            and (candidate.external
+                 or (candidate.mutating and (
+                     candidate.relation_certainty == "unknown"
+                     or not candidate.reversible))))
         retry_ambiguous = (retry_count == 1 or (retry_signal and retry_count < 2))
         progress_ambiguous = bool(
             observation.action_completed and not observation.progress_made
             and not observation.regression_observed
             and (observation.artifact_changed or observation.evidence_refs))
-        if candidate_action_uncertain or drift_signal:
+        candidate_drift_uncertain = bool(
+            drift_signal and (candidate is None or candidate.mutating or candidate.external))
+        if candidate_action_uncertain or candidate_drift_uncertain:
             uncertain_dimensions.append("action_relation")
         if retry_ambiguous:
             uncertain_dimensions.append("retry_relation")

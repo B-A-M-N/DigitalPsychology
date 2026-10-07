@@ -116,8 +116,10 @@ class SemanticQueryPlanner:
                 question = "action_relation"
                 reason = "CFW reports possible goal drift in a consequential candidate"
                 voi = 0.78
-            elif (candidate.relation_certainty == "unknown" or candidate.external
-                  or (candidate.mutating and not candidate.reversible)):
+            elif (candidate.external
+                  or (candidate.mutating and (
+                      candidate.relation_certainty == "unknown"
+                      or not candidate.reversible))):
                 question = "action_relation"
                 reason = "candidate goal relation is unknown or consequential"
                 voi = 0.72

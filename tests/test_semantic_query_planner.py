@@ -65,6 +65,35 @@ def test_irreversible_or_external_candidate_requests_action_relation():
     assert plan.question_id == "action_relation"
 
 
+def test_unknown_read_stays_unattributed_without_spending_a_semantic_query():
+    candidate = ActionCandidate(
+        action_id="read-1", action_class="read", tool_name="read",
+        operation="read", proposed_purpose="unclassified task action",
+        affected_criterion_ids=(), relation_certainty="unknown", mutating=False)
+
+    plan = SemanticQueryPlanner().plan(
+        RuntimeObservation(action_index=1, action_completed=False,
+                          goal_set=_goals(), candidate_action=candidate),
+        policy_ambiguity=_ambiguity("action_relation"))
+
+    assert not plan.should_query
+
+
+def test_unknown_write_requests_semantics_when_the_relation_can_change_policy():
+    candidate = ActionCandidate(
+        action_id="write-1", action_class="write", tool_name="write",
+        operation="write", proposed_purpose="unclassified task action",
+        affected_criterion_ids=(), relation_certainty="unknown", mutating=True,
+        reversible=False)
+
+    plan = SemanticQueryPlanner().plan(
+        RuntimeObservation(action_index=1, action_completed=False,
+                          goal_set=_goals(), candidate_action=candidate),
+        policy_ambiguity=_ambiguity("action_relation"))
+
+    assert plan.question_id == "action_relation"
+
+
 def test_host_confirmed_progress_does_not_spend_laya_latency():
     plan = SemanticQueryPlanner().plan(
         RuntimeObservation(action_index=2, action_completed=True,

@@ -434,7 +434,7 @@ def test_system_one_frame_uses_host_deliverable_and_truthful_optional_counters()
     assert frame.state.situation["verification_actions_since_artifact_change"] == 2
 
 
-def test_unbound_diagnostic_candidate_remains_unknown_and_semantic_criteria_prioritize_starvation():
+def test_unbound_write_candidate_remains_unknown_and_semantic_criteria_prioritize_starvation():
     identity = RuntimeIdentity(
         namespace_id="tenant-a", application_id="codex",
         application_instance_id="codex-local", agent_instance_id="agent-1",
@@ -449,11 +449,11 @@ def test_unbound_diagnostic_candidate_remains_unknown_and_semantic_criteria_prio
             claim=f"Complete requested criterion {index}.",
         ) for index in range(1, 21)))
     candidate = ActionCandidate(
-        action_id="diagnostic-read", action_class="read",
-        tool_name="read_file", operation="inspect",
-        proposed_purpose="Inspect the current failure evidence",
+        action_id="unclassified-write", action_class="write",
+        tool_name="write_file", operation="write",
+        proposed_purpose="Unclassified host task action",
         affected_criterion_ids=(), relation_certainty="unknown",
-        mutating=False, reversible=True)
+        mutating=True, reversible=False)
     seen = {f"criterion-{index:02d}": 4 for index in range(1, 19)}
     seen.update({"criterion-19": 0, "criterion-20": 0})
     service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")

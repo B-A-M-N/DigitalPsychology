@@ -32,9 +32,17 @@ def test_mutating_diagnostic_action_can_remain_unattributed_before_execution():
     assert candidate.mutating
 
 
+def test_uncertain_write_can_remain_unattributed_before_execution():
+    candidate = _candidate(action_class="write", mutating=True)
+
+    assert candidate.affected_criterion_ids == ()
+    assert candidate.relation_certainty == "unknown"
+    assert candidate.to_dict()["affected_criterion_ids"] == []
+
+
 def test_goal_directed_action_still_requires_explicit_or_inferred_criterion_binding():
     with pytest.raises(ValueError, match="criterion-free candidates"):
-        _candidate(action_class="file_edit")
+        _candidate(action_class="file_edit", certainty="explicit")
     with pytest.raises(ValueError, match="unknown relation certainty"):
         _candidate(action_class="diagnostic", criteria=("criterion-1",))
 

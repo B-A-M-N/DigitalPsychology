@@ -63,15 +63,9 @@ class ActionCandidate:
                 or any(not isinstance(item, str) or not item or len(item) > 128
                        for item in criteria)):
             raise ValueError("candidate criteria must be unique bounded IDs")
-        action_class = self.action_class.lower().replace("-", "_")
-        permits_unbound_support = (
-            action_class in {"diagnostic", "support", "read", "observation", "observational"}
-            or action_class.startswith(("diagnostic_", "support_", "read_", "observe_")))
-        if not criteria and (
-                not permits_unbound_support or self.relation_certainty != "unknown"):
+        if not criteria and self.relation_certainty != "unknown":
             raise ValueError(
-                "criterion-free candidates require diagnostic/support/read class "
-                "and unknown relation certainty")
+                "criterion-free candidates require unknown relation certainty")
         if criteria and self.relation_certainty == "unknown":
             raise ValueError("unknown relation certainty cannot claim affected criteria")
         target_refs = tuple(self.target_ref_digests)
