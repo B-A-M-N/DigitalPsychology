@@ -49,6 +49,7 @@ def prepare_system_one_decision_event(
         and (receipt.get("changed_selection") or receipt.get("changed_mode")
              or receipt.get("changed_frameworks")
              or receipt.get("changed_statework_preference")))
+    receipt = receipt if isinstance(receipt, Mapping) else {}
     payload = {
         "system_one_decision_id": judgment.request_id,
         "system_one_mode": "shadow" if status == "shadow" else "advisory",
@@ -75,6 +76,21 @@ def prepare_system_one_decision_event(
         "system_one_answers": {
             answer.question_id: answer.to_dict() for answer in judgment.answers},
         "system_one_semantic_influenced": semantic_influenced,
+        "system_one_tick_id": str(basis.get("tick_id") or ""),
+        "system_one_boundary_kind": str(basis.get("boundary_kind") or ""),
+        "system_one_boundary_sequence": int(basis.get("boundary_sequence", 0)),
+        "system_one_action_index": int(basis.get("host_action_index", 0)),
+        "system_one_question_ids": [answer.question_id for answer in judgment.answers],
+        "system_one_semantic_influence_receipt_id": receipt.get("receipt_id"),
+        "system_one_counterfactual_candidate_id": receipt.get(
+            "counterfactual_candidate_id"),
+        "system_one_selected_candidate_id": receipt.get("selected_candidate_id"),
+        "system_one_changed_selection": bool(receipt.get("changed_selection", False)),
+        "system_one_changed_mode": bool(receipt.get("changed_mode", False)),
+        "system_one_changed_frameworks": list(
+            receipt.get("changed_frameworks") or ()),
+        "system_one_changed_statework_preference": bool(
+            receipt.get("changed_statework_preference", False)),
     }
     event_id = "dp-s1-" + hashlib.sha256(
         f"{descriptor.scope}|{judgment.request_id}".encode("utf-8")).hexdigest()[:40]
@@ -120,7 +136,8 @@ class SystemOneOutcomeLabeler:
 
     def record(self, *, decision_event_id: str, namespace_id: str,
                application_instance_id: str, question_id: str, label: str,
-               authority: str, evidence_ref: str) -> str:
+               authority: str, evidence_ref: str,
+               expected_scope: str | None = None) -> str:
         if question_id not in QUESTION_REGISTRY:
             raise ValueError("unsupported System-1 outcome question family")
         if authority not in VALID_OUTCOME_AUTHORITIES:
@@ -136,6 +153,8 @@ class SystemOneOutcomeLabeler:
                 or decision.actor_id != "digitalpsychology_runtime"
                 or decision.authority_source != "digitalpsychology_system_one"):
             raise ValueError("outcome must reference an authenticated System-1 decision")
+        if expected_scope is not None and decision.scope != expected_scope:
+            raise ValueError("outcome decision escaped its host control session")
         payload = decision.payload or {}
         decision_id = payload.get("system_one_decision_id")
         answers = payload.get("system_one_answers")

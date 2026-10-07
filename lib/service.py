@@ -190,7 +190,8 @@ class DigitalPsychologyService:
                                   namespace_id: str,
                                   application_instance_id: str,
                                   question_id: str, label: str,
-                                  authority: str, evidence_ref: str) -> str:
+                                  authority: str, evidence_ref: str,
+                                  control_session_id: str | None = None) -> str:
         """Persist one later label supplied by a trusted evidence authority."""
         return self._system_one_outcomes.record(
             decision_event_id=decision_event_id,
@@ -199,7 +200,8 @@ class DigitalPsychologyService:
             question_id=question_id,
             label=label,
             authority=authority,
-            evidence_ref=evidence_ref)
+            evidence_ref=evidence_ref,
+            expected_scope=control_session_id)
 
     def _record_intervention_event(
             self, event_context: InterventionEventContext, *, category: str,

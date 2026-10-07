@@ -22,6 +22,16 @@ class ControlTransitionTrace:
     semantic_judgment_returned: bool
     semantic_judgment_used: bool
     semantic_query_failed: bool
+    semantic_question_ids: tuple[str, ...]
+    semantic_influence_receipt_id: str | None
+    semantic_influenced_decision: bool
+    semantic_candidate_change: bool
+    semantic_mode_change: bool
+    semantic_framework_changes: int
+    semantic_statework_change: bool
+    semantic_influenced_interventions: int
+    semantic_effective_interventions: int
+    semantic_ineffective_interventions: int
     goal_drift_detected: bool
     goal_drift_intervention_applied: bool
     cfw_rejection_stage: str | None
@@ -48,6 +58,8 @@ class ControlTransitionTrace:
             raise ValueError("control transition causes must be bounded text")
         for name in ("semantic_query_attempted", "semantic_judgment_returned",
                      "semantic_judgment_used", "semantic_query_failed",
+                     "semantic_influenced_decision", "semantic_candidate_change",
+                     "semantic_mode_change", "semantic_statework_change",
                      "goal_drift_detected", "goal_drift_intervention_applied",
                      "ward_hard_safety"):
             if type(getattr(self, name)) is not bool:
@@ -58,6 +70,22 @@ class ControlTransitionTrace:
             raise ValueError("a semantic judgment cannot be used without being returned")
         if self.semantic_query_failed and not self.semantic_query_attempted:
             raise ValueError("a semantic query cannot fail without being attempted")
+        questions = tuple(self.semantic_question_ids)
+        if (len(questions) > 8 or len(questions) != len(set(questions))
+                or any(not isinstance(item, str) or not item or len(item) > 64
+                       for item in questions)):
+            raise ValueError("control transition semantic questions are malformed")
+        if self.semantic_influence_receipt_id is not None and (
+                not isinstance(self.semantic_influence_receipt_id, str)
+                or not self.semantic_influence_receipt_id
+                or len(self.semantic_influence_receipt_id) > 128):
+            raise ValueError("control transition influence receipt ID is malformed")
+        for name in ("semantic_framework_changes", "semantic_influenced_interventions",
+                     "semantic_effective_interventions",
+                     "semantic_ineffective_interventions"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"control transition {name} must be non-negative")
         if self.cfw_rejection_stage not in {
                 None, "cfw_preflight", "cfw_final_gate"}:
             raise ValueError("control transition CFW rejection stage is invalid")
@@ -79,6 +107,7 @@ class ControlTransitionTrace:
                 raise ValueError("control transition gate receipts are invalid")
             object.__setattr__(self, "cfw_gate_receipts", dict(self.cfw_gate_receipts))
         object.__setattr__(self, "transition_causes", causes)
+        object.__setattr__(self, "semantic_question_ids", questions)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -95,6 +124,16 @@ class ControlTransitionTrace:
             "semantic_judgment_returned": self.semantic_judgment_returned,
             "semantic_judgment_used": self.semantic_judgment_used,
             "semantic_query_failed": self.semantic_query_failed,
+            "semantic_question_ids": list(self.semantic_question_ids),
+            "semantic_influence_receipt_id": self.semantic_influence_receipt_id,
+            "semantic_influenced_decision": self.semantic_influenced_decision,
+            "semantic_candidate_change": self.semantic_candidate_change,
+            "semantic_mode_change": self.semantic_mode_change,
+            "semantic_framework_changes": self.semantic_framework_changes,
+            "semantic_statework_change": self.semantic_statework_change,
+            "semantic_influenced_interventions": self.semantic_influenced_interventions,
+            "semantic_effective_interventions": self.semantic_effective_interventions,
+            "semantic_ineffective_interventions": self.semantic_ineffective_interventions,
             "goal_drift_detected": self.goal_drift_detected,
             "goal_drift_intervention_applied": self.goal_drift_intervention_applied,
             "cfw_rejection_stage": self.cfw_rejection_stage,

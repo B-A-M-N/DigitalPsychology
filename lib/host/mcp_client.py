@@ -24,7 +24,7 @@ from ..compatibility import validate_control_capabilities
 DP_CONTROL_TOOLS = frozenset({
     "open_control_session", "prepare_control_tick", "commit_control_tick",
     "abort_control_tick", "reconcile_control_session", "close_control_session",
-    "read_behavioral_trial_record",
+    "read_behavioral_trial_record", "record_system_one_outcome",
 })
 _CONTROL_TOOLS = DP_CONTROL_TOOLS
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 8.0
@@ -36,6 +36,7 @@ _DEFAULT_TOOL_TIMEOUTS = {
     "reconcile_control_session": 6.0,
     "close_control_session": 3.0,
     "read_behavioral_trial_record": 5.0,
+    "record_system_one_outcome": 5.0,
 }
 
 
@@ -252,6 +253,11 @@ class MCPControlClient:
             "control_session_id": control_session_id,
             "trial_id": trial_id,
         }})
+
+    async def record_system_one_outcome(
+            self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return await self._call("record_system_one_outcome", {
+            "request": dict(request)})
 
     async def _call(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         if name not in _CONTROL_TOOLS:

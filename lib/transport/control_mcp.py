@@ -93,6 +93,11 @@ def create_control_server(control: ControlPlaneService | None = None):
         return control.behavioral_trial_record(
             data["control_session_id"], trial_id=data["trial_id"])
 
+    @server.tool()
+    async def record_system_one_outcome(request: dict[str, Any]) -> dict[str, Any]:
+        """Record an independently evidenced label from the trusted host."""
+        return control.record_system_one_outcome(request)
+
     return server
 
 

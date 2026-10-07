@@ -864,6 +864,55 @@
         "system_one_semantic_influenced": {
           "type": "boolean"
         },
+        "system_one_tick_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "system_one_boundary_kind": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "system_one_boundary_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "system_one_action_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "system_one_question_ids": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 64}
+        },
+        "system_one_semantic_influence_receipt_id": {
+          "type": ["string", "null"],
+          "maxLength": 128
+        },
+        "system_one_counterfactual_candidate_id": {
+          "type": ["string", "null"],
+          "maxLength": 128
+        },
+        "system_one_selected_candidate_id": {
+          "type": ["string", "null"],
+          "maxLength": 128
+        },
+        "system_one_changed_selection": {
+          "type": "boolean"
+        },
+        "system_one_changed_mode": {
+          "type": "boolean"
+        },
+        "system_one_changed_frameworks": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 64}
+        },
+        "system_one_changed_statework_preference": {
+          "type": "boolean"
+        },
         "metacognitive_control_changed": {
           "type": "boolean"
         },

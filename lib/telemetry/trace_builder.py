@@ -16,6 +16,25 @@ def build_control_transition_trace(scope: str, prior_state: BehaviorState,
     from ..telemetry.control_trace import ControlTransitionTrace
 
     facts = dict(basis.get("behavioral_facts") or {})
+    raw_receipt = basis.get("semantic_influence_receipt")
+    receipt = dict(raw_receipt) if isinstance(raw_receipt, Mapping) else {}
+    receipt_id = receipt.get("receipt_id")
+    question_ids = tuple(
+        str(item) for item in receipt.get("question_ids", ())
+        if isinstance(item, str))[:8]
+    semantic_influenced = any(receipt.get(name) is True for name in (
+        "changed_selection", "changed_mode", "changed_statework_preference"))
+    semantic_influenced = semantic_influenced or bool(receipt.get("changed_frameworks"))
+    old_intervention_ids = {item.intervention_id for item in prior_state.active_interventions}
+    influenced_interventions = sum(
+        1 for item in state.active_interventions
+        if receipt_id and item.intervention_id not in old_intervention_ids
+        and item.semantic_influence_receipt_id == receipt_id)
+    linked_outcomes = [item for item in decision.intervention_outcomes
+                       if item.semantic_influence_receipt_id]
+    effective_interventions = sum(item.outcome == "effective" for item in linked_outcomes)
+    ineffective_interventions = sum(
+        item.outcome in {"ineffective", "regressed"} for item in linked_outcomes)
     from ..telemetry.behavioral_trace import classify_justification
     evidence_classes = []
     if facts.get("evidence_refs"):
@@ -73,6 +92,17 @@ def build_control_transition_trace(scope: str, prior_state: BehaviorState,
             basis.get("semantic_judgment_returned")),
         semantic_judgment_used=bool(basis.get("semantic_judgment_used")),
         semantic_query_failed=bool(basis.get("semantic_query_failed")),
+        semantic_question_ids=question_ids,
+        semantic_influence_receipt_id=(
+            str(receipt_id) if isinstance(receipt_id, str) and receipt_id else None),
+        semantic_influenced_decision=semantic_influenced,
+        semantic_candidate_change=bool(receipt.get("changed_selection")),
+        semantic_mode_change=bool(receipt.get("changed_mode")),
+        semantic_framework_changes=len(tuple(receipt.get("changed_frameworks") or ())),
+        semantic_statework_change=bool(receipt.get("changed_statework_preference")),
+        semantic_influenced_interventions=influenced_interventions,
+        semantic_effective_interventions=effective_interventions,
+        semantic_ineffective_interventions=ineffective_interventions,
         goal_drift_detected=drift_detected,
         goal_drift_intervention_applied=drift_applied,
         cfw_rejection_stage=(str(stage) if stage else None),

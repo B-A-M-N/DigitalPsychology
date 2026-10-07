@@ -13,6 +13,8 @@ class HostDegradation:
         self.host = bridge
 
     def _status(self, result: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        decision_refs = (result.get("system_one_decision_refs", ())
+                         if isinstance(result, Mapping) else ())
         return {
             "status": "degraded" if self.host._fault else "ready",
             "control_session_id": self.host.identity.scope,
@@ -20,6 +22,8 @@ class HostDegradation:
             "host_action_index": self.host._action_index,
             "behavior_state": self.host._state.to_dict(),
             "result": dict(result) if result is not None else None,
+            "system_one_decision_refs": [dict(item) for item in decision_refs
+                                         if isinstance(item, Mapping)][:8],
             "fault": self.host._fault,
         }
 

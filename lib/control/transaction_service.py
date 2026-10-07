@@ -582,6 +582,28 @@ class ControlTransactionMethods:
             "system_one_decision_event_ids": [
                 str(item["event_id"]) for item in event_values
                 if item.get("event_type") == "system_one_decision"],
+            "system_one_decision_refs": [
+                {
+                    "event_id": str(item["event_id"]),
+                    "decision_id": str((item.get("payload") or {}).get(
+                        "system_one_decision_id") or ""),
+                    "question_ids": list((item.get("payload") or {}).get(
+                        "system_one_question_ids") or ()),
+                    "tick_id": str((item.get("payload") or {}).get(
+                        "system_one_tick_id") or ""),
+                    "boundary_kind": str((item.get("payload") or {}).get(
+                        "system_one_boundary_kind") or ""),
+                    "boundary_sequence": int((item.get("payload") or {}).get(
+                        "system_one_boundary_sequence", 0)),
+                    "action_index": int((item.get("payload") or {}).get(
+                        "system_one_action_index", 0)),
+                    "influence_receipt_id": (item.get("payload") or {}).get(
+                        "system_one_semantic_influence_receipt_id"),
+                    "influenced": bool((item.get("payload") or {}).get(
+                        "system_one_semantic_influenced", False)),
+                }
+                for item in event_values
+                if item.get("event_type") == "system_one_decision"],
             "commit_digest": commit_digest,
         }
         action_trace = (build_committed_action_trace(

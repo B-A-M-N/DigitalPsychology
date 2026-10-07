@@ -468,6 +468,51 @@ class ControlCommitRequest:
 
 
 @dataclass(frozen=True)
+class RecordSystemOneOutcomeRequest:
+    control_session_id: str
+    decision_event_id: str
+    question_id: str
+    label: str
+    authority: str
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        bounds = {
+            "control_session_id": 256,
+            "decision_event_id": 256,
+            "question_id": 64,
+            "label": 128,
+            "authority": 64,
+            "evidence_ref": 256,
+        }
+        for name, maximum in bounds.items():
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+                raise ValueError(f"{name} must be bounded text")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "RecordSystemOneOutcomeRequest":
+        data = dict(_mapping(value, "System-1 outcome request"))
+        expected = {"protocol_version", "control_session_id", "decision_event_id",
+                    "question_id", "label", "authority", "evidence_ref"}
+        if set(data) != expected or data["protocol_version"] != PROTOCOL_VERSION:
+            raise ValueError("System-1 outcome protocol version or fields are invalid")
+        return cls(
+            control_session_id=data["control_session_id"],
+            decision_event_id=data["decision_event_id"],
+            question_id=data["question_id"], label=data["label"],
+            authority=data["authority"], evidence_ref=data["evidence_ref"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"protocol_version": PROTOCOL_VERSION,
+                "control_session_id": self.control_session_id,
+                "decision_event_id": self.decision_event_id,
+                "question_id": self.question_id, "label": self.label,
+                "authority": self.authority, "evidence_ref": self.evidence_ref}
+
+
+@dataclass(frozen=True)
 class ControlAbortRequest:
     control_session_id: str
     tick_id: str

@@ -1,12 +1,36 @@
 """Rebuild host-only trial qualification records from persisted traces."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
-from ..control_protocol import PROTOCOL_VERSION, ControlSessionDescriptor
+from ..control_protocol import (PROTOCOL_VERSION, ControlSessionDescriptor,
+                                RecordSystemOneOutcomeRequest)
 
 
 class TrialReportMethods:
+    def record_system_one_outcome(self, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist an independent label through the private host control plane."""
+        request = RecordSystemOneOutcomeRequest.from_mapping(raw)
+        stored = self.state_store.control_session(request.control_session_id)
+        if stored is None:
+            raise RuntimeError("outcome request references an unknown control session")
+        descriptor = ControlSessionDescriptor.from_mapping(stored["descriptor"])
+        if descriptor.control_session_id != request.control_session_id:
+            raise RuntimeError("persisted control session identity is inconsistent")
+        recorder = getattr(self.decision_service, "record_system_one_outcome", None)
+        if not callable(recorder):
+            raise RuntimeError("independent System-1 outcome recording is unavailable")
+        outcome_event_id = recorder(
+            decision_event_id=request.decision_event_id,
+            namespace_id=descriptor.identity.namespace_id,
+            application_instance_id=descriptor.identity.application_instance_id,
+            question_id=request.question_id, label=request.label,
+            authority=request.authority, evidence_ref=request.evidence_ref,
+            control_session_id=request.control_session_id)
+        return {"protocol_version": PROTOCOL_VERSION,
+                "control_session_id": request.control_session_id,
+                "outcome_event_id": outcome_event_id}
+
     def behavioral_trial_record(self, control_session_id: str, *, trial_id: str,
                                 task_outcome_score: float | None = None,
                                 task_completed: bool | None = None) -> dict[str, Any]:
@@ -72,6 +96,48 @@ class TrialReportMethods:
             1 for item in transitions if item.get("semantic_judgment_used"))
         record["semantic_failures"] = sum(
             1 for item in transitions if item.get("semantic_query_failed"))
+        from ..telemetry.production_metrics import QUESTION_FAMILIES
+        record["semantic_influenced_decisions"] = sum(
+            bool(item.get("semantic_influenced_decision")) for item in transitions)
+        record["semantic_candidate_changes"] = sum(
+            bool(item.get("semantic_candidate_change")) for item in transitions)
+        record["semantic_mode_changes"] = sum(
+            bool(item.get("semantic_mode_change")) for item in transitions)
+        record["semantic_framework_changes"] = sum(
+            int(item.get("semantic_framework_changes", 0) or 0) for item in transitions)
+        record["semantic_statework_changes"] = sum(
+            bool(item.get("semantic_statework_change")) for item in transitions)
+        record["semantic_influenced_interventions"] = sum(
+            int(item.get("semantic_influenced_interventions", 0) or 0)
+            for item in transitions)
+        record["semantic_effective_interventions"] = sum(
+            int(item.get("semantic_effective_interventions", 0) or 0)
+            for item in transitions)
+        record["semantic_ineffective_interventions"] = sum(
+            int(item.get("semantic_ineffective_interventions", 0) or 0)
+            for item in transitions)
+        by_family: dict[str, dict[str, int]] = {}
+        family_fields = {
+            "queries": "semantic_query_attempted",
+            "results": "semantic_judgment_returned",
+            "influenced_decisions": "semantic_influenced_decision",
+            "candidate_changes": "semantic_candidate_change",
+            "mode_changes": "semantic_mode_change",
+            "statework_changes": "semantic_statework_change",
+        }
+        for family in sorted(QUESTION_FAMILIES):
+            relevant = [item for item in transitions
+                        if family in item.get("semantic_question_ids", ())]
+            metrics = {name: sum(bool(item.get(field)) for item in relevant)
+                       for name, field in family_fields.items()}
+            metrics["framework_changes"] = sum(
+                int(item.get("semantic_framework_changes", 0) or 0)
+                for item in relevant)
+            metrics["influenced_interventions"] = sum(
+                int(item.get("semantic_influenced_interventions", 0) or 0)
+                for item in relevant)
+            by_family[family] = metrics
+        record["semantic_by_question_family"] = by_family
         pre_model_call = [item for item in transitions
                           if item.get("boundary_kind") == "pre_model_call"]
         model_digests = [str(item["model_projection_digest"])
