@@ -69,8 +69,7 @@ def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
         and (set(cause.criterion_ids).intersection(attention_ids)
              or not cause.criterion_ids and not multi_item_task)
         for cause in causes)
-    unscoped_retry = ("equivalent_retry" in context.active_trigger_codes
-                      and not multi_item_task)
+    unscoped_retry = ("equivalent_retry" in codes and not multi_item_task)
     unscoped_support = ("support_work_budget_exceeded" in context.active_trigger_codes
                         and not multi_item_task)
 
@@ -81,7 +80,7 @@ def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
              or scoped_retry_signal or unscoped_retry)
     drift = (focused_stall_count >= support_action_threshold
              or scoped_support_signal or scoped_drift_signal or unscoped_support
-             or ("goal_drift" in context.active_trigger_codes and not multi_item_task)
+             or ("goal_drift" in codes and not multi_item_task)
              or (semantic.goal_drift is True
                  and semantic.goal_drift_confidence >= semantic_threshold)) \
             and not focused_progress

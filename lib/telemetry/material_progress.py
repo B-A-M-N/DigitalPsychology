@@ -26,9 +26,12 @@ def normalized_behavior_codes(active_trigger_codes=(), cfw_signal_codes=()) -> f
     raw = {str(code) for code in (*active_trigger_codes, *cfw_signal_codes)
            if isinstance(code, str) and code}
     normalized = set(raw)
-    if raw & {"owl.approach_failed", "fuse.retry_bound_exceeded"}:
+    if (raw & {"owl.approach_failed", "fuse.retry_bound_exceeded"}
+            or any(code.lower().startswith(("retry.", "retry|")) for code in raw)):
         normalized.add("equivalent_retry")
-    if "owl.constraint_drift" in raw:
+    if ("owl.constraint_drift" in raw
+            or any(code.lower().startswith(("goal_drift.", "goal_drift|"))
+                   for code in raw)):
         normalized.add("goal_drift")
     return frozenset(normalized)
 

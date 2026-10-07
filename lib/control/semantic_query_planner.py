@@ -75,6 +75,9 @@ class SemanticQueryPlanner:
         drift_signal = any(any(token in code for token in (
             "drift", "unrelated", "support_work", "criterion_mismatch", "busywork"))
                                for code in codes)
+        drift_signal = drift_signal or any(any(token in code.lower() for token in (
+            "drift", "unrelated", "support_work", "criterion_mismatch", "busywork"))
+            for code in observation.active_trigger_codes)
         retry_count = observation.equivalent_retry_count
         progress_gap = observation.actions_since_goal_progress
         if observation.goal_set is not None:

@@ -144,6 +144,9 @@ def create_system_one_frame_factory(system_one_service: Any):
         drift_signal = any(any(token in code for token in (
             "drift", "unrelated", "support_work", "criterion_mismatch", "busywork"))
                                for code in signal_codes)
+        drift_signal = drift_signal or any(any(token in code.lower() for token in (
+            "drift", "unrelated", "support_work", "criterion_mismatch", "busywork"))
+            for code in observation.active_trigger_codes)
         candidate = observation.candidate_action
         retry_count = observation.equivalent_retry_count
         progress_gap = observation.actions_since_goal_progress
@@ -353,11 +356,12 @@ def create_system_one_frame_factory(system_one_service: Any):
                      f"subject={','.join(cause.subject_refs)[:20]}")[:256]
                     for cause in causes[:6]
                 ] + [
-                    (f"host_retry_fact={code[:128]};"
+                    (f"host_semantic_trigger={code[:128]};"
                      f"refs={','.join(observation.evidence_refs[:2])[:64]}")[:256]
                     for code in observation.active_trigger_codes
                     if any(token in code.lower() for token in (
-                        "retry", "repeat", "approach_failed", "same_approach"))
+                        "retry", "repeat", "approach_failed", "same_approach",
+                        "drift", "unrelated", "support_work", "busywork"))
                 ])[:8],
                 "actions_since_goal_progress": observation.actions_since_goal_progress,
                 "actions_since_artifact_change": observation.actions_since_artifact_change,
