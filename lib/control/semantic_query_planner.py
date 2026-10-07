@@ -69,6 +69,9 @@ class SemanticQueryPlanner:
         retry_signal = any(any(token in code for token in (
             "retry", "repeat", "same_approach", "approach_failed", "equivalent"))
                                for code in codes)
+        retry_signal = retry_signal or any(any(token in code.lower() for token in (
+            "retry", "repeat", "same_approach", "approach_failed", "equivalent"))
+            for code in observation.active_trigger_codes)
         drift_signal = any(any(token in code for token in (
             "drift", "unrelated", "support_work", "criterion_mismatch", "busywork"))
                                for code in codes)

@@ -138,6 +138,9 @@ def create_system_one_frame_factory(system_one_service: Any):
         retry_signal = any(any(token in code for token in (
             "retry", "repeat", "same_approach", "approach_failed", "equivalent"))
                                for code in signal_codes)
+        retry_signal = retry_signal or any(any(token in code.lower() for token in (
+            "retry", "repeat", "same_approach", "approach_failed", "equivalent"))
+            for code in observation.active_trigger_codes)
         drift_signal = any(any(token in code for token in (
             "drift", "unrelated", "support_work", "criterion_mismatch", "busywork"))
                                for code in signal_codes)
@@ -339,7 +342,7 @@ def create_system_one_frame_factory(system_one_service: Any):
             },
             situation={
                 "current_state": behavior_state.cognitive_mode,
-                "blockers": [
+                "blockers": ([
                     (f"cfw_cause={cause.cause_id[:48]};"
                      f"src={','.join(cause.sources)[:40]};"
                      f"codes={','.join(cause.codes)[:56]};"
@@ -348,7 +351,14 @@ def create_system_one_frame_factory(system_one_service: Any):
                      f"refs={','.join(cause.evidence_refs)[:24]};"
                      f"scope={','.join(cause.scopes)[:20]};"
                      f"subject={','.join(cause.subject_refs)[:20]}")[:256]
-                    for cause in causes[:8]],
+                    for cause in causes[:6]
+                ] + [
+                    (f"host_retry_fact={code[:128]};"
+                     f"refs={','.join(observation.evidence_refs[:2])[:64]}")[:256]
+                    for code in observation.active_trigger_codes
+                    if any(token in code.lower() for token in (
+                        "retry", "repeat", "approach_failed", "same_approach"))
+                ])[:8],
                 "actions_since_goal_progress": observation.actions_since_goal_progress,
                 "actions_since_artifact_change": observation.actions_since_artifact_change,
                 "verification_actions_since_artifact_change": (

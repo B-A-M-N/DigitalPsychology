@@ -271,6 +271,8 @@ DIGITALPSYCHOLOGY_LAYA_TIMEOUT_MS=30000
 The semantic query planner invokes Laya only when host signals leave a
 material ambiguity: a possible equivalent retry, a drift warning on a
 consequential candidate, or new artifact/evidence without confirmed progress.
+Host-verified failed-approach facts can also trigger a retry-relation query for
+a candidate that changes its target or mechanism.
 It skips routine reversible actions, host-confirmed progress/regression,
 already-established repeated attempts, and critical WARD vetoes. At most one
 question is sent per boundary; a disabled question family is never replaced
