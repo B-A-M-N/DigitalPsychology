@@ -188,8 +188,16 @@ def _system_one_decision_refs(event_values: Sequence[Mapping[str, Any]]) -> list
         domain_tags = payload.get("system_one_domain_tags") or ()
         refs.append({
             "event_id": str(item["event_id"]),
+            "timestamp": str(item.get("timestamp") or ""),
             "decision_id": str(payload.get("system_one_decision_id") or ""),
             "question_ids": list(payload.get("system_one_question_ids") or ()),
+            "criterion_ids": list(payload.get("system_one_criterion_ids") or ()),
+            "candidate_relation_certainty": payload.get(
+                "system_one_candidate_relation_certainty"),
+            "candidate_host_relation": payload.get(
+                "system_one_candidate_host_relation"),
+            "candidate_criterion_ids": list(
+                payload.get("system_one_candidate_criterion_ids") or ()),
             "tick_id": str(payload.get("system_one_tick_id") or ""),
             "boundary_kind": str(payload.get("system_one_boundary_kind") or ""),
             "boundary_sequence": int(payload.get("system_one_boundary_sequence", 0)),

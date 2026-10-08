@@ -186,6 +186,8 @@ def test_outbox_delivery_failure_and_success_survive_store_restart(tmp_path):
     assert failed["authenticated_count"] == 0
     assert failed["authenticated_status_available"] is True
     assert failed["last_dispatch_failure"]["error_class"] == "EventSinkError"
+    assert failed["last_attempted_event_id"] == "event-1"
+    assert failed["last_attempt_at"]
     assert failed["by_event_type"]["system_one_decision"]["pending"] == 1
 
     restarted.record_outbox_dispatch_attempt(scope, "event-1")
@@ -196,4 +198,5 @@ def test_outbox_delivery_failure_and_success_survive_store_restart(tmp_path):
     assert delivered["pending_count"] == 0
     assert delivered["authenticated_count"] == 1
     assert delivered["last_dispatch_failure"]["error_class"] == "EventSinkError"
+    assert delivered["last_attempted_event_id"] == "event-1"
     assert delivered["last_successful_delivery_at"]

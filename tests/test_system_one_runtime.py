@@ -506,6 +506,7 @@ def _calibration_events(count=100):
         timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=2 * index)
         payload = {
             "system_one_decision_id": decision_id,
+            "system_one_criterion_ids": [f"task-{index}-plan_complete"],
             "system_one_backend_id": BACKEND_ID,
             "system_one_model_id": MODEL_ID,
             "system_one_model_revision": MODEL_REVISION,
@@ -524,8 +525,27 @@ def _calibration_events(count=100):
                         application_instance_id="app-1", agent_id="agent",
                         agent_instance_id="agent-instance", session_id="session",
                         task_id=f"task-{index}", attempt_id="attempt",
-                        interaction_id="interaction")
+                        interaction_id="interaction", scope="scope-1")
+        decision_event_id = f"event-{index}"
+        evidence_ref = f"host-action://action-{index}#sha256=" + f"{index:064x}"
+        evidence_receipt = {
+            "schema_version": "host-evaluator-receipt/v1",
+            "decision_event_id": decision_event_id,
+            "question_id": "progress_relation",
+            "ground_truth_label": "goal_progress",
+            "evidence_ref": evidence_ref,
+            "evidence_digest": f"{index:064x}",
+            "evidence_authority": "validator",
+            "evidence_observed_at": (
+                timestamp + timedelta(milliseconds=500)
+            ).isoformat().replace("+00:00", "Z"),
+            "task_scope": f"task-{index}",
+            "control_scope": "scope-1",
+            "criterion_ids": [f"task-{index}-plan_complete"],
+            "evaluator_contract_hash": "c" * 64,
+        }
         events.append(SimpleNamespace(
+            event_id=decision_event_id,
             event_type="system_one_decision", category="decision",
             actor_id="digitalpsychology_runtime",
             authority_source="digitalpsychology_system_one",
@@ -536,8 +556,10 @@ def _calibration_events(count=100):
             payload={"system_one_outcome_for": decision_id,
                      "system_one_outcome_progress_relation": "goal_progress",
                      "system_one_outcome_authority": "validator",
-                     "system_one_outcome_evidence_ref": f"evidence-{index}",
+                     "system_one_outcome_evidence_ref": evidence_ref,
+                     "system_one_outcome_evidence_receipt": evidence_receipt,
                      "system_one_independent_outcome": True},
+            event_id=f"outcome-{index}",
             timestamp=(timestamp + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
             **identity))
     return events
@@ -608,6 +630,9 @@ def test_calibration_groups_attempts_and_interactions_into_one_trajectory():
             event.task_id = task_id
             event.attempt_id = attempt_id
             event.interaction_id = interaction_id
+            if event.event_type == "system_one_outcome":
+                event.payload["system_one_outcome_evidence_receipt"][
+                    "task_scope"] = task_id
     with pytest.raises(ValueError, match="independent trajectories"):
         calibration_record_from_events(
             events, question_id="progress_relation", minimum_outcomes=100)

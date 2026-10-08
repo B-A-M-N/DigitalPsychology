@@ -635,6 +635,28 @@
             "disabled"
           ]
         },
+        "system_one_criterion_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
+        },
+        "system_one_candidate_relation_certainty": {
+          "enum": ["explicit", "inferred", "unknown", null]
+        },
+        "system_one_candidate_host_relation": {
+          "enum": [
+            "advances_primary_goal", "removes_concrete_blocker",
+            "required_verification", "diagnostic_support", "unrelated",
+            "ambiguous", null
+          ]
+        },
+        "system_one_candidate_criterion_ids": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
+        },
         "system_one_action_relation": {
           "enum": [
             "advances_primary_goal",
@@ -853,6 +875,36 @@
         "system_one_outcome_evidence_ref": {
           "type": "string",
           "maxLength": 256
+        },
+        "system_one_outcome_evidence_receipt": {
+          "type": "object",
+          "required": [
+            "schema_version", "decision_event_id", "question_id",
+            "ground_truth_label", "evidence_ref", "evidence_digest",
+            "evidence_authority", "evidence_observed_at", "task_scope",
+            "control_scope", "criterion_ids", "evaluator_contract_hash"
+          ],
+          "properties": {
+            "schema_version": {"const": "host-evaluator-receipt/v1"},
+            "decision_event_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "question_id": {"type": "string", "minLength": 1, "maxLength": 64},
+            "ground_truth_label": {"type": "string", "minLength": 1, "maxLength": 128},
+            "evidence_ref": {"type": "string", "minLength": 1, "maxLength": 256},
+            "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "evidence_authority": {
+              "enum": ["host_evidence", "validator", "csw_fact", "operator"]
+            },
+            "evidence_observed_at": {"type": "string", "format": "date-time"},
+            "task_scope": {"type": "string", "minLength": 1, "maxLength": 256},
+            "control_scope": {"type": "string", "minLength": 1, "maxLength": 256},
+            "criterion_ids": {
+              "type": "array", "minItems": 1, "maxItems": 8,
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1, "maxLength": 128}
+            },
+            "evaluator_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          },
+          "additionalProperties": false
         },
         "system_one_independent_outcome": {
           "type": "boolean"

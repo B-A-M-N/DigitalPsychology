@@ -208,8 +208,9 @@ class DigitalPsychologyService:
                                   application_instance_id: str,
                                   question_id: str, label: str,
                                   authority: str, evidence_ref: str,
+                                  evidence_receipt: Mapping[str, Any] | None = None,
                                   control_session_id: str | None = None) -> str:
-        """Persist one later label supplied by a trusted evidence authority."""
+        """Persist one label backed by a validated private host-evaluator receipt."""
         return self._system_one_outcomes.record(
             decision_event_id=decision_event_id,
             namespace_id=namespace_id,
@@ -218,6 +219,7 @@ class DigitalPsychologyService:
             label=label,
             authority=authority,
             evidence_ref=evidence_ref,
+            evidence_receipt=evidence_receipt,
             expected_scope=control_session_id)
 
     def _record_intervention_event(

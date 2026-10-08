@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import re
 from typing import Any, Iterable, Mapping, Optional
 
 from .protocol_artifact import (PROTOCOL_HASH, PROTOCOL_VERSION, QUESTION_REGISTRY,
@@ -15,7 +16,86 @@ from .system_one_contracts import QuestionProbability, SystemOneFrame, canonical
 
 
 VALID_OUTCOME_AUTHORITIES = frozenset({"host_evidence", "validator", "csw_fact", "operator"})
+HOST_EVALUATOR_RECEIPT_SCHEMA = "host-evaluator-receipt/v1"
+_HOST_EVALUATOR_RECEIPT_FIELDS = frozenset({
+    "schema_version", "decision_event_id", "question_id", "ground_truth_label",
+    "evidence_ref", "evidence_digest", "evidence_authority",
+    "evidence_observed_at", "task_scope", "control_scope", "criterion_ids",
+    "evaluator_contract_hash",
+})
 _TEMPERATURES = tuple(round(0.25 + i * 0.05, 2) for i in range(96))
+
+
+def validate_host_evaluator_receipt(
+        receipt: Any, *, decision_event: Any, question_id: str, label: str,
+        authority: str, evidence_ref: str, control_scope: str | None = None,
+        evaluated_at: datetime | None = None) -> dict[str, Any]:
+    """Validate the private host evaluator's evidence receipt against its decision.
+
+    The receipt is emitted only after the trusted task evaluator resolves a
+    host action receipt. The DP event store binds that receipt to the
+    authenticated prediction, task, session, criterion set, and timestamps.
+    """
+    if not isinstance(receipt, Mapping) or set(receipt) != _HOST_EVALUATOR_RECEIPT_FIELDS:
+        raise ValueError("independent outcome requires a complete host evaluator receipt")
+    if receipt.get("schema_version") != HOST_EVALUATOR_RECEIPT_SCHEMA:
+        raise ValueError("host evaluator receipt schema is unsupported")
+    expected = {
+        "decision_event_id": getattr(decision_event, "event_id", None),
+        "question_id": question_id,
+        "ground_truth_label": label,
+        "evidence_ref": evidence_ref,
+        "evidence_authority": authority,
+        "task_scope": getattr(decision_event, "task_id", None),
+        "control_scope": getattr(decision_event, "scope", None),
+    }
+    if control_scope is not None:
+        expected["control_scope"] = control_scope
+    for name, value in expected.items():
+        if (not isinstance(receipt.get(name), str) or not receipt[name]
+                or receipt[name] != value):
+            raise ValueError(f"host evaluator receipt {name} does not match the decision")
+
+    evidence_digest = receipt.get("evidence_digest")
+    evaluator_hash = receipt.get("evaluator_contract_hash")
+    digest_pattern = re.compile(r"[0-9a-f]{64}")
+    if (not isinstance(evidence_digest, str)
+            or digest_pattern.fullmatch(evidence_digest) is None):
+        raise ValueError("host evaluator receipt evidence digest is invalid")
+    if (not isinstance(evaluator_hash, str)
+            or digest_pattern.fullmatch(evaluator_hash) is None):
+        raise ValueError("host evaluator receipt contract hash is invalid")
+    ref_prefix, marker, ref_digest = evidence_ref.rpartition("#sha256=")
+    if not ref_prefix or marker != "#sha256=" or ref_digest != evidence_digest:
+        raise ValueError("host evaluator receipt does not resolve its evidence reference")
+
+    criteria = receipt.get("criterion_ids")
+    decision_criteria = (getattr(decision_event, "payload", {}) or {}).get(
+        "system_one_criterion_ids")
+    if (not isinstance(criteria, (tuple, list)) or not criteria
+            or len(criteria) > 8
+            or any(not isinstance(item, str) or not item or len(item) > 128
+                   for item in criteria)
+            or len(set(criteria)) != len(criteria)):
+        raise ValueError("host evaluator receipt criterion IDs are invalid")
+    if (not isinstance(decision_criteria, (tuple, list))
+            or not set(criteria).issubset(set(decision_criteria))):
+        raise ValueError("host evaluator receipt references a criterion outside the decision")
+
+    decision_time = _timestamp(getattr(decision_event, "timestamp", None))
+    observed_at = _timestamp(receipt.get("evidence_observed_at"))
+    checked_at = evaluated_at or datetime.now(timezone.utc)
+    if (decision_time is None or decision_time.tzinfo is None
+            or observed_at is None or observed_at.tzinfo is None
+            or checked_at.tzinfo is None or observed_at <= decision_time
+            or observed_at > checked_at):
+        raise ValueError("host evidence must be observed after the decision and before labeling")
+
+    normalized = dict(receipt)
+    normalized["criterion_ids"] = list(criteria)
+    normalized["evidence_observed_at"] = observed_at.astimezone(timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+    return normalized
 
 
 def _timestamp(value: Any) -> Optional[datetime]:
@@ -477,6 +557,17 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
         outcome_time = _timestamp(getattr(outcome, "timestamp", None))
         if decision_time is None or outcome_time is None or outcome_time <= decision_time:
             continue
+        try:
+            evidence_receipt = validate_host_evaluator_receipt(
+                payload.get("system_one_outcome_evidence_receipt"),
+                decision_event=decision, question_id=question_id,
+                label=str(payload.get(outcome_key) or ""),
+                authority=str(payload.get("system_one_outcome_authority") or ""),
+                evidence_ref=str(payload.get("system_one_outcome_evidence_ref") or ""),
+                control_scope=getattr(outcome, "scope", None),
+                evaluated_at=outcome_time)
+        except ValueError:
+            continue
         decision_payload = getattr(decision, "payload", {}) or {}
         answer = decision_payload["system_one_answers"][question_id]
         if not isinstance(answer, Mapping) or answer.get("question_id") != question_id:
@@ -516,6 +607,9 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
             "work_mode": str(decision_payload["system_one_work_mode"]),
             "deliverable_kind": str(decision_payload["system_one_deliverable_kind"]),
             "evidence_ref": payload["system_one_outcome_evidence_ref"],
+            "evidence_digest": evidence_receipt["evidence_digest"],
+            "evaluator_contract_hash": evidence_receipt["evaluator_contract_hash"],
+            "criterion_ids": tuple(evidence_receipt["criterion_ids"]),
             "outcome_authority": payload["system_one_outcome_authority"],
             "candidate_context": candidate_context,
         })

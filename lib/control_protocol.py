@@ -485,6 +485,7 @@ class RecordSystemOneOutcomeRequest:
     label: str
     authority: str
     evidence_ref: str
+    evidence_receipt: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         bounds = {
@@ -499,12 +500,22 @@ class RecordSystemOneOutcomeRequest:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip() or len(value) > maximum:
                 raise ValueError(f"{name} must be bounded text")
+        if not isinstance(self.evidence_receipt, Mapping):
+            raise ValueError("evidence_receipt must be an object")
+        try:
+            encoded_receipt = json.dumps(
+                dict(self.evidence_receipt), sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("evidence_receipt must contain JSON values") from exc
+        if len(encoded_receipt.encode("utf-8")) > 8192:
+            raise ValueError("evidence_receipt exceeds the private control bound")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RecordSystemOneOutcomeRequest":
         data = dict(_mapping(value, "System-1 outcome request"))
         expected = {"protocol_version", "control_session_id", "decision_event_id",
-                    "question_id", "label", "authority", "evidence_ref"}
+                    "question_id", "label", "authority", "evidence_ref",
+                    "evidence_receipt"}
         if set(data) != expected or data["protocol_version"] != PROTOCOL_VERSION:
             raise ValueError("System-1 outcome protocol version or fields are invalid")
         return cls(
@@ -512,6 +523,8 @@ class RecordSystemOneOutcomeRequest:
             decision_event_id=data["decision_event_id"],
             question_id=data["question_id"], label=data["label"],
             authority=data["authority"], evidence_ref=data["evidence_ref"],
+            evidence_receipt=_mapping(
+                data["evidence_receipt"], "host evaluator evidence receipt"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -519,7 +532,8 @@ class RecordSystemOneOutcomeRequest:
                 "control_session_id": self.control_session_id,
                 "decision_event_id": self.decision_event_id,
                 "question_id": self.question_id, "label": self.label,
-                "authority": self.authority, "evidence_ref": self.evidence_ref}
+                "authority": self.authority, "evidence_ref": self.evidence_ref,
+                "evidence_receipt": dict(self.evidence_receipt)}
 
 
 @dataclass(frozen=True)

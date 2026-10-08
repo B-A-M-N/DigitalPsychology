@@ -7,7 +7,8 @@ from typing import Any, Mapping
 
 from .feedback_loop import Event, EventFactory, SQLiteSink
 from .protocol_artifact import QUESTION_REGISTRY
-from .system_one_calibration import VALID_OUTCOME_AUTHORITIES
+from .system_one_calibration import (VALID_OUTCOME_AUTHORITIES,
+                                     validate_host_evaluator_receipt)
 from .system_one_contracts import SystemOneFrame, SystemOneJudgment
 
 
@@ -81,6 +82,12 @@ def prepare_system_one_decision_event(
         "system_one_boundary_sequence": int(basis.get("boundary_sequence", 0)),
         "system_one_action_index": int(basis.get("host_action_index", 0)),
         "system_one_question_ids": [answer.question_id for answer in judgment.answers],
+        "system_one_criterion_ids": [item.criterion_id for item in frame.state.criteria],
+        "system_one_candidate_relation_certainty": frame.state.candidate.relation_certainty,
+        "system_one_candidate_host_relation": (
+            frame.state.candidate.host_declared_relation),
+        "system_one_candidate_criterion_ids": list(
+            frame.state.candidate.affected_criterion_ids),
         "system_one_semantic_influence_receipt_id": receipt.get("receipt_id"),
         "system_one_counterfactual_candidate_id": receipt.get(
             "counterfactual_candidate_id"),
@@ -137,6 +144,7 @@ class SystemOneOutcomeLabeler:
     def record(self, *, decision_event_id: str, namespace_id: str,
                application_instance_id: str, question_id: str, label: str,
                authority: str, evidence_ref: str,
+               evidence_receipt: Mapping[str, Any] | None = None,
                expected_scope: str | None = None) -> str:
         if question_id not in QUESTION_REGISTRY:
             raise ValueError("unsupported System-1 outcome question family")
@@ -180,6 +188,10 @@ class SystemOneOutcomeLabeler:
             raise ValueError("decision event timestamp is invalid") from exc
         if decision_time.tzinfo is None or now <= decision_time:
             raise ValueError("independent outcome must follow its decision")
+        validated_receipt = validate_host_evaluator_receipt(
+            evidence_receipt, decision_event=decision, question_id=question_id,
+            label=label, authority=authority, evidence_ref=evidence_ref,
+            control_scope=expected_scope, evaluated_at=now)
 
         event_id = "dp-s1o-" + hashlib.sha256(
             f"{namespace_id}|{application_instance_id}|{decision_event_id}|{question_id}"
@@ -194,7 +206,9 @@ class SystemOneOutcomeLabeler:
                     and prior.get("system_one_outcome_for") == decision_id
                     and prior.get(outcome_key) == label
                     and prior.get("system_one_outcome_authority") == authority
-                    and prior.get("system_one_outcome_evidence_ref") == evidence_ref):
+                    and prior.get("system_one_outcome_evidence_ref") == evidence_ref
+                    and prior.get("system_one_outcome_evidence_receipt")
+                    == validated_receipt):
                 return event_id
             raise ValueError("a different independent outcome is already recorded")
 
@@ -224,6 +238,7 @@ class SystemOneOutcomeLabeler:
                 outcome_key: label,
                 "system_one_outcome_authority": authority,
                 "system_one_outcome_evidence_ref": evidence_ref,
+                "system_one_outcome_evidence_receipt": validated_receipt,
                 "system_one_independent_outcome": True,
             },
         )

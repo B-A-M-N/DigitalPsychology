@@ -39,6 +39,7 @@ class ActionCandidate:
     target_kind: str = "workspace"
     target_ref_digest: str | None = None
     relation_certainty: str = "explicit"
+    host_declared_relation: str | None = None
 
     def __post_init__(self) -> None:
         for name, value, limit in (
@@ -58,16 +59,27 @@ class ActionCandidate:
             raise ValueError("candidate effect flags must be booleans")
         if self.relation_certainty not in {"explicit", "inferred", "unknown"}:
             raise ValueError("candidate relation_certainty must be explicit, inferred, or unknown")
+        allowed_relations = {
+            "advances_primary_goal", "removes_concrete_blocker",
+            "required_verification", "diagnostic_support", "unrelated",
+        }
+        if (self.host_declared_relation is not None
+                and self.host_declared_relation not in allowed_relations):
+            raise ValueError("candidate host relation is unsupported")
         criteria = tuple(self.affected_criterion_ids)
         if (len(criteria) > 8 or len(criteria) != len(set(criteria))
                 or any(not isinstance(item, str) or not item or len(item) > 128
                        for item in criteria)):
             raise ValueError("candidate criteria must be unique bounded IDs")
-        if not criteria and self.relation_certainty != "unknown":
+        if (not criteria and self.relation_certainty != "unknown"
+                and self.host_declared_relation != "unrelated"):
             raise ValueError(
-                "criterion-free candidates require unknown relation certainty")
+                "criterion-free candidates require unknown or explicitly unrelated relation")
         if criteria and self.relation_certainty == "unknown":
             raise ValueError("unknown relation certainty cannot claim affected criteria")
+        if (self.host_declared_relation == "unrelated" and criteria
+                or self.host_declared_relation not in {None, "unrelated"} and not criteria):
+            raise ValueError("host relation and affected criteria are inconsistent")
         target_refs = tuple(self.target_ref_digests)
         if (len(target_refs) > 16 or len(target_refs) != len(set(target_refs))
                 or any(not isinstance(value, str) or len(value) != 64
@@ -103,7 +115,8 @@ class ActionCandidate:
                 "approach_epoch": self.approach_epoch,
                 "target_kind": self.target_kind,
                 "target_ref_digest": self.target_ref_digest,
-                "relation_certainty": self.relation_certainty}
+                "relation_certainty": self.relation_certainty,
+                "host_declared_relation": self.host_declared_relation}
 
 
 @dataclass(frozen=True)

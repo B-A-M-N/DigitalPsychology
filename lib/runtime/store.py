@@ -886,6 +886,11 @@ class BehaviorStateStore:
             last_success = database.execute(
                 "SELECT MAX(delivered_at) FROM runtime_event_delivery WHERE scope=?",
                 (scope,)).fetchone()
+            last_attempt = database.execute(
+                "SELECT event_id, last_attempt_at FROM runtime_event_delivery "
+                "WHERE scope=? AND last_attempt_at IS NOT NULL "
+                "ORDER BY last_attempt_at DESC, event_id DESC LIMIT 1",
+                (scope,)).fetchone()
         by_type: dict[str, dict[str, int]] = {}
         for event_type, committed, delivered, pending in rows:
             by_type[str(event_type)] = {
@@ -918,6 +923,9 @@ class BehaviorStateStore:
             "last_dispatch_failure": ({
                 "at": latest_failure[0], "error_class": latest_failure[1],
             } if latest_failure is not None else None),
+            "last_attempted_event_id": (
+                str(last_attempt[0]) if last_attempt is not None else None),
+            "last_attempt_at": last_attempt[1] if last_attempt is not None else None,
             "last_successful_delivery_at": (last_success[0]
                                              if last_success is not None else None),
             "authenticated_status_available": (

@@ -214,6 +214,7 @@ class TrialReportMethods:
             application_instance_id=descriptor.identity.application_instance_id,
             question_id=request.question_id, label=request.label,
             authority=request.authority, evidence_ref=request.evidence_ref,
+            evidence_receipt=request.evidence_receipt,
             control_session_id=request.control_session_id)
         return {"protocol_version": PROTOCOL_VERSION,
                 "control_session_id": request.control_session_id,

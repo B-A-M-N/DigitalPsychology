@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
 from lib.feedback_loop import Event, EventFactory, SQLiteSink
+from lib.behavior_state import BehaviorState
+from lib.control.service import ControlPlaneService
 from lib.protocol_artifact import QUESTION_REGISTRY
 from lib.system_one_calibration import calibration_metrics
 from lib.system_one_cli import (laya_corpus_status, laya_corpus_status_main,
@@ -16,6 +19,8 @@ from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnsw
                                       SystemOneJudgment, canonical_hash)
 from lib.system_one_events import (SystemOneOutcomeLabeler,
                                    prepare_system_one_decision_event)
+from lib.runtime.store import BehaviorStateStore
+from lib.service import DigitalPsychologyService
 from lib.control.transaction_service import _digest, _system_one_decision_refs
 
 
@@ -137,8 +142,10 @@ def test_host_decision_reference_binds_candidate_and_domain_context():
     }])
 
     assert refs == [{
-        "event_id": "dp-s1-route", "decision_id": "request-1",
+        "event_id": "dp-s1-route", "timestamp": "", "decision_id": "request-1",
         "question_ids": ["route_preference"], "tick_id": "tick-1",
+        "criterion_ids": [], "candidate_relation_certainty": None,
+        "candidate_host_relation": None, "candidate_criterion_ids": [],
         "boundary_kind": "post_action", "boundary_sequence": 4,
         "action_index": 2, "legal_candidate_count": 2,
         "candidate_set_digest": _digest(["gitter", "infrae"]),
@@ -170,6 +177,7 @@ def _stored_decision_event():
             "system_one_model_revision": "rev-1",
             "system_one_model_content_hash": "a" * 64,
             "system_one_provider_protocol_hash": "b" * 64,
+            "system_one_criterion_ids": ["task-plan_complete"],
             "system_one_work_mode": "delivery",
             "system_one_deliverable_kind": "code_behavior",
             "system_one_answers": {"progress_relation": {
@@ -179,24 +187,51 @@ def _stored_decision_event():
         })
 
 
+def _evidence_receipt(decision, evidence_ref, label, **overrides):
+    digest = evidence_ref.rsplit("#sha256=", 1)[-1]
+    receipt = {
+        "schema_version": "host-evaluator-receipt/v1",
+        "decision_event_id": decision.event_id,
+        "question_id": "progress_relation",
+        "ground_truth_label": label,
+        "evidence_ref": evidence_ref,
+        "evidence_digest": digest,
+        "evidence_authority": "validator",
+        "evidence_observed_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=20)
+        ).isoformat().replace("+00:00", "Z"),
+        "task_scope": decision.task_id,
+        "control_scope": decision.scope,
+        "criterion_ids": ["task-plan_complete"],
+        "evaluator_contract_hash": "c" * 64,
+    }
+    receipt.update(overrides)
+    return receipt
+
+
 def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path, capsys):
     sink = SQLiteSink(tmp_path / "events.sqlite3")
     try:
         decision = _stored_decision_event()
         sink.emit_authenticated(decision, authenticated=True)
         labeler = SystemOneOutcomeLabeler(sink)
+        evidence_ref = "host-action://action-1#sha256=" + "d" * 64
+        evidence_receipt = _evidence_receipt(
+            decision, evidence_ref, "goal_progress")
         outcome_id = labeler.record(
             decision_event_id=decision.event_id,
             namespace_id=decision.namespace_id,
             application_instance_id=decision.application_instance_id,
             question_id="progress_relation", label="goal_progress",
-            authority="validator", evidence_ref="validator-evidence-1")
+            authority="validator", evidence_ref=evidence_ref,
+            evidence_receipt=evidence_receipt)
         assert labeler.record(
             decision_event_id=decision.event_id,
             namespace_id=decision.namespace_id,
             application_instance_id=decision.application_instance_id,
             question_id="progress_relation", label="goal_progress",
-            authority="validator", evidence_ref="validator-evidence-1") == outcome_id
+            authority="validator", evidence_ref=evidence_ref,
+            evidence_receipt=evidence_receipt) == outcome_id
         outcome = sink.load_authenticated_event(
             outcome_id, namespace_id="tenant", application_instance_id="app-1")
         assert outcome.event_type == "system_one_outcome"
@@ -236,9 +271,13 @@ def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path, ca
             labeler.record(
                 decision_event_id=decision.event_id,
                 namespace_id=decision.namespace_id,
-                application_instance_id=decision.application_instance_id,
-                question_id="progress_relation", label="no_progress",
-                authority="validator", evidence_ref="validator-evidence-2")
+            application_instance_id=decision.application_instance_id,
+            question_id="progress_relation", label="no_progress",
+            authority="validator",
+            evidence_ref="host-action://action-2#sha256=" + "e" * 64,
+            evidence_receipt=_evidence_receipt(
+                decision, "host-action://action-2#sha256=" + "e" * 64,
+                "no_progress"))
         with pytest.raises(ValueError, match="independent evidence authority"):
             labeler.record(
                 decision_event_id=decision.event_id,
@@ -248,6 +287,68 @@ def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path, ca
                 authority="digitalpsychology_runtime", evidence_ref="agent-claim")
     finally:
         sink.close()
+
+
+def test_committed_system_one_outbox_retries_after_sqlite_delivery_failure(tmp_path):
+    decision = _stored_decision_event()
+    behavior_path = tmp_path / "behavior.sqlite3"
+    event_path = tmp_path / "events.sqlite3"
+    store = BehaviorStateStore(behavior_path)
+    store.save(
+        decision.scope, expected_revision=0, expected_action_index=-1,
+        action_index=1, state=BehaviorState(revision=1),
+        outbox_events=(decision.to_dict(),))
+
+    first_dp = DigitalPsychologyService(event_db=event_path)
+    with sqlite3.connect(event_path) as database:
+        database.execute(
+            "CREATE TRIGGER fail_system_one_delivery "
+            "BEFORE INSERT ON events WHEN NEW.event_type='system_one_decision' "
+            "BEGIN SELECT RAISE(ABORT, 'simulated transient SQLite failure'); END")
+    first_control = ControlPlaneService(decision_service=first_dp,
+                                        state_store=store)
+    try:
+        first_control._dispatch_outbox(decision.scope)
+        assert store.load(decision.scope).state.revision == 1
+        failed = store.outbox_delivery_status(
+            decision.scope, authenticated_event_ids=())
+        assert failed["committed_count"] == failed["enqueued_count"] == 1
+        assert failed["delivered_count"] == failed["authenticated_count"] == 0
+        assert failed["pending_count"] == 1
+        assert failed["last_dispatch_failure"]["error_class"] == "EventError"
+        assert store.outbox_delivery_records(decision.scope)[0]["attempt_count"] == 1
+    finally:
+        first_control.close()
+
+    with sqlite3.connect(event_path) as database:
+        database.execute("DROP TRIGGER fail_system_one_delivery")
+    restarted_store = BehaviorStateStore(behavior_path)
+    restarted_dp = DigitalPsychologyService(event_db=event_path)
+    restarted_control = ControlPlaneService(
+        decision_service=restarted_dp, state_store=restarted_store)
+    try:
+        restarted_control._dispatch_outbox(decision.scope)
+        restarted_control._dispatch_outbox(decision.scope)
+        authenticated = restarted_dp.authenticated_event_ids(
+            (decision.event_id,), namespace_id=decision.namespace_id,
+            application_instance_id=decision.application_instance_id)
+        delivered = restarted_store.outbox_delivery_status(
+            decision.scope, authenticated_event_ids=authenticated)
+        assert delivered["pending_count"] == 0
+        assert delivered["delivered_count"] == delivered["authenticated_count"] == 1
+        assert delivered["last_dispatch_failure"]["error_class"] == "EventError"
+        records = restarted_store.outbox_delivery_records(decision.scope)
+        assert records[0]["attempt_count"] == 2
+        assert records[0]["delivered_at"]
+        with sqlite3.connect(event_path) as database:
+            assert database.execute(
+                "SELECT COUNT(*) FROM events WHERE event_id=?",
+                (decision.event_id,)).fetchone()[0] == 1
+            assert database.execute(
+                "SELECT COUNT(*) FROM authenticated_events WHERE event_id=?",
+                (decision.event_id,)).fetchone()[0] == 1
+    finally:
+        restarted_control.close()
 
 
 def test_aborted_or_uncommitted_system_one_decisions_are_not_persisted(tmp_path):
@@ -260,5 +361,36 @@ def test_aborted_or_uncommitted_system_one_decisions_are_not_persisted(tmp_path)
                 namespace_id="tenant", application_instance_id="app-1",
                 question_id="progress_relation", label="goal_progress",
                 authority="validator", evidence_ref="validator-evidence")
+    finally:
+        sink.close()
+
+
+@pytest.mark.parametrize("invalid_receipt,question_id,evidence_ref", [
+    ({"evidence_digest": "0" * 64}, "progress_relation",
+     "host-action://action#sha256=" + "1" * 64),
+    ({"task_scope": "another-task"}, "progress_relation",
+     "host-action://action#sha256=" + "1" * 64),
+    ({"evidence_observed_at": "2000-01-01T00:00:00Z"}, "progress_relation",
+     "host-action://action#sha256=" + "1" * 64),
+    ({}, "retry_relation", "host-action://action#sha256=" + "1" * 64),
+    ({"criterion_ids": ["another-task-other-criterion"]}, "progress_relation",
+     "host-action://action#sha256=" + "1" * 64),
+])
+def test_outcome_labeler_rejects_unresolved_or_mismatched_evidence(
+        tmp_path, invalid_receipt, question_id, evidence_ref):
+    sink = SQLiteSink(tmp_path / "events.sqlite3")
+    try:
+        decision = _stored_decision_event()
+        sink.emit_authenticated(decision, authenticated=True)
+        base = _evidence_receipt(decision, evidence_ref, "goal_progress")
+        base.update(invalid_receipt)
+        with pytest.raises(ValueError):
+            SystemOneOutcomeLabeler(sink).record(
+                decision_event_id=decision.event_id,
+                namespace_id=decision.namespace_id,
+                application_instance_id=decision.application_instance_id,
+                question_id=question_id, label="goal_progress",
+                authority="validator", evidence_ref=evidence_ref,
+                evidence_receipt=base, expected_scope=decision.scope)
     finally:
         sink.close()

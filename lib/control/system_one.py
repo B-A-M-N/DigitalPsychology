@@ -273,7 +273,7 @@ def create_system_one_frame_factory(system_one_service: Any):
             source="model_proposed" if candidate else "host_observed",
             action_class=(candidate.action_class if candidate else "host_action"),
             host_declared_relation=(
-                "ambiguous" if candidate else
+                candidate.host_declared_relation if candidate else
                 "advances_primary_goal" if observation.progress_made else "ambiguous"),
             target_kind=candidate.target_kind if candidate else "workspace",
             target_ref_digest=(candidate.target_ref_digest if candidate else None),
