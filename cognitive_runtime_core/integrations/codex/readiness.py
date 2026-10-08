@@ -86,6 +86,9 @@ async def inspect_inference_readiness(
             raise TypeError("configRequirements/read returned an invalid response")
     except Exception as exc:  # noqa: BLE001 - classify sanitized upstream readiness failures
         failure_class = _failure_class(exc)
+        if (auth_mode == "external_provider"
+                and failure_class == "workspace_routing_unavailable"):
+            failure_class = "provider_configuration_mismatch"
         readiness = CodexInferenceReadiness(
             ready=False, auth_mode=auth_mode,
             workspace_routing_required=routing_required,
@@ -98,6 +101,15 @@ async def inspect_inference_readiness(
     account_type = _safe_provider(
         account.get("type") if isinstance(account, Mapping) else None)
     workspace_routing = account_result.get("workspaceRouting")
+    if (profile is not None and profile.auth_mode == "external_provider"
+            and (account_type == "chatgpt" or workspace_routing is not None)):
+        readiness = CodexInferenceReadiness(
+            ready=False, auth_mode=auth_mode,
+            workspace_routing_required=False, workspace_routing_ready=False,
+            provider_id=profile.provider_id, account_type=account_type,
+            requirements_loaded=True,
+            failure_class="provider_configuration_mismatch")
+        raise CodexInfrastructureUnavailable(readiness)
     workspace_routing_required = bool(
         profile is not None and profile.auth_mode == "chatgpt"
         and account_type == "chatgpt" and workspace_routing is not None)
@@ -129,7 +141,7 @@ async def inspect_inference_readiness(
             ready=False, auth_mode=auth_mode,
             workspace_routing_required=False, workspace_routing_ready=True,
             provider_id=profile.provider_id, account_type=account_type,
-            requirements_loaded=True, failure_class="provider_auth_mode_mismatch")
+            requirements_loaded=True, failure_class="provider_configuration_mismatch")
         raise CodexInfrastructureUnavailable(readiness)
     if (profile is not None and profile.auth_mode == "openai_api_key"
             and account_type not in {None, "apiKey"}):
@@ -151,7 +163,10 @@ async def inspect_inference_readiness(
             workspace_routing_required=False,
             workspace_routing_ready=True, provider_id=expected_provider,
             account_type=account_type, requirements_loaded=True,
-            failure_class="managed_provider_mismatch")
+            failure_class=("provider_configuration_mismatch"
+                           if profile is not None
+                           and profile.auth_mode == "external_provider"
+                           else "managed_provider_mismatch"))
         raise CodexInfrastructureUnavailable(readiness)
 
     return CodexInferenceReadiness(

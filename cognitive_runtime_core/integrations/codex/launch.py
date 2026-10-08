@@ -30,6 +30,28 @@ def resolve_codex_home(environment: Mapping[str, str] | None = None) -> Path:
     return Path(supplied).expanduser().resolve() if supplied else Path.home() / ".codex"
 
 
+def resolve_packaged_codex_binary(configured: str | None = None, *,
+                                  home: Path | None = None) -> str:
+    """Resolve Codex only from an installed standalone release directory."""
+    candidate = configured or shutil.which("codex")
+    if not candidate:
+        raise CodexLaunchConfigurationError(
+            "packaged Codex CLI binary is unavailable")
+    account_home = (home or Path.home()).expanduser()
+    try:
+        binary = Path(candidate).expanduser().resolve(strict=True)
+        releases = (account_home / ".codex" / "packages" / "standalone"
+                    / "releases").resolve(strict=True)
+    except OSError:
+        raise CodexLaunchConfigurationError(
+            "packaged Codex CLI binary is unavailable") from None
+    if (not binary.is_file() or releases not in binary.parents
+            or not os.access(binary, os.X_OK)):
+        raise CodexLaunchConfigurationError(
+            "Codex binary must identify an installed standalone release")
+    return str(binary)
+
+
 @dataclass(frozen=True)
 class CodexLaunchProfile:
     binary: str

@@ -25,6 +25,26 @@ from .protocol import (
     _safe_text,
 )
 
+_PROVIDER_CREDENTIAL_ENV_KEYS = frozenset({
+    "FREEINFERENCE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+})
+
+
+def _codex_inspection_environment(
+        child_environment: Mapping[str, str],
+        launch_profile: CodexLaunchProfile | None) -> dict[str, str]:
+    """Keep provider credentials out of local version and feature probes."""
+    result = {str(key): str(value) for key, value in child_environment.items()}
+    if launch_profile is not None:
+        for key in launch_profile.secret_env_keys:
+            result.pop(key, None)
+    if (launch_profile is not None
+            and launch_profile.auth_mode == "external_provider"):
+        for key in _PROVIDER_CREDENTIAL_ENV_KEYS:
+            result.pop(key, None)
+    return result
+
 
 class JsonlAppServerClient:
     """Small bidirectional JSON-RPC client for the App Server stdio transport."""
@@ -90,6 +110,7 @@ class JsonlAppServerClient:
         for key in pass_env:
             if key in os.environ:
                 child_env[key] = os.environ[key]
+        inspection_env = _codex_inspection_environment(child_env, launch_profile)
 
         if command is None:
             app_server_bin = (launch_profile.binary if launch_profile is not None
@@ -120,7 +141,7 @@ class JsonlAppServerClient:
             # surface the host does not delegate.
             feature_process = await asyncio.create_subprocess_exec(
                 app_server_bin, "features", "list",
-                cwd=str(Path(cwd).resolve()), env=child_env,
+                cwd=str(Path(cwd).resolve()), env=inspection_env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             try:
                 feature_stdout, _ = await asyncio.wait_for(
@@ -141,7 +162,7 @@ class JsonlAppServerClient:
                     "utf-8", errors="replace").splitlines() if line.split()
             }
             cli_version = await cls._discover_cli_version(
-                app_server_bin, cwd=Path(cwd), env=child_env)
+                app_server_bin, cwd=Path(cwd), env=inspection_env)
             codex_feature_catalog = _native_feature_catalog_identity(
                 supported_features, cli_version)
             feature_args = _host_only_feature_args(supported_features)

@@ -33,9 +33,20 @@ _HOST_ONLY_FEATURES = (set(_NATIVE_EXEC_FEATURES) | set(_NATIVE_MODEL_TOOL_FEATU
                        | set(_NATIVE_WORKSPACE_FEATURES))
 NATIVE_FEATURE_CATALOG_VERSION = "codex-native-host-policy-v1"
 NATIVE_FEATURE_CATALOG_SHA256 = "82b363a94a1372a9ef42cafe5b160c67f38bf2502583d34858faa97d8b4bada2"
-REVIEWED_CODEX_CLI_VERSION = "codex-cli 0.160.0"
+REVIEWED_CODEX_CLI_VERSION = "codex-cli 0.160.1"
 REVIEWED_CODEX_FEATURE_CATALOG_SHA256 = (
-    "3310a31f8ec0d7a985fb07cf6043bc060dc5c438c4b23058e14b9b1144b86714")
+    "3fe988b7cd6e943692cc315f98824cdda73be8c382971b9b1fa8ec5ed7bb8696")
+_REVIEWED_CODEX_FEATURE_CATALOGS = {
+    "codex-cli 0.160.0":
+        "3310a31f8ec0d7a985fb07cf6043bc060dc5c438c4b23058e14b9b1144b86714",
+    REVIEWED_CODEX_CLI_VERSION: REVIEWED_CODEX_FEATURE_CATALOG_SHA256,
+}
+
+
+def reviewed_codex_feature_catalog(version: object, digest: object) -> bool:
+    """Accept only locally reviewed CLI version and feature-catalog pairs."""
+    return (isinstance(version, str) and isinstance(digest, str)
+            and _REVIEWED_CODEX_FEATURE_CATALOGS.get(version) == digest)
 
 
 def _native_feature_policy_identity() -> dict[str, str]:
@@ -64,8 +75,7 @@ def _native_feature_catalog_identity(supported_features: Sequence[str],
                             "feature_names": feature_names}, sort_keys=True,
                            separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(canonical).hexdigest()
-    if (cli_version != REVIEWED_CODEX_CLI_VERSION
-            or digest != REVIEWED_CODEX_FEATURE_CATALOG_SHA256):
+    if not reviewed_codex_feature_catalog(cli_version, digest):
         raise RuntimeError(
             "Codex CLI feature catalog is unknown; review and pin its version and full feature list")
     return {
