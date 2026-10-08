@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,8 @@ from cognitive_runtime_core.integrations.codex.readiness import (
 )
 
 
-def _profile(tmp_path: Path, *, mode: str = "external_provider") -> CodexLaunchProfile:
+def _profile(tmp_path: Path, *, mode: str = "external_provider",
+             provider_name: str | None = None) -> CodexLaunchProfile:
     values = {
         "binary": "/packaged/codex",
         "auth_mode": mode,
@@ -35,6 +37,8 @@ def _profile(tmp_path: Path, *, mode: str = "external_provider") -> CodexLaunchP
             "provider_env_key": "FREEINFERENCE_API_KEY",
             "secret_env_keys": ("FREEINFERENCE_API_KEY",),
         })
+        if provider_name is not None:
+            values["provider_name"] = provider_name
     return CodexLaunchProfile(**values)
 
 
@@ -107,6 +111,19 @@ def test_external_provider_readiness_rejects_managed_provider_drift(tmp_path):
         _readiness(client, _profile(tmp_path))
 
     assert captured.value.readiness.failure_class == "provider_configuration_mismatch"
+
+
+def test_external_provider_display_name_is_written_to_isolated_profile(tmp_path):
+    profile = _profile(tmp_path, provider_name="FreeInference")
+    profile.codex_home.mkdir(mode=0o700)
+
+    from cognitive_runtime_core.integrations.codex.launch import prepare_codex_home
+    prepare_codex_home(profile, model="catalog-model", parent_environment={})
+
+    config = tomllib.loads(
+        (profile.codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert config["model_provider"] == "freeinference"
+    assert config["model_providers"]["freeinference"]["name"] == "FreeInference"
 
 
 def test_inspection_environment_does_not_receive_provider_credentials(tmp_path):

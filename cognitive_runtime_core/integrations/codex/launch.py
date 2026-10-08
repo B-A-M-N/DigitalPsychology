@@ -64,6 +64,7 @@ class CodexLaunchProfile:
     requires_openai_auth: bool = False
     secret_env_keys: tuple[str, ...] = ()
     auth_source_home: Path | None = None
+    provider_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.auth_mode not in {"chatgpt", "openai_api_key", "external_provider"}:
@@ -101,10 +102,19 @@ class CodexLaunchProfile:
             if self.requires_openai_auth:
                 raise CodexLaunchConfigurationError(
                     "external auth providers must not require OpenAI auth")
+            if (self.provider_name is not None
+                    and (not isinstance(self.provider_name, str)
+                         or not self.provider_name.strip()
+                         or len(self.provider_name) > 128
+                         or any(ord(character) < 32
+                                for character in self.provider_name))):
+                raise CodexLaunchConfigurationError(
+                    "external provider display name is invalid")
             if self.provider_env_key not in keys:
                 object.__setattr__(self, "secret_env_keys", (*keys, self.provider_env_key))
         elif any(value is not None for value in (
-                self.provider_id, self.provider_base_url, self.provider_env_key)):
+                self.provider_id, self.provider_base_url, self.provider_env_key,
+                self.provider_name)):
             raise CodexLaunchConfigurationError(
                 "provider fields are only valid in external-provider mode")
         if self.auth_mode == "openai_api_key" and self.secret_env_keys not in (
@@ -208,7 +218,7 @@ def prepare_codex_home(profile: CodexLaunchProfile, *, model: str,
             f"model_provider = {_toml_string(profile.provider_id)}",
             "",
             f"[model_providers.{profile.provider_id}]",
-            f"name = {_toml_string(profile.provider_id)}",
+            f"name = {_toml_string(profile.provider_name or profile.provider_id)}",
             f"base_url = {_toml_string(profile.provider_base_url)}",
             f"env_key = {_toml_string(profile.provider_env_key)}",
             f"wire_api = {_toml_string(profile.wire_api)}",
