@@ -687,6 +687,7 @@ def _write_candidate(path: Path, record: CalibrationRecord) -> None:
 
 def _write_corpus_manifest(path: Path, *, corpus_id: str, question_family: str,
                            candidate_digest: str,
+                           evaluator_contract_hash: str,
                            task_instance_hashes: tuple[str, ...],
                            task_fixture_hashes: Mapping[str, str]) -> dict[str, Any]:
     task_hashes = list(task_instance_hashes)
@@ -695,6 +696,9 @@ def _write_corpus_manifest(path: Path, *, corpus_id: str, question_family: str,
             or question_family not in QUESTION_REGISTRY
             or len(candidate_digest) != 64
             or any(char not in "0123456789abcdef" for char in candidate_digest)
+            or len(evaluator_contract_hash) != 64
+            or any(char not in "0123456789abcdef"
+                   for char in evaluator_contract_hash)
             or not task_hashes or len(task_hashes) != len(set(task_hashes))
             or any(len(value) != 64 or any(char not in "0123456789abcdef"
                                            for char in value) for value in task_hashes)
@@ -709,10 +713,11 @@ def _write_corpus_manifest(path: Path, *, corpus_id: str, question_family: str,
                       "fixture_hash": fixtures[task_hash]}
                      for task_hash in task_hashes]
     manifest: dict[str, Any] = {
-        "schema_version": "laya-calibration-corpus/v2",
+        "schema_version": "laya-calibration-corpus/v3",
         "corpus_id": corpus_id,
         "question_family": question_family,
         "candidate_digest": candidate_digest,
+        "evaluator_contract_hash": evaluator_contract_hash,
         "task_instance_hashes": task_hashes,
         "task_fixture_hashes": task_fixtures,
         "independent_fixture_count": len(set(fixtures.values())),
@@ -831,6 +836,7 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
                 manifest_path, corpus_id=args.corpus_id,
                 question_family=args.question_family,
                 candidate_digest=record.digest,
+                evaluator_contract_hash=record.evaluator_contract_hash,
                 task_instance_hashes=task_hashes,
                 task_fixture_hashes=task_fixtures)
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
@@ -841,6 +847,7 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
         "question_family": args.question_family,
         "status": record.status,
         "candidate_digest": record.digest,
+        "evaluator_contract_hash": record.evaluator_contract_hash,
         "output": str(output_path),
         "metrics": metrics,
         "holdout": {

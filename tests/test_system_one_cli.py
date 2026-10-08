@@ -220,13 +220,15 @@ def test_calibration_corpus_manifest_binds_candidate_and_task_instances(tmp_path
                 for index, task_hash in enumerate(hashes)}
     manifest = system_one_cli._write_corpus_manifest(
         path, corpus_id="qualification-2026-10", question_family="progress_relation",
-        candidate_digest="c" * 64, task_instance_hashes=hashes,
+        candidate_digest="c" * 64, evaluator_contract_hash="d" * 64,
+        task_instance_hashes=hashes,
         task_fixture_hashes=fixtures)
 
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted == manifest
     assert persisted["task_instance_hashes"] == sorted(hashes)
-    assert persisted["schema_version"] == "laya-calibration-corpus/v2"
+    assert persisted["schema_version"] == "laya-calibration-corpus/v3"
+    assert persisted["evaluator_contract_hash"] == "d" * 64
     assert persisted["independent_fixture_count"] == 30
     assert persisted["fixture_set_hash"] == canonical_hash({
         "fixtures": [{"task_instance_hash": task_hash,

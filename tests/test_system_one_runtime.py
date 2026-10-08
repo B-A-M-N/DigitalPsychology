@@ -447,7 +447,8 @@ def calibration_record(question_id="progress_relation", *, status="active"):
     return CalibrationRecord(
         question_id=question_id, backend_id=BACKEND_ID, model_id=MODEL_ID,
         model_revision=MODEL_REVISION, model_content_hash=MODEL_HASH,
-        provider_protocol_hash=PROVIDER_HASH, temperature=0.5,
+        provider_protocol_hash=PROVIDER_HASH, evaluator_contract_hash="c" * 64,
+        temperature=0.5,
         minimum_advisory_confidence=0.9, sample_count=100, training_count=60,
         calibration_count=20, holdout_count=20,
         training_outcome_digest="d" * 64,
@@ -504,7 +505,7 @@ def test_advisory_mode_can_enable_only_qualified_question_families():
         service.close()
 
 
-def _calibration_events(count=100):
+def _calibration_events(count=100, *, evaluator_hash="c" * 64):
     events = []
     labels = tuple(QUESTION_REGISTRY["progress_relation"]["criteria"])
     for index in range(count):
@@ -550,7 +551,7 @@ def _calibration_events(count=100):
             "task_scope": f"task-{index}",
             "control_scope": "scope-1",
             "criterion_ids": [f"task-{index}-plan_complete"],
-            "evaluator_contract_hash": "c" * 64,
+            "evaluator_contract_hash": evaluator_hash,
         }
         events.append(SimpleNamespace(
             event_id=decision_event_id,
@@ -595,6 +596,56 @@ def test_calibration_uses_later_independent_outcomes_and_fits_temperature():
                 record.holdout_outcome_digest}) == 3
     assert record.holdout_log_loss >= 0
     assert record.qualification_passed
+
+
+def test_calibration_record_and_partition_digests_pin_evaluator_identity():
+    events = _calibration_events()
+    record = calibration_record_from_events(
+        events, question_id="progress_relation", minimum_outcomes=100,
+        minimum_accuracy=0.99, maximum_brier=0.02, maximum_ece=0.1)
+    different_contract = calibration_record_from_events(
+        _calibration_events(evaluator_hash="d" * 64),
+        question_id="progress_relation", minimum_outcomes=100,
+        minimum_accuracy=0.99, maximum_brier=0.02, maximum_ece=0.1)
+
+    assert record.evaluator_contract_hash == "c" * 64
+    assert different_contract.evaluator_contract_hash == "d" * 64
+    assert record.digest != different_contract.digest
+    assert record.training_outcome_digest != different_contract.training_outcome_digest
+
+    changed_receipt_events = _calibration_events()
+    first_outcome = next(event for event in changed_receipt_events
+                         if event.event_type == "system_one_outcome")
+    receipt = first_outcome.payload["system_one_outcome_evidence_receipt"]
+    changed_evidence_digest = "e" * 64
+    changed_ref = receipt["evidence_ref"].rsplit("#sha256=", 1)[0]
+    changed_ref += "#sha256=" + changed_evidence_digest
+    receipt["evidence_digest"] = changed_evidence_digest
+    receipt["evidence_ref"] = changed_ref
+    first_outcome.payload["system_one_outcome_evidence_ref"] = changed_ref
+    first_outcome.evidence_refs = [changed_ref]
+    changed_receipt_record = calibration_record_from_events(
+        changed_receipt_events, question_id="progress_relation",
+        minimum_outcomes=100, minimum_accuracy=0.99,
+        maximum_brier=0.02, maximum_ece=0.1)
+    assert (record.training_outcome_digest, record.calibration_outcome_digest,
+            record.holdout_outcome_digest) != (
+                changed_receipt_record.training_outcome_digest,
+                changed_receipt_record.calibration_outcome_digest,
+                changed_receipt_record.holdout_outcome_digest)
+
+
+def test_calibration_rejects_mixed_evaluator_contracts():
+    events = _calibration_events()
+    first_outcome = next(event for event in events
+                         if event.event_type == "system_one_outcome")
+    first_outcome.payload["system_one_outcome_evidence_receipt"][
+        "evaluator_contract_hash"] = "d" * 64
+
+    with pytest.raises(ValueError, match="mixes evaluator contract identities"):
+        calibration_record_from_events(
+            events, question_id="progress_relation", minimum_outcomes=100,
+            minimum_accuracy=0.99, maximum_brier=0.02, maximum_ece=0.1)
 
 
 def test_calibration_corpus_identity_hashes_only_independently_labeled_task_instances():
@@ -676,11 +727,11 @@ def test_calibration_lifecycle_stages_activates_and_exports_active_bundle(tmp_pa
     path_data = json.loads((tmp_path / "system-one-calibration.json").read_text())
     restored = CalibrationBundle.from_mapping(bundle.to_dict())
     assert restored.digest == bundle.digest
-    assert bundle.to_dict()["schema_version"] == "1.3.0"
+    assert bundle.to_dict()["schema_version"] == "1.4.0"
     assert path_data["revision"] == 2
-    assert path_data["schema_version"] == "2.0.0"
+    assert path_data["schema_version"] == "3.0.0"
     legacy = bundle.to_dict()
-    legacy["schema_version"] = "1.1.0"
+    legacy["schema_version"] = "1.3.0"
     with pytest.raises(ValueError, match="malformed System-1 calibration bundle"):
         CalibrationBundle.from_mapping(legacy)
 

@@ -30,7 +30,7 @@ class SystemOneCalibrationLifecycle:
         self._lock = threading.RLock()
 
     def _empty(self) -> dict[str, Any]:
-        return {"schema_version": "2.0.0", "revision": 0,
+        return {"schema_version": "3.0.0", "revision": 0,
                 "records": {}, "active": {}, "history": []}
 
     def _read(self) -> dict[str, Any]:
@@ -48,7 +48,7 @@ class SystemOneCalibrationLifecycle:
         if not isinstance(value, dict) or set(value) != {
                 "schema_version", "revision", "records", "active", "history"}:
             raise CalibrationLifecycleError("calibration lifecycle state is malformed")
-        if value["schema_version"] != "2.0.0" or not isinstance(value["revision"], int):
+        if value["schema_version"] != "3.0.0" or not isinstance(value["revision"], int):
             raise CalibrationLifecycleError("calibration lifecycle version is unsupported")
         if not isinstance(value["records"], dict) or not isinstance(value["active"], dict):
             raise CalibrationLifecycleError("calibration lifecycle maps are malformed")

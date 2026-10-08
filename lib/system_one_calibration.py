@@ -212,6 +212,7 @@ class CalibrationRecord:
     model_revision: str
     model_content_hash: str
     provider_protocol_hash: str
+    evaluator_contract_hash: str
     temperature: float
     minimum_advisory_confidence: float
     sample_count: int
@@ -261,6 +262,7 @@ class CalibrationRecord:
                 raise ValueError(f"{name} must be bounded non-empty text")
         for name in ("model_content_hash", "provider_protocol_hash", "protocol_hash",
                      "question_registry_hash", "state_projection_schema_hash",
+                     "evaluator_contract_hash",
                      "training_outcome_digest", "calibration_outcome_digest",
                      "holdout_outcome_digest"):
             value = getattr(self, name)
@@ -374,6 +376,7 @@ class CalibrationRecord:
                 "model_id": self.model_id, "model_revision": self.model_revision,
                 "model_content_hash": self.model_content_hash,
                 "provider_protocol_hash": self.provider_protocol_hash,
+                "evaluator_contract_hash": self.evaluator_contract_hash,
                 "temperature": float(self.temperature),
                 "minimum_advisory_confidence": float(self.minimum_advisory_confidence),
                 "sample_count": self.sample_count, "training_count": self.training_count,
@@ -417,6 +420,7 @@ class CalibrationRecord:
     def from_mapping(cls, value: Mapping[str, Any]) -> "CalibrationRecord":
         fields = {"question_id", "backend_id", "model_id", "model_revision",
                   "model_content_hash", "provider_protocol_hash", "temperature",
+                  "evaluator_contract_hash",
                   "minimum_advisory_confidence", "sample_count", "training_count",
                   "calibration_count", "holdout_count", "training_outcome_digest",
                   "calibration_outcome_digest", "holdout_outcome_digest", "holdout_accuracy",
@@ -533,7 +537,7 @@ class CalibrationBundle:
         return {key: self.records[key].canonical() for key in sorted(self.records)}
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": "1.3.0", "records": self.canonical(),
+        return {"schema_version": "1.4.0", "records": self.canonical(),
                 "bundle_hash": self.digest}
 
     @property
@@ -553,7 +557,7 @@ class CalibrationBundle:
     def from_mapping(cls, value: Mapping[str, Any]) -> "CalibrationBundle":
         if (not isinstance(value, Mapping) or set(value) != {
                 "schema_version", "records", "bundle_hash"}
-                or value.get("schema_version") != "1.3.0"
+                or value.get("schema_version") != "1.4.0"
                 or not isinstance(value.get("records"), Mapping)):
             raise ValueError("malformed System-1 calibration bundle")
         bundle = cls({str(key): CalibrationRecord.from_mapping(item)
@@ -668,8 +672,13 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
             "evidence_ref": payload["system_one_outcome_evidence_ref"],
             "evidence_digest": evidence_receipt["evidence_digest"],
             "evaluator_contract_hash": evidence_receipt["evaluator_contract_hash"],
+            "evaluator_receipt_digest": canonical_hash(evidence_receipt),
+            "evidence_observed_at": evidence_receipt["evidence_observed_at"],
             "criterion_ids": tuple(evidence_receipt["criterion_ids"]),
             "outcome_authority": payload["system_one_outcome_authority"],
+            "outcome_event_id": str(getattr(outcome, "event_id", "") or ""),
+            "outcome_timestamp": outcome_time.astimezone(timezone.utc).isoformat().replace(
+                "+00:00", "Z"),
             "candidate_context": candidate_context,
         })
         seen.add(key)
@@ -802,6 +811,10 @@ def calibration_record_from_events(
     if len(identities) != 1:
         raise ValueError("calibration evidence mixes provider or model content identities")
     model_tuple = next(iter(identities))
+    evaluator_contracts = {row["evaluator_contract_hash"] for row in rows}
+    if len(evaluator_contracts) != 1:
+        raise ValueError("calibration evidence mixes evaluator contract identities")
+    evaluator_contract_hash = next(iter(evaluator_contracts))
     ordered_fixtures = sorted(fixture_ids, key=lambda item: hashlib.sha256(
         item.encode("utf-8")).digest())
     train_end = max(1, int(len(ordered_fixtures) * 0.6))
@@ -849,6 +862,13 @@ def calibration_record_from_events(
                             "predicted": row["selected"], "actual": row["actual"],
                             "probabilities": row["probabilities"],
                             "evidence_ref": row["evidence_ref"],
+                            "evidence_digest": row["evidence_digest"],
+                            "evidence_observed_at": row["evidence_observed_at"],
+                            "evaluator_contract_hash": row["evaluator_contract_hash"],
+                            "evaluator_receipt_digest": row["evaluator_receipt_digest"],
+                            "criterion_ids": list(row["criterion_ids"]),
+                            "outcome_event_id": row["outcome_event_id"],
+                            "outcome_timestamp": row["outcome_timestamp"],
                             "authority": row["outcome_authority"]}
                            for row in material]
         return canonical_hash(rows_for_digest)
@@ -879,7 +899,8 @@ def calibration_record_from_events(
     return CalibrationRecord(
         question_id=question_id, backend_id=model_tuple[0], model_id=model_tuple[1],
         model_revision=model_tuple[2], model_content_hash=model_tuple[3],
-        provider_protocol_hash=model_tuple[4], temperature=temperature,
+        provider_protocol_hash=model_tuple[4],
+        evaluator_contract_hash=evaluator_contract_hash, temperature=temperature,
         minimum_advisory_confidence=minimum_confidence,
         sample_count=len(rows), training_count=len(train),
         calibration_count=len(calibration), holdout_count=len(holdout),
