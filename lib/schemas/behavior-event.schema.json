@@ -882,11 +882,13 @@
             "schema_version", "decision_event_id", "question_id",
             "ground_truth_label", "evidence_ref", "evidence_digest",
             "evidence_authority", "evidence_observed_at", "task_scope",
+            "task_family", "source_action_receipt_id",
+            "source_action_result_digest", "evaluator_observation_digest",
             "control_scope", "criterion_ids", "evaluator_contract_hash",
             "task_instance_hash", "fixture_set_hash"
           ],
           "properties": {
-            "schema_version": {"const": "host-evaluator-receipt/v1"},
+            "schema_version": {"const": "host-evaluator-receipt/v2"},
             "decision_event_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "question_id": {"type": "string", "minLength": 1, "maxLength": 64},
             "ground_truth_label": {"type": "string", "minLength": 1, "maxLength": 128},
@@ -896,6 +898,10 @@
               "enum": ["host_evidence", "validator", "csw_fact", "operator"]
             },
             "evidence_observed_at": {"type": "string", "format": "date-time"},
+            "task_family": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+            "source_action_receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "source_action_result_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "evaluator_observation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "task_scope": {"type": "string", "minLength": 1, "maxLength": 256},
             "control_scope": {"type": "string", "minLength": 1, "maxLength": 256},
             "criterion_ids": {

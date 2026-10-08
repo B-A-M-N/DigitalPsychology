@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import secrets
 from dataclasses import replace
 from functools import wraps
 import time
@@ -37,6 +38,18 @@ def _record_metric(self: Any, operation: str, *args: Any) -> None:
             method(*args)
         except Exception:
             _LOG.warning("could not persist a production metric", exc_info=True)
+
+
+def _record_control_tick_attempt(self: Any, attempt_id: str | None, *,
+                                 status: str, **fields: Any) -> None:
+    """Keep query-stage diagnostics best-effort and outside policy authority."""
+    if attempt_id is None:
+        return
+    try:
+        self.state_store.update_control_tick_attempt(
+            attempt_id, status=status, **fields)
+    except Exception:
+        _LOG.warning("could not persist a control tick diagnostic", exc_info=True)
 
 
 def _record_laya_event(self: Any, event: str, *, amount: int = 1,
@@ -328,8 +341,44 @@ class ControlTransactionMethods:
         if request.expected_behavior_revision != record.state.revision:
             raise RuntimeError("control tick behavior revision is stale")
 
-        preparation = self.engine.prepare(descriptor, record, request)
+        attempt_id = secrets.token_hex(16)
+        try:
+            self.state_store.begin_control_tick_attempt(
+                scope, request.tick_id, attempt_id=attempt_id,
+                boundary_sequence=request.boundary_sequence,
+                request_digest=digest)
+        except Exception:
+            # Diagnostic persistence must never change the control decision.
+            _LOG.warning("could not start control tick diagnostic", exc_info=True)
+            attempt_id = None
+        try:
+            preparation = self.engine.prepare(descriptor, record, request)
+        except Exception as exc:
+            _record_control_tick_attempt(
+                self, attempt_id, status="failed",
+                failure_class=type(exc).__name__)
+            raise
         _record_laya_preparation_metrics(self, preparation, record.state)
+        system_one_frame = dict(preparation.system_one_frame or {})
+        question_ids = [str(item["question_id"])
+                        for item in system_one_frame.get("questions", ())
+                        if isinstance(item, Mapping)
+                        and isinstance(item.get("question_id"), str)]
+        system_one_result = dict(preparation.system_one_result or {})
+        query_failure_class = system_one_result.get("reason")
+        if (not isinstance(query_failure_class, str)
+                or not query_failure_class.isidentifier()
+                or len(query_failure_class) > 96):
+            query_failure_class = ("provider_failed"
+                                   if preparation.system_one_query_failed else None)
+        _record_control_tick_attempt(
+            self, attempt_id, status="inference_complete",
+            query_opportunity=preparation.system_one_query_opportunity,
+            question_ids=question_ids,
+            query_attempted=preparation.system_one_query_attempted,
+            judgment_returned=preparation.system_one_judgment_returned,
+            query_failed=preparation.system_one_query_failed,
+            failure_class=query_failure_class)
         if preparation.starvation_prevented:
             _record_metric(self, "increment", "starvation_prevention_events",
                            len(preparation.starvation_prevented))
@@ -386,6 +435,14 @@ class ControlTransactionMethods:
                         expected_action_index=record.action_index,
                         boundary_sequence=request.boundary_sequence,
                         input_digest=current_input_digest):
+                    _record_control_tick_attempt(
+                        self, attempt_id, status="unchanged",
+                        query_opportunity=preparation.system_one_query_opportunity,
+                        question_ids=question_ids,
+                        query_attempted=preparation.system_one_query_attempted,
+                        judgment_returned=preparation.system_one_judgment_returned,
+                        query_failed=preparation.system_one_query_failed,
+                        failure_class=query_failure_class)
                     return {
                         "protocol_version": PROTOCOL_VERSION,
                         "control_session_id": scope,
@@ -510,9 +567,28 @@ class ControlTransactionMethods:
                            if preparation.system_one_result is not None else None),
             }
         basis_digest = _digest(basis)
-        saved = self.state_store.prepare_control_tick(
-            scope, tick_id=request.tick_id, request_digest=digest,
-            basis=basis, decision=decision.to_dict())
+        try:
+            saved = self.state_store.prepare_control_tick(
+                scope, tick_id=request.tick_id, request_digest=digest,
+                basis=basis, decision=decision.to_dict())
+        except Exception as exc:
+            _record_control_tick_attempt(
+                self, attempt_id, status="failed",
+                query_opportunity=preparation.system_one_query_opportunity,
+                question_ids=question_ids,
+                query_attempted=preparation.system_one_query_attempted,
+                judgment_returned=preparation.system_one_judgment_returned,
+                query_failed=preparation.system_one_query_failed,
+                failure_class=type(exc).__name__)
+            raise
+        _record_control_tick_attempt(
+            self, attempt_id, status="prepared",
+            query_opportunity=preparation.system_one_query_opportunity,
+            question_ids=question_ids,
+            query_attempted=preparation.system_one_query_attempted,
+            judgment_returned=preparation.system_one_judgment_returned,
+            query_failed=preparation.system_one_query_failed,
+            failure_class=query_failure_class)
         _record_metric(self, "increment", "control_ticks_prepared")
         response = self._prepared_response(scope, request.tick_id, saved)
         response["basis_digest"] = basis_digest
@@ -651,6 +727,13 @@ class ControlTransactionMethods:
                                      if action_trace is not None else None),
             behavioral_control_transition=transition_trace,
         )
+        try:
+            self.state_store.update_control_tick_attempts(
+                scope, request.tick_id, status="committed",
+                decision_event_ids=result["system_one_decision_event_ids"])
+        except Exception:
+            _LOG.warning("could not finish committed control tick diagnostic",
+                         exc_info=True)
         _record_laya_commit_metrics(self, basis, record.state, decision)
         _record_metric(self, "increment", "control_ticks_committed")
         previous_lease = record.state.attention_lease
@@ -740,6 +823,12 @@ class ControlTransactionMethods:
         aborted = self.state_store.abort_control_tick(
             request.control_session_id, request.tick_id,
             decision_id=request.decision_id, detail=detail)
+        try:
+            self.state_store.update_control_tick_attempts(
+                request.control_session_id, request.tick_id, status="aborted")
+        except Exception:
+            _LOG.warning("could not finish aborted control tick diagnostic",
+                         exc_info=True)
         if transaction["status"] == "prepared":
             _record_metric(self, "increment", "control_ticks_aborted")
         state = self.state_store.load(request.control_session_id).state
@@ -803,6 +892,13 @@ class ControlTransactionMethods:
 
     def _dispatch_outbox(self, scope: str) -> None:
         for item in self.state_store.pending_outbox(scope):
+            destination = getattr(self.decision_service, "event_db", None)
+            if destination is not None:
+                try:
+                    self.state_store.record_outbox_destination(
+                        scope, item.event_id, str(destination))
+                except Exception:
+                    _LOG.warning("could not record outbox destination", exc_info=True)
             try:
                 self.state_store.record_outbox_dispatch_attempt(scope, item.event_id)
             except Exception:

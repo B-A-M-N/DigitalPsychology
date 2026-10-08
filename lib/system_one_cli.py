@@ -598,8 +598,340 @@ def load_authenticated_system_one_events(path: str | Path) -> list[Any]:
     return events
 
 
-def laya_corpus_status(path: str | Path) -> dict[str, Any]:
-    """Summarize a trusted event corpus without returning event payloads."""
+def _runtime_corpus_diagnostics(path: str | Path, *, event_path: Path,
+                                event_identity: Mapping[tuple[str, str], bool]
+                                ) -> dict[str, Any]:
+    """Reconcile trusted runtime tick/outbox facts against one event database."""
+    supplied = Path(path).expanduser()
+    if supplied.is_symlink():
+        raise ValueError("runtime state database must not be a symlink")
+    runtime_path = supplied.resolve(strict=False)
+    base: dict[str, Any] = {
+        "runtime_state_database_path": str(runtime_path),
+        "read_only": True,
+        "status": "unavailable",
+        "query_tick_history_available": False,
+        "query_attempt_history_available": False,
+        "query_history_started_at": None,
+        "control_tick_attempts": 0,
+        "control_tick_counts": {},
+        "system_one_query_opportunities": 0,
+        "query_opportunities_without_attempt": 0,
+        "system_one_query_attempts": 0,
+        "system_one_judgments_returned": 0,
+        "system_one_query_failures": 0,
+        "query_attempts_without_committed_tick": [],
+        "delivery_history_available": False,
+        "outbox_history_available": False,
+        "delivery_by_event_type": {},
+        "pending_outbox_events": None,
+        "last_dispatch_failure": None,
+        "last_attempted_event_id": None,
+        "last_successful_delivery_at": None,
+        "delivered_to_another_database": 0,
+        "delivered_missing_from_selected_database": 0,
+        "delivery_destination_unknown": 0,
+        "events_present_without_authentication": 0,
+        "committed_query_without_decision_event": 0,
+        "committed_query_without_delivery_record": None,
+        "committed_query_delivery_pending": None,
+        "committed_query_event_unauthenticated": None,
+        "committed_query_event_missing_from_selected_database": None,
+    }
+    if not runtime_path.is_file():
+        base["diagnostic"] = "runtime_state_database_missing"
+        return base
+
+    uri = runtime_path.as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True) as database:
+        tables = {str(row[0]) for row in database.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        ticks: dict[str, str] = {}
+        tick_counts: dict[str, int] = {}
+        if "control_ticks" in tables:
+            base["query_tick_history_available"] = True
+            for tick_id, status, basis_json in database.execute(
+                    "SELECT tick_id, status, basis_json FROM control_ticks"):
+                tick_counts[str(status)] = tick_counts.get(str(status), 0) + 1
+                try:
+                    basis = json.loads(basis_json)
+                except (TypeError, json.JSONDecodeError):
+                    basis = {}
+                if isinstance(basis, Mapping) and basis.get(
+                        "semantic_query_attempted") is True:
+                    ticks[str(tick_id)] = str(status)
+        base["control_tick_counts"] = tick_counts
+        if "runtime_diagnostic_meta" in tables:
+            row = database.execute(
+                "SELECT value FROM runtime_diagnostic_meta "
+                "WHERE key='system_one_diagnostics_started_at'").fetchone()
+            if row is not None:
+                base["query_history_started_at"] = str(row[0])
+
+        attempts = []
+        if "system_one_tick_attempts" in tables:
+            base["query_attempt_history_available"] = True
+            rows = database.execute(
+                "SELECT attempt_id, scope, tick_id, status, query_opportunity, "
+                "question_ids_json, query_attempted, judgment_returned, "
+                "query_failed, failure_class, decision_event_ids_json "
+                "FROM system_one_tick_attempts ORDER BY started_at, attempt_id"
+            ).fetchall()
+            for row in rows:
+                try:
+                    questions = json.loads(row[5])
+                    decision_event_ids = json.loads(row[10])
+                except (TypeError, json.JSONDecodeError):
+                    questions = []
+                    decision_event_ids = []
+                attempts.append({
+                    "attempt_id": str(row[0]), "scope": str(row[1]),
+                    "tick_id": str(row[2]), "status": str(row[3]),
+                    "query_opportunity": (None if row[4] is None else bool(row[4])),
+                    "question_ids": questions if isinstance(questions, list) else [],
+                    "query_attempted": (None if row[6] is None else bool(row[6])),
+                    "judgment_returned": (None if row[7] is None else bool(row[7])),
+                    "query_failed": (None if row[8] is None else bool(row[8])),
+                    "failure_class": row[9],
+                    "decision_event_ids": (decision_event_ids
+                                           if isinstance(decision_event_ids, list) else []),
+                })
+
+    observed_attempts = [item for item in attempts
+                         if item["query_attempted"] is True]
+    attempts_without_commit = ([item for item in observed_attempts
+                                if ticks.get(item["tick_id"]) != "committed"]
+                               if base["query_tick_history_available"] else None)
+    opportunities = [item for item in attempts
+                     if item["query_opportunity"] is True]
+    base["system_one_query_attempts"] = len(observed_attempts)
+    base["control_tick_attempts"] = len(attempts)
+    base["system_one_query_opportunities"] = len(opportunities)
+    base["query_opportunities_without_attempt"] = sum(
+        item["query_opportunity"] is True and item["query_attempted"] is False
+        for item in attempts)
+    base["system_one_judgments_returned"] = sum(
+        item["judgment_returned"] is True for item in observed_attempts)
+    base["system_one_query_failures"] = sum(
+        item["query_failed"] is True for item in observed_attempts)
+    base["query_attempts_without_committed_tick"] = (
+        attempts_without_commit[:256] if attempts_without_commit is not None else None)
+
+    event_path_string = str(event_path.resolve())
+    delivery_summary: dict[str, dict[str, int]] = {}
+    delivery_records: dict[tuple[str, str], dict[str, Any]] = {}
+    pending: int | None = 0
+    delivered_elsewhere = 0
+    delivered_missing_selected = 0
+    destination_unknown = 0
+    unauthenticated = sum(authenticated is False
+                          for authenticated in event_identity.values())
+    latest_failure: tuple[str, str, str] | None = None
+    last_attempt: tuple[str, str] | None = None
+    last_success: str | None = None
+    if "runtime_event_delivery" in tables:
+        base["delivery_history_available"] = True
+        with sqlite3.connect(uri, uri=True) as database:
+            tables = {str(row[0]) for row in database.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            columns = {str(row[1]) for row in database.execute(
+                "PRAGMA table_info(runtime_event_delivery)")}
+            destination_expr = ("destination_path" if "destination_path" in columns
+                                else "NULL")
+            has_outbox = "runtime_event_outbox" in tables
+            base["outbox_history_available"] = has_outbox
+            pending_expr = ("CASE WHEN o.event_id IS NULL THEN 0 ELSE 1 END"
+                            if has_outbox else "NULL")
+            outbox_join = (" LEFT JOIN runtime_event_outbox AS o "
+                           "ON o.scope=d.scope AND o.event_id=d.event_id"
+                           if has_outbox else "")
+            rows = database.execute(
+                "SELECT d.scope, d.event_id, d.event_type, d.last_attempt_at, "
+                "d.last_error_class, d.last_failure_at, d.delivered_at, "
+                f"{destination_expr}, {pending_expr} "
+                "FROM runtime_event_delivery AS d" + outbox_join + " "
+                "ORDER BY d.enqueued_at, d.event_id").fetchall()
+            for (scope, event_id, event_type, last_attempt_at, error_class,
+                 failure_at, delivered_at, destination, is_pending) in rows:
+                event_type = str(event_type)
+                counts = delivery_summary.setdefault(event_type, {
+                    "committed": 0, "enqueued": 0, "delivered": 0,
+                    "authenticated_in_selected_store": 0,
+                    "pending": 0, "present_unauthenticated": 0,
+                    "delivered_elsewhere": 0,
+                    "delivered_missing_from_selected_database": 0,
+                    "destination_unknown": 0,
+                })
+                counts["committed"] += 1
+                counts["enqueued"] += 1
+                if is_pending is None:
+                    pending = None
+                elif pending is not None:
+                    pending += int(bool(is_pending))
+                counts["pending"] += int(is_pending is True)
+                delivered = delivered_at is not None
+                counts["delivered"] += int(delivered)
+                event_auth = event_identity.get((str(scope), str(event_id)))
+                if event_auth is True:
+                    counts["authenticated_in_selected_store"] += 1
+                elif event_auth is False:
+                    counts["present_unauthenticated"] += 1
+                normalized_destination = None
+                if destination:
+                    actual_destination = str(Path(str(destination)).expanduser().resolve())
+                    normalized_destination = actual_destination
+                if delivered and normalized_destination:
+                    if normalized_destination != event_path_string:
+                        delivered_elsewhere += 1
+                        counts["delivered_elsewhere"] += 1
+                    elif event_auth is None:
+                        delivered_missing_selected += 1
+                        counts["delivered_missing_from_selected_database"] += 1
+                elif delivered:
+                    destination_unknown += 1
+                    counts["destination_unknown"] += 1
+                delivery_records[(str(scope), str(event_id))] = {
+                    "pending": None if is_pending is None else bool(is_pending),
+                    "delivered": delivered,
+                    "destination": normalized_destination,
+                    "event_type": event_type,
+                }
+                if last_attempt_at and (last_attempt is None
+                                        or str(last_attempt_at) > last_attempt[0]):
+                    last_attempt = (str(last_attempt_at), str(event_id))
+                if failure_at and (latest_failure is None
+                                   or str(failure_at) > latest_failure[0]):
+                    latest_failure = (str(failure_at), str(error_class or "UnknownError"),
+                                      str(event_id))
+                if delivered_at and (last_success is None
+                                     or str(delivered_at) > last_success):
+                    last_success = str(delivered_at)
+
+    if not base["delivery_history_available"] or not base["outbox_history_available"]:
+        pending = None
+
+    base.update({
+        "status": "observed",
+        "delivery_by_event_type": delivery_summary,
+        "pending_outbox_events": pending,
+        "last_dispatch_failure": ({
+            "at": latest_failure[0], "error_class": latest_failure[1],
+            "event_id": latest_failure[2],
+        } if latest_failure else None),
+        "last_attempted_event_id": last_attempt[1] if last_attempt else None,
+        "last_successful_delivery_at": last_success,
+        "delivered_to_another_database": delivered_elsewhere,
+        "delivered_missing_from_selected_database": delivered_missing_selected,
+        "delivery_destination_unknown": destination_unknown,
+        "events_present_without_authentication": unauthenticated,
+        "unpaired_authenticated_decisions": {
+            family: max(0, counts["authenticated_decisions"]
+                        - counts["paired_independent_outcomes"])
+            for family, counts in calibration_corpus_counts(
+                load_authenticated_system_one_events(event_path)).items()
+            if counts["authenticated_decisions"]
+            > counts["paired_independent_outcomes"]
+        },
+        "query_without_committed_tick_count": (
+            len(attempts_without_commit) if attempts_without_commit is not None else None),
+        "query_history_incomplete_count": sum(
+            item["query_attempted"] is None
+            and item["status"] in {"started", "inference_complete"}
+            for item in attempts),
+    })
+
+    committed_query_without_event = 0
+    committed_query_without_delivery = 0
+    committed_query_pending = 0
+    committed_query_unauthenticated = 0
+    committed_query_missing_selected = 0
+    for item in observed_attempts:
+        if item["status"] != "committed":
+            continue
+        decision_event_ids = item["decision_event_ids"]
+        if not decision_event_ids:
+            committed_query_without_event += 1
+            continue
+        if not base["delivery_history_available"]:
+            continue
+        for event_id in decision_event_ids:
+            delivery = delivery_records.get((item["scope"], str(event_id)))
+            if delivery is None:
+                committed_query_without_delivery += 1
+                continue
+            if delivery["pending"] is True:
+                committed_query_pending += 1
+            if delivery["destination"] == event_path_string:
+                if event_identity.get((item["scope"], str(event_id))) is None:
+                    committed_query_missing_selected += 1
+            elif delivery["destination"] is not None:
+                committed_query_missing_selected += 1
+            if event_identity.get((item["scope"], str(event_id))) is False:
+                committed_query_unauthenticated += 1
+    base.update({
+        "committed_query_without_decision_event": committed_query_without_event,
+        "committed_query_without_delivery_record": (
+            committed_query_without_delivery if base["delivery_history_available"] else None),
+        "committed_query_delivery_pending": (
+            committed_query_pending if base["outbox_history_available"] else None),
+        "committed_query_event_unauthenticated": (
+            committed_query_unauthenticated if base["delivery_history_available"] else None),
+        "committed_query_event_missing_from_selected_database": (
+            committed_query_missing_selected if base["delivery_history_available"] else None),
+    })
+    diagnostics = []
+    if base["query_attempt_history_available"] and not attempts:
+        diagnostics.append("no_control_tick_attempt_recorded_since_audit_start")
+    elif base["query_attempt_history_available"] and not observed_attempts:
+        diagnostics.append("no_system_one_query_attempt_recorded_since_audit_start")
+    if base["query_opportunities_without_attempt"]:
+        diagnostics.append("query_opportunity_without_attempt")
+    if not base["query_attempt_history_available"]:
+        diagnostics.append("query_attempt_history_unavailable")
+    if (base["query_attempt_history_available"]
+            and not base["query_tick_history_available"]):
+        diagnostics.append("control_tick_history_unavailable")
+    if attempts_without_commit:
+        diagnostics.append("system_one_query_without_committed_tick")
+    if base["system_one_query_failures"]:
+        diagnostics.append("system_one_query_failed")
+    if committed_query_without_event:
+        diagnostics.append("committed_query_missing_decision_event")
+    if committed_query_without_delivery:
+        if base["delivery_history_available"]:
+            diagnostics.append("committed_query_missing_delivery_record")
+    if committed_query_pending:
+        if base["outbox_history_available"]:
+            diagnostics.append("committed_query_delivery_pending")
+    if committed_query_unauthenticated:
+        if base["delivery_history_available"]:
+            diagnostics.append("committed_query_event_unauthenticated")
+    if committed_query_missing_selected:
+        if base["delivery_history_available"]:
+            diagnostics.append("committed_query_event_missing_from_selected_database")
+    if not base["delivery_history_available"]:
+        diagnostics.append("delivery_history_unavailable")
+    elif not base["outbox_history_available"]:
+        diagnostics.append("outbox_history_unavailable")
+    if pending:
+        diagnostics.append("committed_event_delivery_pending")
+    if delivered_elsewhere:
+        diagnostics.append("event_delivery_not_in_selected_store")
+    if delivered_missing_selected:
+        diagnostics.append("delivery_receipt_without_selected_event")
+    if destination_unknown:
+        diagnostics.append("delivery_destination_unknown")
+    if unauthenticated:
+        diagnostics.append("event_present_without_authentication")
+    if base["unpaired_authenticated_decisions"]:
+        diagnostics.append("authenticated_decision_missing_outcome")
+    base["diagnostics"] = diagnostics
+    return base
+
+
+def laya_corpus_status(path: str | Path,
+                       runtime_state_path: str | Path | None = None) -> dict[str, Any]:
+    """Summarize a trusted event corpus and runtime delivery state, without payloads."""
     supplied_path = Path(path).expanduser()
     if supplied_path.is_symlink():
         raise ValueError("event database must not be a symlink")
@@ -607,14 +939,16 @@ def laya_corpus_status(path: str | Path) -> dict[str, Any]:
     if not event_path.is_file():
         raise ValueError("event database must be a regular file")
     event_counts: dict[str, dict[str, int]] = {}
+    event_identity: dict[tuple[str, str], bool] = {}
     with sqlite3.connect(event_path.as_uri() + "?mode=ro", uri=True) as database:
         rows = database.execute(
-            "SELECT e.payload, CASE WHEN a.event_id IS NULL THEN 0 ELSE 1 END "
+            "SELECT e.event_id, e.payload, "
+            "CASE WHEN a.event_id IS NULL THEN 0 ELSE 1 END "
             "FROM events AS e LEFT JOIN authenticated_events AS a "
             "ON a.namespace_id=e.namespace_id "
             "AND a.application_instance_id=e.application_instance_id "
             "AND a.event_id=e.event_id ORDER BY e.row_id").fetchall()
-    for encoded, authenticated in rows:
+    for event_id, encoded, authenticated in rows:
         try:
             event = json.loads(encoded)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -625,8 +959,15 @@ def laya_corpus_status(path: str | Path) -> dict[str, Any]:
         counts = event_counts.setdefault(event_type, {"total": 0, "authenticated": 0})
         counts["total"] += 1
         counts["authenticated"] += int(bool(authenticated))
+        scope = event.get("scope") if isinstance(event, dict) else None
+        if isinstance(scope, str) and isinstance(event_id, str):
+            event_identity[(scope, event_id)] = bool(authenticated)
 
     trusted_events = load_authenticated_system_one_events(event_path)
+    if runtime_state_path is None:
+        runtime_state_path = os.environ.get(
+            "DIGITALPSYCHOLOGY_BEHAVIOR_STATE_DB",
+            str(trusted_state_root() / "behavior-state.sqlite3"))
     return {
         "schema_version": "laya-corpus-status/v1",
         "event_database_path": str(event_path),
@@ -637,6 +978,9 @@ def laya_corpus_status(path: str | Path) -> dict[str, Any]:
         "event_type_counts": event_counts,
         "system_one_event_count": len(trusted_events),
         "question_families": calibration_corpus_counts(trusted_events),
+        "runtime_diagnostics": _runtime_corpus_diagnostics(
+            runtime_state_path, event_path=event_path,
+            event_identity=event_identity),
     }
 
 
@@ -645,9 +989,13 @@ def laya_corpus_status_main(argv: list[str] | None = None) -> int:
         description="Report authenticated Laya corpus counts without event content")
     parser.add_argument("--event-db", default=os.environ.get(
         "DIGITALPSYCHOLOGY_EVENT_DB", str(trusted_state_root() / "events.sqlite3")))
+    parser.add_argument("--runtime-state-db", default=os.environ.get(
+        "DIGITALPSYCHOLOGY_BEHAVIOR_STATE_DB",
+        str(trusted_state_root() / "behavior-state.sqlite3")),
+        help="private DP behavior-state database used to reconcile query ticks and outbox")
     args = parser.parse_args(argv)
     try:
-        report = laya_corpus_status(args.event_db)
+        report = laya_corpus_status(args.event_db, args.runtime_state_db)
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         print(f"corpus status failed: {exc}", file=sys.stderr)
         return 1

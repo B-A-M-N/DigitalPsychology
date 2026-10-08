@@ -536,7 +536,7 @@ def _calibration_events(count=100, *, evaluator_hash="c" * 64):
         decision_event_id = f"event-{index}"
         evidence_ref = f"host-action://action-{index}#sha256=" + f"{index:064x}"
         evidence_receipt = {
-            "schema_version": "host-evaluator-receipt/v1",
+            "schema_version": "host-evaluator-receipt/v2",
             "decision_event_id": decision_event_id,
             "task_instance_hash": task_instance_hash(f"task-{index}"),
             "fixture_set_hash": f"{index + 1:064x}",
@@ -545,6 +545,10 @@ def _calibration_events(count=100, *, evaluator_hash="c" * 64):
             "evidence_ref": evidence_ref,
             "evidence_digest": f"{index:064x}",
             "evidence_authority": "validator",
+            "task_family": "semantic_progress_relation",
+            "source_action_receipt_id": f"action-{index}",
+            "source_action_result_digest": f"{index:064x}",
+            "evaluator_observation_digest": f"{index + 2:064x}",
             "evidence_observed_at": (
                 timestamp + timedelta(milliseconds=500)
             ).isoformat().replace("+00:00", "Z"),
@@ -621,6 +625,7 @@ def test_calibration_record_and_partition_digests_pin_evaluator_identity():
     changed_ref = receipt["evidence_ref"].rsplit("#sha256=", 1)[0]
     changed_ref += "#sha256=" + changed_evidence_digest
     receipt["evidence_digest"] = changed_evidence_digest
+    receipt["source_action_result_digest"] = changed_evidence_digest
     receipt["evidence_ref"] = changed_ref
     first_outcome.payload["system_one_outcome_evidence_ref"] = changed_ref
     first_outcome.evidence_refs = [changed_ref]

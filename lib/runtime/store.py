@@ -72,7 +72,12 @@ class BehaviorStateStore:
                     last_error_class TEXT,
                     last_failure_at TEXT,
                     delivered_at TEXT,
+                    destination_path TEXT,
                     PRIMARY KEY (scope, event_id)
+                );
+                CREATE TABLE IF NOT EXISTS runtime_diagnostic_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS runtime_event_outbox_scope_order
                     ON runtime_event_outbox(scope, action_index, event_id);
@@ -108,6 +113,27 @@ class BehaviorStateStore:
                     PRIMARY KEY (scope, tick_id),
                     UNIQUE (scope, decision_id)
                 );
+                CREATE TABLE IF NOT EXISTS system_one_tick_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    tick_id TEXT NOT NULL,
+                    boundary_sequence INTEGER NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'started', 'inference_complete', 'prepared',
+                        'committed', 'aborted', 'unchanged', 'failed')),
+                    query_opportunity INTEGER,
+                    question_ids_json TEXT NOT NULL DEFAULT '[]',
+                    query_attempted INTEGER,
+                    judgment_returned INTEGER,
+                    query_failed INTEGER,
+                    failure_class TEXT,
+                    decision_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS system_one_tick_attempt_scope_order
+                    ON system_one_tick_attempts(scope, started_at, attempt_id);
                 CREATE TABLE IF NOT EXISTS behavioral_action_traces (
                     scope TEXT NOT NULL,
                     action_index INTEGER NOT NULL,
@@ -137,6 +163,15 @@ class BehaviorStateStore:
                 database.execute(
                     "ALTER TABLE behavior_state ADD COLUMN cfw_signal_cursor "
                     "INTEGER NOT NULL DEFAULT 0")
+            delivery_columns = {str(row[1]) for row in database.execute(
+                "PRAGMA table_info(runtime_event_delivery)").fetchall()}
+            if "destination_path" not in delivery_columns:
+                database.execute(
+                    "ALTER TABLE runtime_event_delivery ADD COLUMN destination_path TEXT")
+            database.execute(
+                "INSERT OR IGNORE INTO runtime_diagnostic_meta(key, value) "
+                "VALUES ('system_one_diagnostics_started_at', ?)",
+                (datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),))
             # Preserve visibility for events that were already pending when
             # durable delivery diagnostics were introduced.
             pending = database.execute(
@@ -813,6 +848,160 @@ class BehaviorStateStore:
             events.append(RuntimeOutboxEvent(scope, str(event_id), payload))
         return tuple(events)
 
+    def begin_control_tick_attempt(self, scope: str, tick_id: str, *,
+                                   attempt_id: str, boundary_sequence: int,
+                                   request_digest: str) -> None:
+        """Durably mark entry into tick preparation before semantic inference."""
+        if (not isinstance(scope, str) or not scope or len(scope) > 1024
+                or not isinstance(tick_id, str) or not tick_id or len(tick_id) > 256
+                or not isinstance(attempt_id, str)
+                or len(attempt_id) != 32
+                or any(char not in "0123456789abcdef" for char in attempt_id)
+                or type(boundary_sequence) is not int or boundary_sequence < 0
+                or not isinstance(request_digest, str)
+                or len(request_digest) != 64
+                or any(char not in "0123456789abcdef" for char in request_digest)):
+            raise ValueError("control tick attempt identity is malformed")
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with self._connect() as database:
+            database.execute(
+                "INSERT INTO system_one_tick_attempts "
+                "(attempt_id, scope, tick_id, boundary_sequence, request_digest, "
+                "status, query_opportunity, question_ids_json, query_attempted, "
+                "judgment_returned, query_failed, failure_class, "
+                "decision_event_ids_json, started_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'started', NULL, '[]', NULL, NULL, NULL, "
+                "NULL, '[]', ?, ?)",
+                (attempt_id, scope, tick_id, boundary_sequence, request_digest,
+                 now, now))
+
+    def update_control_tick_attempt(self, attempt_id: str, *, status: str,
+                                    query_opportunity: bool | None = None,
+                                    question_ids: Sequence[str] = (),
+                                    query_attempted: bool | None = None,
+                                    judgment_returned: bool | None = None,
+                                    query_failed: bool | None = None,
+                                    failure_class: str | None = None,
+                                    decision_event_ids: Sequence[str] = ()) -> None:
+        """Update bounded diagnostics without changing control-tick decisions."""
+        valid_status = {"started", "inference_complete", "prepared", "committed",
+                        "aborted", "unchanged", "failed"}
+        bool_values = (query_opportunity, query_attempted, judgment_returned,
+                       query_failed)
+        if (not isinstance(attempt_id, str) or len(attempt_id) != 32
+                or any(char not in "0123456789abcdef" for char in attempt_id)
+                or status not in valid_status
+                or any(value is not None and type(value) is not bool
+                       for value in bool_values)
+                or not isinstance(question_ids, (tuple, list))
+                or len(question_ids) > 8
+                or any(not isinstance(item, str) or not item or len(item) > 96
+                       for item in question_ids)
+                or not isinstance(decision_event_ids, (tuple, list))
+                or len(decision_event_ids) > 32
+                or any(not isinstance(item, str) or not item or len(item) > 256
+                       for item in decision_event_ids)
+                or (failure_class is not None
+                    and (not isinstance(failure_class, str)
+                         or not failure_class.isidentifier()
+                         or len(failure_class) > 96))):
+            raise ValueError("control tick attempt diagnostics are malformed")
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with self._connect() as database:
+            cursor = database.execute(
+                "UPDATE system_one_tick_attempts SET status=?, query_opportunity=?, "
+                "question_ids_json=?, query_attempted=?, judgment_returned=?, "
+                "query_failed=?, failure_class=?, decision_event_ids_json=?, "
+                "updated_at=? WHERE attempt_id=?",
+                (status,
+                 None if query_opportunity is None else int(query_opportunity),
+                 json.dumps(list(question_ids), separators=(",", ":")),
+                 None if query_attempted is None else int(query_attempted),
+                 None if judgment_returned is None else int(judgment_returned),
+                 None if query_failed is None else int(query_failed),
+                 failure_class,
+                 json.dumps(list(decision_event_ids), separators=(",", ":")),
+                 now, attempt_id))
+            if cursor.rowcount != 1:
+                raise RuntimeError("control tick diagnostic attempt is missing")
+
+    def update_control_tick_attempts(self, scope: str, tick_id: str, *,
+                                     status: str,
+                                     decision_event_ids: Sequence[str] = ()) -> None:
+        """Advance prepared attempts after the tick commits or aborts."""
+        if (status not in {"committed", "aborted"}
+                or not isinstance(scope, str) or not scope
+                or not isinstance(tick_id, str) or not tick_id
+                or not isinstance(decision_event_ids, (tuple, list))
+                or len(decision_event_ids) > 32
+                or any(not isinstance(item, str) or not item or len(item) > 256
+                       for item in decision_event_ids)):
+            raise ValueError("control tick completion diagnostics are malformed")
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with self._connect() as database:
+            database.execute(
+                "UPDATE system_one_tick_attempts SET status=?, "
+                "decision_event_ids_json=?, updated_at=? "
+                "WHERE scope=? AND tick_id=? AND status='prepared'",
+                (status, json.dumps(list(decision_event_ids), separators=(",", ":")),
+                 now, scope, tick_id))
+
+    def record_outbox_destination(self, scope: str, event_id: str,
+                                  destination_path: str) -> None:
+        """Record the trusted event-store path used by the private dispatcher."""
+        if (not isinstance(scope, str) or not scope or not isinstance(event_id, str)
+                or not event_id or not isinstance(destination_path, str)
+                or not destination_path or len(destination_path) > 4096):
+            raise ValueError("outbox destination metadata is malformed")
+        path = str(Path(destination_path).expanduser().resolve())
+        with self._connect() as database:
+            database.execute(
+                "UPDATE runtime_event_delivery SET destination_path=? "
+                "WHERE scope=? AND event_id=?",
+                (path, scope, event_id))
+
+    def system_one_tick_attempts(self, *, scope: str | None = None,
+                                 limit: int = 4096) -> tuple[dict[str, Any], ...]:
+        """Read bounded query-to-commit diagnostics for trusted host reporting."""
+        if type(limit) is not int or not 1 <= limit <= 8192:
+            raise ValueError("System-1 tick diagnostic limit is invalid")
+        query = (
+            "SELECT attempt_id, scope, tick_id, boundary_sequence, request_digest, "
+            "status, query_opportunity, question_ids_json, query_attempted, "
+            "judgment_returned, query_failed, failure_class, "
+            "decision_event_ids_json, started_at, updated_at "
+            "FROM system_one_tick_attempts")
+        parameters: tuple[Any, ...] = ()
+        if scope is not None:
+            query += " WHERE scope=?"
+            parameters = (scope,)
+        query += " ORDER BY started_at DESC, attempt_id DESC LIMIT ?"
+        parameters = (*parameters, limit)
+        with self._connect() as database:
+            rows = database.execute(query, parameters).fetchall()
+        result = []
+        for row in rows:
+            try:
+                question_ids = json.loads(row[7])
+                event_ids = json.loads(row[12])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("persisted System-1 tick diagnostics are malformed") from exc
+            if not isinstance(question_ids, list) or not isinstance(event_ids, list):
+                raise RuntimeError("persisted System-1 tick diagnostics are malformed")
+            result.append({
+                "attempt_id": str(row[0]), "scope": str(row[1]),
+                "tick_id": str(row[2]), "boundary_sequence": int(row[3]),
+                "request_digest": str(row[4]), "status": str(row[5]),
+                "query_opportunity": (None if row[6] is None else bool(row[6])),
+                "question_ids": question_ids,
+                "query_attempted": (None if row[8] is None else bool(row[8])),
+                "judgment_returned": (None if row[9] is None else bool(row[9])),
+                "query_failed": (None if row[10] is None else bool(row[10])),
+                "failure_class": row[11], "decision_event_ids": event_ids,
+                "started_at": str(row[13]), "updated_at": str(row[14]),
+            })
+        return tuple(result)
+
     def record_outbox_dispatch_attempt(self, scope: str, event_id: str) -> None:
         """Persist the start of a delivery attempt without storing event content."""
         now = datetime.now(timezone.utc).isoformat()
@@ -850,7 +1039,8 @@ class BehaviorStateStore:
             rows = database.execute(
                 "SELECT d.event_id, d.event_type, d.enqueued_at, d.attempt_count, "
                 "d.last_attempt_at, d.last_error_class, d.last_failure_at, "
-                "d.delivered_at, CASE WHEN o.event_id IS NULL THEN 0 ELSE 1 END "
+                "d.delivered_at, d.destination_path, "
+                "CASE WHEN o.event_id IS NULL THEN 0 ELSE 1 END "
                 "FROM runtime_event_delivery AS d LEFT JOIN runtime_event_outbox AS o "
                 "ON o.scope=d.scope AND o.event_id=d.event_id "
                 "WHERE d.scope=? ORDER BY d.enqueued_at, d.event_id", (scope,)
@@ -860,7 +1050,7 @@ class BehaviorStateStore:
             "enqueued_at": row[2], "attempt_count": int(row[3]),
             "last_attempt_at": row[4], "last_error_class": row[5],
             "last_failure_at": row[6], "delivered_at": row[7],
-            "pending": bool(row[8]),
+            "destination_path": row[8], "pending": bool(row[9]),
         } for row in rows)
 
     def outbox_delivery_status(self, scope: str, *,
@@ -887,7 +1077,8 @@ class BehaviorStateStore:
                 "SELECT MAX(delivered_at) FROM runtime_event_delivery WHERE scope=?",
                 (scope,)).fetchone()
             last_attempt = database.execute(
-                "SELECT event_id, last_attempt_at FROM runtime_event_delivery "
+                "SELECT event_id, last_attempt_at, destination_path "
+                "FROM runtime_event_delivery "
                 "WHERE scope=? AND last_attempt_at IS NOT NULL "
                 "ORDER BY last_attempt_at DESC, event_id DESC LIMIT 1",
                 (scope,)).fetchone()
@@ -926,6 +1117,8 @@ class BehaviorStateStore:
             "last_attempted_event_id": (
                 str(last_attempt[0]) if last_attempt is not None else None),
             "last_attempt_at": last_attempt[1] if last_attempt is not None else None,
+            "last_destination_path": (last_attempt[2]
+                                      if last_attempt is not None else None),
             "last_successful_delivery_at": (last_success[0]
                                              if last_success is not None else None),
             "authenticated_status_available": (

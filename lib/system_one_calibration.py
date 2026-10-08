@@ -16,11 +16,13 @@ from .system_one_contracts import QuestionProbability, SystemOneFrame, canonical
 
 
 VALID_OUTCOME_AUTHORITIES = frozenset({"host_evidence", "validator", "csw_fact", "operator"})
-HOST_EVALUATOR_RECEIPT_SCHEMA = "host-evaluator-receipt/v1"
+HOST_EVALUATOR_RECEIPT_SCHEMA = "host-evaluator-receipt/v2"
 _HOST_EVALUATOR_RECEIPT_FIELDS = frozenset({
     "schema_version", "decision_event_id", "question_id", "ground_truth_label",
     "evidence_ref", "evidence_digest", "evidence_authority",
-    "evidence_observed_at", "task_scope", "control_scope", "criterion_ids",
+    "evidence_observed_at", "task_family", "source_action_receipt_id",
+    "source_action_result_digest", "evaluator_observation_digest",
+    "task_scope", "control_scope", "criterion_ids",
     "evaluator_contract_hash", "task_instance_hash", "fixture_set_hash",
 })
 PRODUCTION_MINIMUM_INDEPENDENT_TRAJECTORIES = 30
@@ -35,9 +37,9 @@ def validate_host_evaluator_receipt(
         evaluated_at: datetime | None = None) -> dict[str, Any]:
     """Validate the private host evaluator's evidence receipt against its decision.
 
-    The receipt is emitted only after the trusted task evaluator resolves a
-    host action receipt. The DP event store binds that receipt to the
-    authenticated prediction, task, session, criterion set, and timestamps.
+    The private task host validates the source action and evaluator observation
+    before submission. DP binds their digests to the authenticated prediction,
+    task, session, criterion set, and timestamps.
     """
     if not isinstance(receipt, Mapping) or set(receipt) != _HOST_EVALUATOR_RECEIPT_FIELDS:
         raise ValueError("independent outcome requires a complete host evaluator receipt")
@@ -63,6 +65,7 @@ def validate_host_evaluator_receipt(
 
     evidence_digest = receipt.get("evidence_digest")
     evaluator_hash = receipt.get("evaluator_contract_hash")
+    observation_digest = receipt.get("evaluator_observation_digest")
     digest_pattern = re.compile(r"[0-9a-f]{64}")
     if (not isinstance(evidence_digest, str)
             or digest_pattern.fullmatch(evidence_digest) is None):
@@ -73,9 +76,20 @@ def validate_host_evaluator_receipt(
     if (not isinstance(receipt.get("fixture_set_hash"), str)
             or digest_pattern.fullmatch(receipt["fixture_set_hash"]) is None):
         raise ValueError("host evaluator receipt fixture identity is invalid")
+    if (not isinstance(observation_digest, str)
+            or digest_pattern.fullmatch(observation_digest) is None):
+        raise ValueError("host evaluator receipt observation digest is invalid")
     ref_prefix, marker, ref_digest = evidence_ref.rpartition("#sha256=")
     if not ref_prefix or marker != "#sha256=" or ref_digest != evidence_digest:
         raise ValueError("host evaluator receipt does not resolve its evidence reference")
+    source_receipt_id = receipt.get("source_action_receipt_id")
+    source_result_digest = receipt.get("source_action_result_digest")
+    if (not ref_prefix.startswith("host-action://")
+            or ref_prefix.removeprefix("host-action://") != source_receipt_id
+            or source_result_digest != evidence_digest
+            or not isinstance(receipt.get("task_family"), str)
+            or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", receipt["task_family"])):
+        raise ValueError("host evaluator receipt does not resolve its source action")
 
     criteria = receipt.get("criterion_ids")
     decision_criteria = (getattr(decision_event, "payload", {}) or {}).get(

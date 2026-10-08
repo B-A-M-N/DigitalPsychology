@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import sqlite3
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -190,13 +191,18 @@ def _stored_decision_event():
 def _evidence_receipt(decision, evidence_ref, label, **overrides):
     digest = evidence_ref.rsplit("#sha256=", 1)[-1]
     receipt = {
-        "schema_version": "host-evaluator-receipt/v1",
+        "schema_version": "host-evaluator-receipt/v2",
         "decision_event_id": decision.event_id,
         "question_id": "progress_relation",
         "ground_truth_label": label,
         "evidence_ref": evidence_ref,
         "evidence_digest": digest,
         "evidence_authority": "validator",
+        "task_family": "semantic_progress_relation",
+        "source_action_receipt_id": evidence_ref.rpartition("#sha256=")[0].removeprefix(
+            "host-action://"),
+        "source_action_result_digest": digest,
+        "evaluator_observation_digest": "9" * 64,
         "evidence_observed_at": (
             datetime.now(timezone.utc) - timedelta(seconds=20)
         ).isoformat().replace("+00:00", "Z"),
@@ -321,6 +327,12 @@ def test_committed_system_one_outbox_retries_after_sqlite_delivery_failure(tmp_p
         assert failed["pending_count"] == 1
         assert failed["last_dispatch_failure"]["error_class"] == "EventError"
         assert store.outbox_delivery_records(decision.scope)[0]["attempt_count"] == 1
+        corpus = laya_corpus_status(event_path, behavior_path)["runtime_diagnostics"]
+        assert corpus["delivery_history_available"] is True
+        assert corpus["outbox_history_available"] is True
+        assert corpus["pending_outbox_events"] == 1
+        assert corpus["last_dispatch_failure"]["error_class"] == "EventError"
+        assert "committed_event_delivery_pending" in corpus["diagnostics"]
     finally:
         first_control.close()
 
@@ -344,6 +356,12 @@ def test_committed_system_one_outbox_retries_after_sqlite_delivery_failure(tmp_p
         records = restarted_store.outbox_delivery_records(decision.scope)
         assert records[0]["attempt_count"] == 2
         assert records[0]["delivered_at"]
+        assert records[0]["destination_path"] == str(event_path.resolve())
+        corpus = laya_corpus_status(event_path, behavior_path)["runtime_diagnostics"]
+        assert corpus["pending_outbox_events"] == 0
+        assert corpus["delivery_by_event_type"]["system_one_decision"][
+            "authenticated_in_selected_store"] == 1
+        assert corpus["delivered_to_another_database"] == 0
         with sqlite3.connect(event_path) as database:
             assert database.execute(
                 "SELECT COUNT(*) FROM events WHERE event_id=?",
@@ -353,6 +371,116 @@ def test_committed_system_one_outbox_retries_after_sqlite_delivery_failure(tmp_p
                 (decision.event_id,)).fetchone()[0] == 1
     finally:
         restarted_control.close()
+
+
+def test_corpus_status_retains_query_attempt_without_committed_tick_after_restart(
+        tmp_path):
+    event_path = tmp_path / "events.sqlite3"
+    behavior_path = tmp_path / "behavior.sqlite3"
+    sink = SQLiteSink(event_path)
+    try:
+        scope = "scope-query-without-tick"
+        store = BehaviorStateStore(behavior_path)
+        store.begin_control_tick_attempt(
+            scope, "tick-no-commit", attempt_id="a" * 32,
+            boundary_sequence=7, request_digest="b" * 64)
+        store.update_control_tick_attempt(
+            "a" * 32, status="inference_complete", query_opportunity=True,
+            question_ids=("progress_relation",), query_attempted=True,
+            judgment_returned=True, query_failed=False)
+
+        # Reopening the state store represents a fresh host process. The tick
+        # attempt remains visible even though control_ticks has no commit row.
+        restarted = BehaviorStateStore(behavior_path)
+        status = laya_corpus_status(event_path, behavior_path)
+        runtime = status["runtime_diagnostics"]
+        assert runtime["query_attempt_history_available"] is True
+        assert runtime["control_tick_attempts"] == 1
+        assert runtime["system_one_query_opportunities"] == 1
+        assert runtime["system_one_query_attempts"] == 1
+        assert runtime["system_one_judgments_returned"] == 1
+        assert runtime["query_without_committed_tick_count"] == 1
+        assert runtime["query_attempts_without_committed_tick"][0]["tick_id"] == (
+            "tick-no-commit")
+        assert "system_one_query_without_committed_tick" in runtime["diagnostics"]
+        assert runtime["query_history_started_at"]
+        assert restarted.system_one_tick_attempts(scope=scope)[0]["status"] == (
+            "inference_complete")
+    finally:
+        sink.close()
+
+
+def test_corpus_status_distinguishes_no_query_unauthenticated_and_missing_outcome(
+        tmp_path):
+    event_path = tmp_path / "events.sqlite3"
+    behavior_path = tmp_path / "behavior.sqlite3"
+    sink = SQLiteSink(event_path)
+    try:
+        sink.emit(_stored_decision_event())
+        authenticated_decision = replace(
+            _stored_decision_event(), event_id="dp-s1-authenticated-without-outcome")
+        sink.emit_authenticated(authenticated_decision, authenticated=True)
+
+        runtime = laya_corpus_status(
+            event_path, BehaviorStateStore(behavior_path).path)["runtime_diagnostics"]
+        assert runtime["query_attempt_history_available"] is True
+        assert runtime["query_tick_history_available"] is True
+        assert runtime["control_tick_attempts"] == 0
+        assert runtime["system_one_query_attempts"] == 0
+        assert "no_control_tick_attempt_recorded_since_audit_start" in runtime[
+            "diagnostics"]
+        assert runtime["events_present_without_authentication"] == 1
+        assert runtime["unpaired_authenticated_decisions"]["progress_relation"] == 1
+        assert "event_present_without_authentication" in runtime["diagnostics"]
+        assert "authenticated_decision_missing_outcome" in runtime["diagnostics"]
+    finally:
+        sink.close()
+
+
+def test_corpus_status_identifies_delivery_to_another_or_missing_event_store(
+        tmp_path):
+    source_path = tmp_path / "source-events.sqlite3"
+    selected_path = tmp_path / "selected-events.sqlite3"
+    behavior_path = tmp_path / "behavior.sqlite3"
+    source_sink = SQLiteSink(source_path)
+    selected_sink = SQLiteSink(selected_path)
+    try:
+        decision = _stored_decision_event()
+        source_sink.emit_authenticated(decision, authenticated=True)
+        store = BehaviorStateStore(behavior_path)
+        store.save(
+            decision.scope, expected_revision=0, expected_action_index=-1,
+            action_index=0, state=BehaviorState(revision=1),
+            outbox_events=(decision.to_dict(),))
+        store.record_outbox_destination(decision.scope, decision.event_id,
+                                        str(source_path))
+        store.record_outbox_dispatch_attempt(decision.scope, decision.event_id)
+        store.acknowledge_outbox_event(decision.scope, decision.event_id)
+
+        diagnostics = laya_corpus_status(
+            selected_path, behavior_path)["runtime_diagnostics"]
+        assert diagnostics["delivered_to_another_database"] == 1
+        assert "event_delivery_not_in_selected_store" in diagnostics["diagnostics"]
+
+        # Model a durable delivery receipt whose declared target matches the
+        # selected DB, while the event itself is absent there.
+        missing_decision = replace(
+            decision, event_id="dp-s1-missing-in-selected", scope="scope-missing")
+        store.save(
+            "scope-missing", expected_revision=0, expected_action_index=-1,
+            action_index=0, state=BehaviorState(revision=1),
+            outbox_events=(missing_decision.to_dict(),))
+        store.record_outbox_destination("scope-missing", missing_decision.event_id,
+                                        str(selected_path))
+        store.record_outbox_dispatch_attempt("scope-missing", missing_decision.event_id)
+        store.acknowledge_outbox_event("scope-missing", missing_decision.event_id)
+        missing = laya_corpus_status(
+            selected_path, behavior_path)["runtime_diagnostics"]
+        assert missing["delivered_missing_from_selected_database"] == 1
+        assert "delivery_receipt_without_selected_event" in missing["diagnostics"]
+    finally:
+        source_sink.close()
+        selected_sink.close()
 
 
 def test_aborted_or_uncommitted_system_one_decisions_are_not_persisted(tmp_path):
@@ -378,6 +506,12 @@ def test_aborted_or_uncommitted_system_one_decisions_are_not_persisted(tmp_path)
      "host-action://action#sha256=" + "1" * 64),
     ({}, "retry_relation", "host-action://action#sha256=" + "1" * 64),
     ({"criterion_ids": ["another-task-other-criterion"]}, "progress_relation",
+     "host-action://action#sha256=" + "1" * 64),
+    ({"source_action_receipt_id": "different-action"}, "progress_relation",
+     "host-action://action#sha256=" + "1" * 64),
+    ({"source_action_result_digest": "2" * 64}, "progress_relation",
+     "host-action://action#sha256=" + "1" * 64),
+    ({"evaluator_observation_digest": "invalid"}, "progress_relation",
      "host-action://action#sha256=" + "1" * 64),
 ])
 def test_outcome_labeler_rejects_unresolved_or_mismatched_evidence(
