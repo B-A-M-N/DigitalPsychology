@@ -25,7 +25,9 @@ from .system_one_contracts import (ActivityFact, CriterionState, QuestionSpec,
 from .system_one_calibration import (CalibrationBundle, CalibrationRecord, calibration_metrics,
                                      calibration_corpus_counts,
                                      calibration_record_from_events,
-                                     calibration_task_instance_hashes)
+                                     calibration_task_instance_hashes,
+                                     calibration_task_fixture_hashes,
+                                     PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES)
 from .system_one_learning import (CalibrationLifecycleError,
                                   SystemOneCalibrationLifecycle)
 from .laya_configuration import model_settings
@@ -685,24 +687,36 @@ def _write_candidate(path: Path, record: CalibrationRecord) -> None:
 
 def _write_corpus_manifest(path: Path, *, corpus_id: str, question_family: str,
                            candidate_digest: str,
-                           task_instance_hashes: tuple[str, ...]) -> dict[str, Any]:
+                           task_instance_hashes: tuple[str, ...],
+                           task_fixture_hashes: Mapping[str, str]) -> dict[str, Any]:
     task_hashes = list(task_instance_hashes)
+    fixtures = dict(task_fixture_hashes)
     if (not isinstance(corpus_id, str) or not corpus_id or len(corpus_id) > 256
             or question_family not in QUESTION_REGISTRY
             or len(candidate_digest) != 64
             or any(char not in "0123456789abcdef" for char in candidate_digest)
             or not task_hashes or len(task_hashes) != len(set(task_hashes))
             or any(len(value) != 64 or any(char not in "0123456789abcdef"
-                                           for char in value) for value in task_hashes)):
+                                           for char in value) for value in task_hashes)
+            or set(fixtures) != set(task_hashes)
+            or any(not isinstance(value, str) or len(value) != 64
+                   or any(char not in "0123456789abcdef" for char in value)
+                   for value in fixtures.values())
+            or len(set(fixtures.values())) < PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES):
         raise ValueError("calibration corpus identity is malformed")
     task_hashes.sort()
+    task_fixtures = [{"task_instance_hash": task_hash,
+                      "fixture_hash": fixtures[task_hash]}
+                     for task_hash in task_hashes]
     manifest: dict[str, Any] = {
-        "schema_version": "laya-calibration-corpus/v1",
+        "schema_version": "laya-calibration-corpus/v2",
         "corpus_id": corpus_id,
         "question_family": question_family,
         "candidate_digest": candidate_digest,
         "task_instance_hashes": task_hashes,
-        "fixture_set_hash": canonical_hash({"task_instance_hashes": task_hashes}),
+        "task_fixture_hashes": task_fixtures,
+        "independent_fixture_count": len(set(fixtures.values())),
+        "fixture_set_hash": canonical_hash({"fixtures": task_fixtures}),
     }
     manifest["manifest_digest"] = canonical_hash(manifest)
     path = path.expanduser()
@@ -752,6 +766,8 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
                         default=PRODUCTION_MINIMUM_OUTCOMES)
     parser.add_argument("--minimum-trajectories", type=int,
                         default=PRODUCTION_MINIMUM_TRAJECTORIES)
+    parser.add_argument("--minimum-fixtures", type=int,
+                        default=PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES)
     parser.add_argument("--minimum-cohort-trajectories", type=int,
                         default=PRODUCTION_MINIMUM_COHORT_TRAJECTORIES)
     parser.add_argument("--minimum-accuracy", type=float,
@@ -768,6 +784,7 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
         parser.error("--corpus-id must be at most 256 characters")
     if (args.minimum_outcomes < PRODUCTION_MINIMUM_OUTCOMES
             or args.minimum_trajectories < PRODUCTION_MINIMUM_TRAJECTORIES
+            or args.minimum_fixtures < PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES
             or args.minimum_cohort_trajectories < PRODUCTION_MINIMUM_COHORT_TRAJECTORIES
             or args.minimum_accuracy < PRODUCTION_MINIMUM_ACCURACY
             or args.maximum_brier > PRODUCTION_MAXIMUM_BRIER
@@ -785,6 +802,7 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
             minimum_confidence=args.minimum_confidence,
             minimum_outcomes=args.minimum_outcomes,
             minimum_independent_trajectories=args.minimum_trajectories,
+            minimum_independent_fixtures=args.minimum_fixtures,
             minimum_cohort_trajectories=args.minimum_cohort_trajectories,
             minimum_accuracy=args.minimum_accuracy,
             maximum_brier=args.maximum_brier,
@@ -807,11 +825,14 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
         if manifest_path is not None:
             task_hashes = calibration_task_instance_hashes(
                 events, question_id=args.question_family)
+            task_fixtures = calibration_task_fixture_hashes(
+                events, question_id=args.question_family)
             corpus_manifest = _write_corpus_manifest(
                 manifest_path, corpus_id=args.corpus_id,
                 question_family=args.question_family,
                 candidate_digest=record.digest,
-                task_instance_hashes=task_hashes)
+                task_instance_hashes=task_hashes,
+                task_fixture_hashes=task_fixtures)
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         print(f"qualification failed: {exc}", file=sys.stderr)
         return 1
@@ -831,9 +852,13 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
         "counts": {
             "independent_outcomes": record.sample_count,
             "independent_trajectories": record.independent_trajectory_count,
+            "independent_fixtures": record.independent_fixture_count,
             "training": record.training_count,
             "calibration": record.calibration_count,
             "holdout": record.holdout_count,
+            "training_fixtures": record.training_fixture_count,
+            "calibration_fixtures": record.calibration_fixture_count,
+            "holdout_fixtures": record.holdout_fixture_count,
         },
         "activation": "candidate only; requires independent host review",
         "corpus_manifest": (corpus_manifest if corpus_manifest is not None else None),

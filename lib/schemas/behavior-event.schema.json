@@ -882,7 +882,8 @@
             "schema_version", "decision_event_id", "question_id",
             "ground_truth_label", "evidence_ref", "evidence_digest",
             "evidence_authority", "evidence_observed_at", "task_scope",
-            "control_scope", "criterion_ids", "evaluator_contract_hash"
+            "control_scope", "criterion_ids", "evaluator_contract_hash",
+            "task_instance_hash", "fixture_set_hash"
           ],
           "properties": {
             "schema_version": {"const": "host-evaluator-receipt/v1"},
@@ -902,7 +903,9 @@
               "uniqueItems": true,
               "items": {"type": "string", "minLength": 1, "maxLength": 128}
             },
-            "evaluator_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            "evaluator_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "task_instance_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "fixture_set_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
           },
           "additionalProperties": false
         },

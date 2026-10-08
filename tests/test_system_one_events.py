@@ -10,7 +10,7 @@ from lib.feedback_loop import Event, EventFactory, SQLiteSink
 from lib.behavior_state import BehaviorState
 from lib.control.service import ControlPlaneService
 from lib.protocol_artifact import QUESTION_REGISTRY
-from lib.system_one_calibration import calibration_metrics
+from lib.system_one_calibration import calibration_metrics, task_instance_hash
 from lib.system_one_cli import (laya_corpus_status, laya_corpus_status_main,
                                 load_authenticated_system_one_events)
 from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnswer,
@@ -204,6 +204,8 @@ def _evidence_receipt(decision, evidence_ref, label, **overrides):
         "control_scope": decision.scope,
         "criterion_ids": ["task-plan_complete"],
         "evaluator_contract_hash": "c" * 64,
+        "task_instance_hash": task_instance_hash(decision.task_id),
+        "fixture_set_hash": "f" * 64,
     }
     receipt.update(overrides)
     return receipt
@@ -261,6 +263,8 @@ def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path, ca
             "authenticated_outcomes": 1,
             "paired_independent_outcomes": 1,
             "independent_trajectories": 1,
+            "task_instances": 1,
+            "independent_fixtures": 1,
         }
         assert laya_corpus_status_main(["--event-db", str(sink.path)]) == 0
         cli_output = capsys.readouterr().out

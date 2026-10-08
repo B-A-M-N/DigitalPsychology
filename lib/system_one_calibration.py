@@ -21,8 +21,11 @@ _HOST_EVALUATOR_RECEIPT_FIELDS = frozenset({
     "schema_version", "decision_event_id", "question_id", "ground_truth_label",
     "evidence_ref", "evidence_digest", "evidence_authority",
     "evidence_observed_at", "task_scope", "control_scope", "criterion_ids",
-    "evaluator_contract_hash",
+    "evaluator_contract_hash", "task_instance_hash", "fixture_set_hash",
 })
+PRODUCTION_MINIMUM_INDEPENDENT_TRAJECTORIES = 30
+PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES = 30
+PRODUCTION_MINIMUM_COHORT_TRAJECTORIES = 20
 _TEMPERATURES = tuple(round(0.25 + i * 0.05, 2) for i in range(96))
 
 
@@ -42,6 +45,8 @@ def validate_host_evaluator_receipt(
         raise ValueError("host evaluator receipt schema is unsupported")
     expected = {
         "decision_event_id": getattr(decision_event, "event_id", None),
+        "task_instance_hash": canonical_hash({
+            "task_id": getattr(decision_event, "task_id", None)}),
         "question_id": question_id,
         "ground_truth_label": label,
         "evidence_ref": evidence_ref,
@@ -65,6 +70,9 @@ def validate_host_evaluator_receipt(
     if (not isinstance(evaluator_hash, str)
             or digest_pattern.fullmatch(evaluator_hash) is None):
         raise ValueError("host evaluator receipt contract hash is invalid")
+    if (not isinstance(receipt.get("fixture_set_hash"), str)
+            or digest_pattern.fullmatch(receipt["fixture_set_hash"]) is None):
+        raise ValueError("host evaluator receipt fixture identity is invalid")
     ref_prefix, marker, ref_digest = evidence_ref.rpartition("#sha256=")
     if not ref_prefix or marker != "#sha256=" or ref_digest != evidence_digest:
         raise ValueError("host evaluator receipt does not resolve its evidence reference")
@@ -227,6 +235,12 @@ class CalibrationRecord:
     training_trajectory_count: int = 0
     calibration_trajectory_count: int = 0
     holdout_trajectory_count: int = 0
+    independent_fixture_count: int = 0
+    training_fixture_count: int = 0
+    calibration_fixture_count: int = 0
+    holdout_fixture_count: int = 0
+    minimum_independent_trajectories: int = PRODUCTION_MINIMUM_INDEPENDENT_TRAJECTORIES
+    minimum_independent_fixtures: int = PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES
     cohort_counts: tuple[tuple[str, str, int], ...] = ()
     minimum_cohort_trajectories: int = 20
     candidate_context_counts: tuple[tuple[int, str, str, int], ...] = ()
@@ -257,7 +271,7 @@ class CalibrationRecord:
             raise ValueError("unsupported calibration protocol")
         for name in ("temperature", "minimum_advisory_confidence", "holdout_accuracy",
                      "holdout_brier", "holdout_ece", "holdout_log_loss",
-                     "qualification_minimum_accuracy", "qualification_maximum_brier",
+            "qualification_minimum_accuracy", "qualification_maximum_brier",
                      "qualification_maximum_ece"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
@@ -275,7 +289,10 @@ class CalibrationRecord:
             "sample_count", "training_count", "calibration_count", "holdout_count",
             "minimum_outcomes", "independent_trajectory_count",
             "training_trajectory_count", "calibration_trajectory_count",
-            "holdout_trajectory_count")
+            "holdout_trajectory_count", "independent_fixture_count",
+            "training_fixture_count", "calibration_fixture_count",
+            "holdout_fixture_count", "minimum_independent_trajectories",
+            "minimum_independent_fixtures", "minimum_cohort_trajectories")
         if any(type(getattr(self, name)) is not int or getattr(self, name) < 0
                for name in count_fields):
             raise ValueError("calibration sample counts must be non-negative")
@@ -284,11 +301,30 @@ class CalibrationRecord:
         if (self.training_count + self.calibration_count + self.holdout_count
                 != self.sample_count):
             raise ValueError("calibration train/calibration/holdout counts do not add up")
+        if (self.minimum_independent_trajectories
+                < PRODUCTION_MINIMUM_INDEPENDENT_TRAJECTORIES
+                or self.minimum_independent_fixtures
+                < PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES):
+            raise ValueError("calibration independence thresholds cannot be weakened")
+        if self.minimum_outcomes < 100:
+            raise ValueError("calibration outcome threshold cannot be weakened")
+        if self.minimum_cohort_trajectories < PRODUCTION_MINIMUM_COHORT_TRAJECTORIES:
+            raise ValueError("calibration cohort threshold cannot be weakened")
+        if (self.minimum_advisory_confidence < 0.9
+                or self.qualification_minimum_accuracy < 0.8
+                or self.qualification_maximum_brier > 0.25
+                or self.qualification_maximum_ece > 0.12):
+            raise ValueError("calibration quality thresholds cannot be weakened")
         if (self.training_trajectory_count + self.calibration_trajectory_count
                 + self.holdout_trajectory_count != self.independent_trajectory_count
                 or min(self.training_trajectory_count, self.calibration_trajectory_count,
                        self.holdout_trajectory_count) < 1):
             raise ValueError("calibration trajectory partitions do not add up")
+        if (self.training_fixture_count + self.calibration_fixture_count
+                + self.holdout_fixture_count != self.independent_fixture_count
+                or min(self.training_fixture_count, self.calibration_fixture_count,
+                       self.holdout_fixture_count) < 1):
+            raise ValueError("calibration fixture partitions do not add up")
         allowed_labels = set(QUESTION_REGISTRY[self.question_id]["criteria"])
         if len(self.holdout_class_metrics) != len(allowed_labels):
             raise ValueError("holdout class metrics must cover the complete question family")
@@ -303,14 +339,16 @@ class CalibrationRecord:
             metric_labels.add(metric[0])
         if not self.work_modes or not self.deliverable_kinds:
             raise ValueError("calibration applicability must name work modes and deliverables")
-        if self.independent_trajectory_count < 1 or self.minimum_cohort_trajectories < 1:
-            raise ValueError("calibration must record independent trajectory count")
+        if (self.independent_trajectory_count < self.minimum_independent_trajectories
+                or self.independent_fixture_count < self.minimum_independent_fixtures
+                or self.minimum_cohort_trajectories < 1):
+            raise ValueError("calibration lacks independent trajectories or fixtures")
         if (not self.cohort_counts
                 or any(len(item) != 3 or not isinstance(item[0], str) or not item[0]
                        or not isinstance(item[1], str) or not item[1]
                        or not isinstance(item[2], int) or isinstance(item[2], bool)
-                       or item[2] < self.minimum_cohort_trajectories
-                       or item[2] > self.independent_trajectory_count
+                or item[2] < self.minimum_cohort_trajectories
+                       or item[2] > self.independent_fixture_count
                        for item in self.cohort_counts)):
             raise ValueError("calibration applicability cohorts are malformed")
         cohort_pairs = {(mode, kind) for mode, kind, _count in self.cohort_counts}
@@ -323,7 +361,7 @@ class CalibrationRecord:
                       or any(ch not in "0123456789abcdef" for ch in digest)
                       for digest in item[1:3])
                or not isinstance(item[3], int) or item[3] < self.minimum_cohort_trajectories
-               or item[3] > self.independent_trajectory_count
+                or item[3] > self.independent_fixture_count
                for item in self.candidate_context_counts):
             raise ValueError("route candidate calibration contexts are malformed")
         if self.status not in {"candidate", "active", "stale", "rolled_back"}:
@@ -359,6 +397,12 @@ class CalibrationRecord:
                 "training_trajectory_count": self.training_trajectory_count,
                 "calibration_trajectory_count": self.calibration_trajectory_count,
                 "holdout_trajectory_count": self.holdout_trajectory_count,
+                "independent_fixture_count": self.independent_fixture_count,
+                "training_fixture_count": self.training_fixture_count,
+                "calibration_fixture_count": self.calibration_fixture_count,
+                "holdout_fixture_count": self.holdout_fixture_count,
+                "minimum_independent_trajectories": self.minimum_independent_trajectories,
+                "minimum_independent_fixtures": self.minimum_independent_fixtures,
                 "cohort_counts": [list(item) for item in self.cohort_counts],
                 "minimum_cohort_trajectories": self.minimum_cohort_trajectories,
                 "candidate_context_counts": [list(item)
@@ -381,7 +425,10 @@ class CalibrationRecord:
                   "qualification_maximum_brier", "qualification_maximum_ece", "work_modes",
                   "deliverable_kinds", "independent_trajectory_count",
                   "training_trajectory_count", "calibration_trajectory_count",
-                  "holdout_trajectory_count", "cohort_counts",
+                  "holdout_trajectory_count", "independent_fixture_count",
+                  "training_fixture_count", "calibration_fixture_count",
+                  "holdout_fixture_count", "minimum_independent_trajectories",
+                  "minimum_independent_fixtures", "cohort_counts",
                   "minimum_cohort_trajectories", "candidate_context_counts",
                   "protocol_version", "protocol_hash",
                   "question_registry_hash", "state_projection_schema_hash",
@@ -432,6 +479,8 @@ class CalibrationRecord:
             and self.holdout_brier <= maximum_brier
             and self.holdout_ece <= maximum_ece
             and self.sample_count >= self.minimum_outcomes
+            and self.independent_trajectory_count >= self.minimum_independent_trajectories
+            and self.independent_fixture_count >= self.minimum_independent_fixtures
             and self.holdout_count >= max(10, int(self.minimum_outcomes * 0.2))
             and task["work_mode"] in self.work_modes
             and task["deliverable_kind"] in self.deliverable_kinds
@@ -454,6 +503,8 @@ class CalibrationRecord:
         minimum_partition = max(10, int(self.minimum_outcomes * 0.2))
         return bool(
             self.sample_count >= self.minimum_outcomes
+            and self.independent_trajectory_count >= self.minimum_independent_trajectories
+            and self.independent_fixture_count >= self.minimum_independent_fixtures
             and self.training_count >= minimum_train
             and self.calibration_count >= minimum_partition
             and self.holdout_count >= minimum_partition
@@ -482,7 +533,7 @@ class CalibrationBundle:
         return {key: self.records[key].canonical() for key in sorted(self.records)}
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": "1.2.0", "records": self.canonical(),
+        return {"schema_version": "1.3.0", "records": self.canonical(),
                 "bundle_hash": self.digest}
 
     @property
@@ -502,7 +553,7 @@ class CalibrationBundle:
     def from_mapping(cls, value: Mapping[str, Any]) -> "CalibrationBundle":
         if (not isinstance(value, Mapping) or set(value) != {
                 "schema_version", "records", "bundle_hash"}
-                or value.get("schema_version") != "1.2.0"
+                or value.get("schema_version") != "1.3.0"
                 or not isinstance(value.get("records"), Mapping)):
             raise ValueError("malformed System-1 calibration bundle")
         bundle = cls({str(key): CalibrationRecord.from_mapping(item)
@@ -536,6 +587,7 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
     outcome_key = f"system_one_outcome_{question_id}"
     allowed_labels = set(QUESTION_REGISTRY[question_id]["criteria"])
     seen: set[tuple[tuple[str, ...], str]] = set()
+    fixture_by_task: dict[str, str] = {}
     for outcome in event_list:
         payload = getattr(outcome, "payload", {}) or {}
         if (getattr(outcome, "event_type", None) != "system_one_outcome"
@@ -568,6 +620,11 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
                 evaluated_at=outcome_time)
         except ValueError:
             continue
+        task_hash = evidence_receipt["task_instance_hash"]
+        fixture_hash = evidence_receipt["fixture_set_hash"]
+        prior_fixture = fixture_by_task.setdefault(task_hash, fixture_hash)
+        if prior_fixture != fixture_hash:
+            raise ValueError("one task instance is bound to multiple fixture snapshots")
         decision_payload = getattr(decision, "payload", {}) or {}
         answer = decision_payload["system_one_answers"][question_id]
         if not isinstance(answer, Mapping) or answer.get("question_id") != question_id:
@@ -601,6 +658,8 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
         rows.append({
             "identity": key[0], "trajectory_id": hashlib.sha256(
                 json.dumps(key[0][:7], separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "task_instance_hash": task_hash,
+            "fixture_set_hash": fixture_hash,
             "decision_id": key[1], "probabilities": probabilities,
             "selected": selected, "actual": actual,
             "model_identity": tuple(str(decision_payload[field]) for field in required_identity[:5]),
@@ -631,6 +690,19 @@ def calibration_task_instance_hashes(events: Iterable[Any], *, question_id: str
     return tuple(sorted({task_instance_hash(row["identity"][6])
                          for row in _paired_rows(events, question_id)
                          if len(row["identity"]) > 6 and row["identity"][6]}))
+
+
+def calibration_task_fixture_hashes(events: Iterable[Any], *, question_id: str
+                                    ) -> dict[str, str]:
+    """Bind each independently labeled task instance to its pristine fixture."""
+    fixtures: dict[str, str] = {}
+    for row in _paired_rows(events, question_id):
+        task_hash = row["task_instance_hash"]
+        fixture_hash = row["fixture_set_hash"]
+        prior = fixtures.setdefault(task_hash, fixture_hash)
+        if prior != fixture_hash:
+            raise ValueError("one task instance is bound to multiple fixture snapshots")
+    return dict(sorted(fixtures.items()))
 
 
 def calibration_metrics(events: Iterable[Any], *, label: str = "progress_relation") -> dict[str, Any]:
@@ -673,6 +745,8 @@ def calibration_corpus_counts(events: Iterable[Any]) -> dict[str, dict[str, int]
             "paired_independent_outcomes": len(outcome_rows),
             "independent_trajectories": len({
                 row["trajectory_id"] for row in outcome_rows}),
+            "task_instances": len({row["task_instance_hash"] for row in outcome_rows}),
+            "independent_fixtures": len({row["fixture_set_hash"] for row in outcome_rows}),
         }
     return result
 
@@ -693,34 +767,56 @@ def _calibration_bins(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def calibration_record_from_events(
     events: Iterable[Any], *, question_id: str,
     minimum_confidence: float = 0.9, minimum_outcomes: int = 100,
-    minimum_independent_trajectories: int = 30,
+    minimum_independent_trajectories: int = PRODUCTION_MINIMUM_INDEPENDENT_TRAJECTORIES,
+    minimum_independent_fixtures: int = PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES,
     minimum_cohort_trajectories: int = 20,
     minimum_accuracy: float = 0.8, maximum_brier: float = 0.25,
     maximum_ece: float = 0.12,
 ) -> CalibrationRecord:
     """Fit on train, calibrate on calibration, and qualify only on holdout rows."""
+    if (type(minimum_outcomes) is not int or minimum_outcomes < 100
+            or type(minimum_independent_trajectories) is not int
+            or minimum_independent_trajectories
+            < PRODUCTION_MINIMUM_INDEPENDENT_TRAJECTORIES
+            or type(minimum_independent_fixtures) is not int
+            or minimum_independent_fixtures
+            < PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES):
+        raise ValueError("calibration independence thresholds cannot be weakened")
+    if (type(minimum_cohort_trajectories) is not int
+            or minimum_cohort_trajectories < PRODUCTION_MINIMUM_COHORT_TRAJECTORIES
+            or minimum_confidence < 0.9
+            or minimum_accuracy < 0.8
+            or maximum_brier > 0.25
+            or maximum_ece > 0.12):
+        raise ValueError("calibration qualification thresholds cannot be weakened")
     rows = _paired_rows(events, question_id)
     if len(rows) < minimum_outcomes:
         raise ValueError("insufficient later independent outcomes for calibration")
     trajectory_ids = sorted({row["trajectory_id"] for row in rows})
     if len(trajectory_ids) < minimum_independent_trajectories:
         raise ValueError("insufficient later independent trajectories for calibration")
+    fixture_ids = sorted({row["fixture_set_hash"] for row in rows})
+    if len(fixture_ids) < minimum_independent_fixtures:
+        raise ValueError("insufficient distinct task fixtures for calibration")
     identities = {row["model_identity"] for row in rows}
     if len(identities) != 1:
         raise ValueError("calibration evidence mixes provider or model content identities")
     model_tuple = next(iter(identities))
-    ordered_trajectories = sorted(trajectory_ids, key=lambda item: hashlib.sha256(
+    ordered_fixtures = sorted(fixture_ids, key=lambda item: hashlib.sha256(
         item.encode("utf-8")).digest())
-    train_end = max(1, int(len(ordered_trajectories) * 0.6))
-    calibration_end = max(train_end + 1, int(len(ordered_trajectories) * 0.8))
-    calibration_end = min(calibration_end, len(ordered_trajectories) - 1)
-    training_trajectories = set(ordered_trajectories[:train_end])
-    calibration_trajectories = set(ordered_trajectories[train_end:calibration_end])
-    holdout_trajectories = set(ordered_trajectories[calibration_end:])
-    train = [row for row in rows if row["trajectory_id"] in training_trajectories]
+    train_end = max(1, int(len(ordered_fixtures) * 0.6))
+    calibration_end = max(train_end + 1, int(len(ordered_fixtures) * 0.8))
+    calibration_end = min(calibration_end, len(ordered_fixtures) - 1)
+    training_fixtures = set(ordered_fixtures[:train_end])
+    calibration_fixtures = set(ordered_fixtures[train_end:calibration_end])
+    holdout_fixtures = set(ordered_fixtures[calibration_end:])
+    train = [row for row in rows if row["fixture_set_hash"] in training_fixtures]
     calibration = [row for row in rows
-                   if row["trajectory_id"] in calibration_trajectories]
-    holdout = [row for row in rows if row["trajectory_id"] in holdout_trajectories]
+                   if row["fixture_set_hash"] in calibration_fixtures]
+    holdout = [row for row in rows if row["fixture_set_hash"] in holdout_fixtures]
+    training_trajectories = {row["trajectory_id"] for row in train}
+    calibration_trajectories = {row["trajectory_id"] for row in calibration}
+    holdout_trajectories = {row["trajectory_id"] for row in holdout}
     minimum_calibration_rows = max(10, int(minimum_outcomes * 0.2))
     if (len(train) < max(20, int(minimum_outcomes * 0.4))
             or len(calibration) < minimum_calibration_rows
@@ -747,6 +843,8 @@ def calibration_record_from_events(
     def digest(material: list[dict[str, Any]]) -> str:
         rows_for_digest = [{"identity": list(row["identity"]),
                             "trajectory_id": row["trajectory_id"],
+                            "task_instance_hash": row["task_instance_hash"],
+                            "fixture_set_hash": row["fixture_set_hash"],
                             "decision_id": row["decision_id"],
                             "predicted": row["selected"], "actual": row["actual"],
                             "probabilities": row["probabilities"],
@@ -758,20 +856,20 @@ def calibration_record_from_events(
     cohort_trajectories: dict[tuple[str, str], set[str]] = {}
     for row in rows:
         key = (row["work_mode"], row["deliverable_kind"])
-        cohort_trajectories.setdefault(key, set()).add(row["trajectory_id"])
+        cohort_trajectories.setdefault(key, set()).add(row["fixture_set_hash"])
     applicable_cohorts = tuple(sorted(
         (mode, kind, len(trajectories))
         for (mode, kind), trajectories in cohort_trajectories.items()
         if len(trajectories) >= minimum_cohort_trajectories))
     if not applicable_cohorts:
-        raise ValueError("no work-mode/deliverable cohort has enough independent trajectories")
+        raise ValueError("no work-mode/deliverable cohort has enough distinct task fixtures")
     candidate_context_counts: tuple[tuple[int, str, str, int], ...] = ()
     if question_id == "route_preference":
         contexts: dict[tuple[int, str, str], set[str]] = {}
         for row in rows:
             context = row.get("candidate_context")
             if context is not None:
-                contexts.setdefault(context, set()).add(row["trajectory_id"])
+                contexts.setdefault(context, set()).add(row["fixture_set_hash"])
         candidate_context_counts = tuple(sorted(
             (count, candidate_digest, domain_digest, len(trajectories))
             for (count, candidate_digest, domain_digest), trajectories in contexts.items()
@@ -799,6 +897,12 @@ def calibration_record_from_events(
         training_trajectory_count=len(training_trajectories),
         calibration_trajectory_count=len(calibration_trajectories),
         holdout_trajectory_count=len(holdout_trajectories),
+        independent_fixture_count=len(fixture_ids),
+        training_fixture_count=len(training_fixtures),
+        calibration_fixture_count=len(calibration_fixtures),
+        holdout_fixture_count=len(holdout_fixtures),
+        minimum_independent_trajectories=minimum_independent_trajectories,
+        minimum_independent_fixtures=minimum_independent_fixtures,
         cohort_counts=applicable_cohorts,
         minimum_cohort_trajectories=minimum_cohort_trajectories,
         candidate_context_counts=candidate_context_counts,
@@ -808,4 +912,7 @@ def calibration_record_from_events(
 __all__ = ["CalibrationRecord", "CalibrationBundle", "calibration_metrics",
            "calibration_corpus_counts",
            "calibration_record_from_events", "task_instance_hash",
-           "calibration_task_instance_hashes"]
+           "calibration_task_instance_hashes", "calibration_task_fixture_hashes",
+           "PRODUCTION_MINIMUM_INDEPENDENT_TRAJECTORIES",
+           "PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES",
+           "PRODUCTION_MINIMUM_COHORT_TRAJECTORIES"]

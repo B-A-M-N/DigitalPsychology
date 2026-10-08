@@ -20,6 +20,7 @@ from lib.system_one_calibration import (CalibrationBundle, CalibrationRecord,
                                         calibration_metrics,
                                         calibration_record_from_events,
                                         calibration_task_instance_hashes,
+                                        calibration_task_fixture_hashes,
                                         task_instance_hash)
 from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnswer,
                                       QuestionProbability, QuestionSpec, SemanticState,
@@ -447,7 +448,7 @@ def calibration_record(question_id="progress_relation", *, status="active"):
         question_id=question_id, backend_id=BACKEND_ID, model_id=MODEL_ID,
         model_revision=MODEL_REVISION, model_content_hash=MODEL_HASH,
         provider_protocol_hash=PROVIDER_HASH, temperature=0.5,
-        minimum_advisory_confidence=0.8, sample_count=100, training_count=60,
+        minimum_advisory_confidence=0.9, sample_count=100, training_count=60,
         calibration_count=20, holdout_count=20,
         training_outcome_digest="d" * 64,
         calibration_outcome_digest="e" * 64, holdout_outcome_digest="f" * 64,
@@ -463,9 +464,14 @@ def calibration_record(question_id="progress_relation", *, status="active"):
         independent_trajectory_count=30,
         training_trajectory_count=18, calibration_trajectory_count=6,
         holdout_trajectory_count=6,
-        cohort_counts=(("delivery", "code_behavior", 20),),
+        independent_fixture_count=30,
+        training_fixture_count=18, calibration_fixture_count=6,
+        holdout_fixture_count=6,
+        minimum_independent_trajectories=30,
+        minimum_independent_fixtures=30,
+        cohort_counts=(("delivery", "code_behavior", 30),),
         minimum_cohort_trajectories=20,
-        minimum_outcomes=20, status=status)
+        minimum_outcomes=100, status=status)
 
 
 def test_calibration_is_per_question_family_and_changes_probabilities():
@@ -531,6 +537,8 @@ def _calibration_events(count=100):
         evidence_receipt = {
             "schema_version": "host-evaluator-receipt/v1",
             "decision_event_id": decision_event_id,
+            "task_instance_hash": task_instance_hash(f"task-{index}"),
+            "fixture_set_hash": f"{index + 1:064x}",
             "question_id": "progress_relation",
             "ground_truth_label": "goal_progress",
             "evidence_ref": evidence_ref,
@@ -597,6 +605,10 @@ def test_calibration_corpus_identity_hashes_only_independently_labeled_task_inst
     assert len(hashes) == 4
     assert hashes == tuple(sorted(hashes))
     assert task_instance_hash("task-0") in hashes
+    fixture_hashes = calibration_task_fixture_hashes(
+        events, question_id="progress_relation")
+    assert len(fixture_hashes) == 4
+    assert fixture_hashes[task_instance_hash("task-0")] == f"{1:064x}"
     assert calibration_task_instance_hashes(
         events, question_id="retry_relation") == ()
 
@@ -607,9 +619,14 @@ def test_calibration_rejects_self_labeled_or_nonlater_outcomes():
         if event.event_type == "system_one_outcome":
             event.payload["system_one_independent_outcome"] = False
     assert calibration_metrics(events)["independent_outcomes"] == 0
-    with pytest.raises(ValueError, match="insufficient later independent"):
+    with pytest.raises(ValueError, match="thresholds cannot be weakened"):
         calibration_record_from_events(events, question_id="progress_relation",
                                        minimum_outcomes=1)
+
+
+def test_calibration_record_cannot_lower_production_sample_minimum():
+    with pytest.raises(ValueError, match="outcome threshold cannot be weakened"):
+        replace(calibration_record(), minimum_outcomes=99)
 
 
 def test_calibration_rejects_outcome_authority_claim_mismatch():
@@ -631,8 +648,11 @@ def test_calibration_groups_attempts_and_interactions_into_one_trajectory():
             event.attempt_id = attempt_id
             event.interaction_id = interaction_id
             if event.event_type == "system_one_outcome":
+                receipt = event.payload["system_one_outcome_evidence_receipt"]
                 event.payload["system_one_outcome_evidence_receipt"][
                     "task_scope"] = task_id
+                receipt["task_instance_hash"] = task_instance_hash(task_id)
+                receipt["fixture_set_hash"] = "a" * 64
     with pytest.raises(ValueError, match="independent trajectories"):
         calibration_record_from_events(
             events, question_id="progress_relation", minimum_outcomes=100)
@@ -656,7 +676,7 @@ def test_calibration_lifecycle_stages_activates_and_exports_active_bundle(tmp_pa
     path_data = json.loads((tmp_path / "system-one-calibration.json").read_text())
     restored = CalibrationBundle.from_mapping(bundle.to_dict())
     assert restored.digest == bundle.digest
-    assert bundle.to_dict()["schema_version"] == "1.2.0"
+    assert bundle.to_dict()["schema_version"] == "1.3.0"
     assert path_data["revision"] == 2
     assert path_data["schema_version"] == "2.0.0"
     legacy = bundle.to_dict()
