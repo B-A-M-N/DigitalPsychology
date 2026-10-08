@@ -796,9 +796,20 @@ class ControlTransactionMethods:
     def _dispatch_outbox(self, scope: str) -> None:
         for item in self.state_store.pending_outbox(scope):
             try:
+                self.state_store.record_outbox_dispatch_attempt(scope, item.event_id)
+            except Exception:
+                # Delivery diagnostics are best-effort if the state store is
+                # temporarily unavailable; the sink remains idempotent.
+                pass
+            try:
                 delivered = self.decision_service.dispatch_runtime_event(item.event)
                 if delivered != item.event_id:
                     raise RuntimeError("DP event sink acknowledged a different event")
                 self.state_store.acknowledge_outbox_event(scope, item.event_id)
-            except Exception:
+            except Exception as exc:
+                try:
+                    self.state_store.record_outbox_dispatch_failure(
+                        scope, item.event_id, type(exc).__name__)
+                except Exception:
+                    pass
                 break

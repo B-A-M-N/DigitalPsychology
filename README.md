@@ -56,7 +56,7 @@ Implemented capabilities include:
 - **Derived attention fairness** with a round-robin bound based on the current runnable criterion count and bounded lease size. The 258-action ceiling applies only to a full 256-item task set.
 - **An independent intervention outcome evaluator** that accepts only scoped, post-intervention host/CSW/validator evidence and an exact applied-directive receipt. It distinguishes supported progress, regression, confounding, missing evidence, and expired windows; agent success claims are not evidence.
 - **Intervention lifecycle records** with cause, expected effect, target criteria, baseline status, start action, bounded horizon, scope, expiry, and measured outcome; cleared or expired interventions emit explicit release directives.
-- **Transactional intervention event outbox** that commits authenticated application and outcome events with the DP behavior revision, then retries delivery idempotently after restarts.
+- **Transactional intervention event outbox** that commits authenticated application and outcome events with the DP behavior revision, retries delivery idempotently after restarts, and retains attempt, failure-class, delivery, and authentication status for trusted trial reports.
 - **Constrained StateWork preferences** ranked only from the eligible choices supplied by CSW. DP cannot commit or legalize a CSW transition.
 - **A versioned private MCP control protocol** with prepare/apply/commit/abort/reconcile transactions, exact directive receipts, and restart recovery against CFW and CSW revisions.
 - **Harness-neutral runtime contracts** in `cognitive_runtime_core/`. `TaskContract`, `ActionProposal`, `RuntimeObservationProjection`, and `CompletionProposal` give product adapters one bounded interface for task intent, actions, outcomes, and completion evidence. DP owns behavioral policy and its private control port; adapters own only their product-specific projection.
@@ -381,6 +381,15 @@ partitioned by trajectory. The command writes a mode-0600 candidate record;
 activation still requires independent host review through
 `SystemOneCalibrationLifecycle`. Threshold flags may make qualification
 stricter, but cannot weaken those production minimums.
+
+Use `digital-psychology-laya-corpus-status --event-db PATH` to inspect a
+retained corpus before qualification. It opens the database read-only and
+prints its canonical path, total and authenticated event counts by event type,
+and authenticated decision/outcome pairs and independent trajectory counts by
+question family. It never prints event payloads. Trusted per-trial DP telemetry
+also includes committed, enqueued, delivered, and authenticated outbox counts,
+the pending count, and the last dispatch failure class and successful delivery
+time. Authentication counts are verified against the configured event store.
 
 To prepare for a later efficacy study, also pass `--corpus-id ID
 --corpus-manifest-out CORPUS.json` to `laya-qualify`. The private manifest

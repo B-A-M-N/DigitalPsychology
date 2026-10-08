@@ -941,6 +941,13 @@ def test_private_stdio_mcp_applies_cfw_and_csw_then_commits(tmp_path):
             assert trial["model_projection_events"] == 2
             assert trial["model_projection_updates"] == 1
             assert trial["unique_model_projection_digests"] == 2
+            delivery = trial["runtime_event_delivery"]
+            assert delivery["committed_count"] >= 1
+            assert delivery["enqueued_count"] == delivery["committed_count"]
+            assert delivery["pending_count"] == 0
+            assert delivery["delivered_count"] == delivery["authenticated_count"]
+            assert delivery["authenticated_status_available"] is True
+            assert delivery["last_successful_delivery_at"]
             metrics = bridge.production_metrics_snapshot()
             assert metrics["counters"]["control_ticks_prepared"] >= 1
             assert metrics["counters"]["control_ticks_committed"] >= 1

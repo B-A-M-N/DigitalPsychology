@@ -23,6 +23,7 @@ from .system_one_contracts import (ActivityFact, CriterionState, QuestionSpec,
                                    SystemOneIdentity, SystemOneJudgment,
                                    canonical_hash)
 from .system_one_calibration import (CalibrationBundle, CalibrationRecord, calibration_metrics,
+                                     calibration_corpus_counts,
                                      calibration_record_from_events,
                                      calibration_task_instance_hashes)
 from .system_one_learning import (CalibrationLifecycleError,
@@ -595,6 +596,63 @@ def load_authenticated_system_one_events(path: str | Path) -> list[Any]:
     return events
 
 
+def laya_corpus_status(path: str | Path) -> dict[str, Any]:
+    """Summarize a trusted event corpus without returning event payloads."""
+    supplied_path = Path(path).expanduser()
+    if supplied_path.is_symlink():
+        raise ValueError("event database must not be a symlink")
+    event_path = supplied_path.resolve(strict=True)
+    if not event_path.is_file():
+        raise ValueError("event database must be a regular file")
+    event_counts: dict[str, dict[str, int]] = {}
+    with sqlite3.connect(event_path.as_uri() + "?mode=ro", uri=True) as database:
+        rows = database.execute(
+            "SELECT e.payload, CASE WHEN a.event_id IS NULL THEN 0 ELSE 1 END "
+            "FROM events AS e LEFT JOIN authenticated_events AS a "
+            "ON a.namespace_id=e.namespace_id "
+            "AND a.application_instance_id=e.application_instance_id "
+            "AND a.event_id=e.event_id ORDER BY e.row_id").fetchall()
+    for encoded, authenticated in rows:
+        try:
+            event = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("event database contains a malformed event") from exc
+        event_type = event.get("event_type") if isinstance(event, dict) else None
+        if not isinstance(event_type, str) or not event_type:
+            event_type = "unknown"
+        counts = event_counts.setdefault(event_type, {"total": 0, "authenticated": 0})
+        counts["total"] += 1
+        counts["authenticated"] += int(bool(authenticated))
+
+    trusted_events = load_authenticated_system_one_events(event_path)
+    return {
+        "schema_version": "laya-corpus-status/v1",
+        "event_database_path": str(event_path),
+        "read_only": True,
+        "event_count": sum(item["total"] for item in event_counts.values()),
+        "authenticated_event_count": sum(
+            item["authenticated"] for item in event_counts.values()),
+        "event_type_counts": event_counts,
+        "system_one_event_count": len(trusted_events),
+        "question_families": calibration_corpus_counts(trusted_events),
+    }
+
+
+def laya_corpus_status_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Report authenticated Laya corpus counts without event content")
+    parser.add_argument("--event-db", default=os.environ.get(
+        "DIGITALPSYCHOLOGY_EVENT_DB", str(trusted_state_root() / "events.sqlite3")))
+    args = parser.parse_args(argv)
+    try:
+        report = laya_corpus_status(args.event_db)
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        print(f"corpus status failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, sort_keys=True, indent=2))
+    return 0
+
+
 def _write_candidate(path: Path, record: CalibrationRecord) -> None:
     path = path.expanduser()
     parent = _trusted_output_parent(path)
@@ -785,5 +843,6 @@ def laya_qualify_main(argv: list[str] | None = None) -> int:
 
 __all__ = ["laya_doctor_main", "laya_doctor_report", "laya_qualify_main",
            "laya_activate_main", "laya_smoke_main", "laya_smoke_report",
+           "laya_corpus_status", "laya_corpus_status_main",
            "_write_corpus_manifest",
            "load_authenticated_system_one_events"]

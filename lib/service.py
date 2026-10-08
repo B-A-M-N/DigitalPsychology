@@ -179,6 +179,23 @@ class DigitalPsychologyService:
         """Idempotently deliver a trusted host event from the runtime outbox."""
         return self._intervention_events.dispatch(value)
 
+    def authenticated_event_ids(self, event_ids: Any, *, namespace_id: str,
+                                application_instance_id: str) -> set[str]:
+        """Verify delivered IDs against the private authenticated event store."""
+        return self._sink.authenticated_event_ids(
+            event_ids, namespace_id=namespace_id,
+            application_instance_id=application_instance_id)
+
+    def authenticated_event_type_counts(self, *, scope: str, task_id: str,
+                                        namespace_id: str,
+                                        application_instance_id: str,
+                                        event_types: Any) -> dict[str, int]:
+        """Read bounded authenticated event counts for one private trial scope."""
+        return self._sink.authenticated_event_type_counts(
+            scope=scope, task_id=task_id, namespace_id=namespace_id,
+            application_instance_id=application_instance_id,
+            event_types=event_types)
+
     @staticmethod
     def prepare_system_one_decision_event(descriptor: Any,
                                           basis: Mapping[str, Any]

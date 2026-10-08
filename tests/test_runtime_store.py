@@ -163,3 +163,37 @@ def test_2000_boundary_soak_bounds_receipts_latency_context_and_memory(tmp_path)
     assert max_context_bytes < 16_384
     assert peak_memory_bytes < 128 * 1024 * 1024
     assert database_bytes < 64 * 1024 * 1024
+
+
+def test_outbox_delivery_failure_and_success_survive_store_restart(tmp_path):
+    database_path = tmp_path / "behavior.sqlite3"
+    scope = "tenant/app/agent/session/task/attempt"
+    store = BehaviorStateStore(database_path)
+    store.save(
+        scope, expected_revision=0, expected_action_index=-1, action_index=0,
+        state=BehaviorState(revision=1),
+        outbox_events=({"event_id": "event-1", "scope": scope,
+                        "event_type": "system_one_decision"},))
+
+    store.record_outbox_dispatch_attempt(scope, "event-1")
+    store.record_outbox_dispatch_failure(scope, "event-1", "EventSinkError")
+    restarted = BehaviorStateStore(database_path)
+    failed = restarted.outbox_delivery_status(scope, authenticated_event_ids=())
+    assert failed["committed_count"] == 1
+    assert failed["enqueued_count"] == 1
+    assert failed["delivered_count"] == 0
+    assert failed["pending_count"] == 1
+    assert failed["authenticated_count"] == 0
+    assert failed["authenticated_status_available"] is True
+    assert failed["last_dispatch_failure"]["error_class"] == "EventSinkError"
+    assert failed["by_event_type"]["system_one_decision"]["pending"] == 1
+
+    restarted.record_outbox_dispatch_attempt(scope, "event-1")
+    restarted.acknowledge_outbox_event(scope, "event-1")
+    delivered = BehaviorStateStore(database_path).outbox_delivery_status(
+        scope, authenticated_event_ids=("event-1",))
+    assert delivered["delivered_count"] == 1
+    assert delivered["pending_count"] == 0
+    assert delivered["authenticated_count"] == 1
+    assert delivered["last_dispatch_failure"]["error_class"] == "EventSinkError"
+    assert delivered["last_successful_delivery_at"]

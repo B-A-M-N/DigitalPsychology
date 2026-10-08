@@ -314,4 +314,29 @@ class TrialReportMethods:
         record["projection_updates"] = model_updates
         record["unique_projection_digests"] = len(set(model_digests))
         record["control_transition_count"] = len(transitions)
+        delivery_counts = self.state_store.outbox_delivery_status(control_session_id)
+        authenticated_type_counts = None
+        authenticate = getattr(
+            self.decision_service, "authenticated_event_type_counts", None)
+        if callable(authenticate):
+            try:
+                authenticated_type_counts = authenticate(
+                    scope=control_session_id,
+                    task_id=descriptor.identity.task_id,
+                    namespace_id=descriptor.identity.namespace_id,
+                    application_instance_id=(
+                        descriptor.identity.application_instance_id),
+                    event_types=tuple(delivery_counts["by_event_type"]))
+            except Exception as exc:
+                record["runtime_event_delivery_authentication_error_class"] = (
+                    type(exc).__name__)
+        delivery = self.state_store.outbox_delivery_status(
+            control_session_id,
+            authenticated_event_type_counts=authenticated_type_counts)
+        event_db = getattr(self.decision_service, "event_db", None)
+        if event_db is not None:
+            from pathlib import Path
+            delivery["authenticated_event_store_path"] = str(
+                Path(event_db).expanduser().resolve())
+        record["runtime_event_delivery"] = delivery
         return record

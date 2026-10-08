@@ -1219,6 +1219,70 @@ class SQLiteSink:
         ).fetchone()
         return EventFactory.from_dict(json.loads(row[0])) if row is not None else None
 
+    def authenticated_event_ids(self, event_ids: Iterable[Any], *,
+                                namespace_id: str,
+                                application_instance_id: str) -> set[str]:
+        """Return only IDs present in the authenticated event table."""
+        if not isinstance(namespace_id, str) or not namespace_id:
+            raise ValueError("authenticated event origin requires namespace_id")
+        if not isinstance(application_instance_id, str) or not application_instance_id:
+            raise ValueError("authenticated event origin requires application_instance_id")
+        ids = tuple(dict.fromkeys(
+            item for item in event_ids
+            if isinstance(item, str) and item and len(item) <= 256))
+        authenticated: set[str] = set()
+        for start in range(0, len(ids), 500):
+            batch = ids[start:start + 500]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                "SELECT event_id FROM authenticated_events WHERE namespace_id=? "
+                "AND application_instance_id=? AND event_id IN (" + placeholders + ")",
+                (namespace_id, application_instance_id, *batch),
+            ).fetchall()
+            authenticated.update(str(row[0]) for row in rows)
+        return authenticated
+
+    def authenticated_event_type_counts(self, *, scope: str, task_id: str,
+                                        namespace_id: str,
+                                        application_instance_id: str,
+                                        event_types: Iterable[str]
+                                        ) -> dict[str, int]:
+        """Count authenticated event types for one trusted runtime scope."""
+        if not isinstance(scope, str) or not scope:
+            raise ValueError("authenticated event query requires a scope")
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("authenticated event query requires a task ID")
+        if not isinstance(namespace_id, str) or not namespace_id:
+            raise ValueError("authenticated event origin requires namespace_id")
+        if not isinstance(application_instance_id, str) or not application_instance_id:
+            raise ValueError("authenticated event origin requires application_instance_id")
+        types = tuple(dict.fromkeys(
+            item for item in event_types
+            if isinstance(item, str) and item and len(item) <= 128))
+        if not types:
+            return {}
+        counts: dict[str, int] = {}
+        for start in range(0, len(types), 400):
+            batch = types[start:start + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                "SELECT json_extract(e.payload, '$.event_type'), COUNT(*) "
+                "FROM events AS e JOIN authenticated_events AS a "
+                "ON a.namespace_id=e.namespace_id "
+                "AND a.application_instance_id=e.application_instance_id "
+                "AND a.event_id=e.event_id "
+                "WHERE e.namespace_id=? AND e.application_instance_id=? "
+                "AND e.task_id=? "
+                "AND json_extract(e.payload, '$.scope')=? "
+                "AND json_extract(e.payload, '$.event_type') IN (" + placeholders + ") "
+                "GROUP BY json_extract(e.payload, '$.event_type')",
+                (namespace_id, application_instance_id, task_id, scope, *batch),
+            ).fetchall()
+            counts.update({str(row[0]): int(row[1]) for row in rows})
+        return counts
+
     def close(self) -> None:
         self._conn.close()
 

@@ -62,8 +62,22 @@ class BehaviorStateStore:
                     action_index INTEGER NOT NULL,
                     PRIMARY KEY (scope, event_id)
                 );
+                CREATE TABLE IF NOT EXISTS runtime_event_delivery (
+                    scope TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    enqueued_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at TEXT,
+                    last_error_class TEXT,
+                    last_failure_at TEXT,
+                    delivered_at TEXT,
+                    PRIMARY KEY (scope, event_id)
+                );
                 CREATE INDEX IF NOT EXISTS runtime_event_outbox_scope_order
                     ON runtime_event_outbox(scope, action_index, event_id);
+                CREATE INDEX IF NOT EXISTS runtime_event_delivery_scope_type
+                    ON runtime_event_delivery(scope, event_type, delivered_at);
                 CREATE TABLE IF NOT EXISTS control_sessions (
                     scope TEXT PRIMARY KEY,
                     descriptor_json TEXT NOT NULL,
@@ -123,6 +137,25 @@ class BehaviorStateStore:
                 database.execute(
                     "ALTER TABLE behavior_state ADD COLUMN cfw_signal_cursor "
                     "INTEGER NOT NULL DEFAULT 0")
+            # Preserve visibility for events that were already pending when
+            # durable delivery diagnostics were introduced.
+            pending = database.execute(
+                "SELECT scope, event_id, event_json FROM runtime_event_outbox"
+            ).fetchall()
+            migrated_at = datetime.now(timezone.utc).isoformat()
+            for scope, event_id, encoded in pending:
+                try:
+                    payload = json.loads(encoded)
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                event_type = (payload.get("event_type") or payload.get("kind")
+                              if isinstance(payload, dict) else None)
+                if not isinstance(event_type, str) or not event_type:
+                    event_type = "unknown"
+                database.execute(
+                    "INSERT OR IGNORE INTO runtime_event_delivery "
+                    "(scope, event_id, event_type, enqueued_at) VALUES (?, ?, ?, ?)",
+                    (scope, event_id, event_type[:128], migrated_at))
 
     @contextmanager
     def _connect(self):
@@ -337,6 +370,19 @@ class BehaviorStateStore:
                     "INSERT OR IGNORE INTO runtime_event_outbox "
                     "(scope, event_id, event_json, action_index) VALUES (?, ?, ?, ?)",
                     (scope, event_id, encoded, action_index))
+                try:
+                    event_payload = json.loads(encoded)
+                    event_type = (event_payload.get("event_type")
+                                  or event_payload.get("kind") or "unknown")
+                except (AttributeError, TypeError, json.JSONDecodeError):
+                    event_type = "unknown"
+                if not isinstance(event_type, str) or not event_type:
+                    event_type = "unknown"
+                database.execute(
+                    "INSERT OR IGNORE INTO runtime_event_delivery "
+                    "(scope, event_id, event_type, enqueued_at) VALUES (?, ?, ?, ?)",
+                    (scope, event_id, event_type[:128],
+                     datetime.now(timezone.utc).isoformat()))
             if trace_json is not None:
                 prior_trace = database.execute(
                     "SELECT event_json FROM behavioral_action_traces "
@@ -767,10 +813,128 @@ class BehaviorStateStore:
             events.append(RuntimeOutboxEvent(scope, str(event_id), payload))
         return tuple(events)
 
+    def record_outbox_dispatch_attempt(self, scope: str, event_id: str) -> None:
+        """Persist the start of a delivery attempt without storing event content."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            database.execute(
+                "UPDATE runtime_event_delivery SET attempt_count=attempt_count+1, "
+                "last_attempt_at=? WHERE scope=? AND event_id=? "
+                "AND EXISTS (SELECT 1 FROM runtime_event_outbox "
+                "WHERE scope=? AND event_id=?)",
+                (now, scope, event_id, scope, event_id))
+            database.commit()
+
+    def record_outbox_dispatch_failure(self, scope: str, event_id: str,
+                                       error_class: str) -> None:
+        """Persist a bounded failure class; exception text may contain private data."""
+        if not isinstance(error_class, str) or not error_class:
+            error_class = "UnknownError"
+        safe_error_class = "".join(
+            char for char in error_class if char.isalnum() or char in "._")[:96]
+        if not safe_error_class:
+            safe_error_class = "UnknownError"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            database.execute(
+                "UPDATE runtime_event_delivery SET last_error_class=?, "
+                "last_failure_at=? WHERE scope=? AND event_id=?",
+                (safe_error_class, now, scope, event_id))
+            database.commit()
+
+    def outbox_delivery_records(self, scope: str) -> tuple[dict[str, Any], ...]:
+        """Read durable delivery metadata for one private control-session scope."""
+        with self._connect() as database:
+            rows = database.execute(
+                "SELECT d.event_id, d.event_type, d.enqueued_at, d.attempt_count, "
+                "d.last_attempt_at, d.last_error_class, d.last_failure_at, "
+                "d.delivered_at, CASE WHEN o.event_id IS NULL THEN 0 ELSE 1 END "
+                "FROM runtime_event_delivery AS d LEFT JOIN runtime_event_outbox AS o "
+                "ON o.scope=d.scope AND o.event_id=d.event_id "
+                "WHERE d.scope=? ORDER BY d.enqueued_at, d.event_id", (scope,)
+            ).fetchall()
+        return tuple({
+            "event_id": str(row[0]), "event_type": str(row[1]),
+            "enqueued_at": row[2], "attempt_count": int(row[3]),
+            "last_attempt_at": row[4], "last_error_class": row[5],
+            "last_failure_at": row[6], "delivered_at": row[7],
+            "pending": bool(row[8]),
+        } for row in rows)
+
+    def outbox_delivery_status(self, scope: str, *,
+                               authenticated_event_ids: Sequence[str] | None = None,
+                               authenticated_event_type_counts: Mapping[str, int] | None = None
+                               ) -> dict[str, Any]:
+        """Summarize committed, pending, delivered, and authenticated events."""
+        with self._connect() as database:
+            rows = database.execute(
+                "SELECT d.event_type, COUNT(*), "
+                "SUM(CASE WHEN d.delivered_at IS NULL THEN 0 ELSE 1 END), "
+                "SUM(CASE WHEN o.event_id IS NULL THEN 0 ELSE 1 END) "
+                "FROM runtime_event_delivery AS d "
+                "LEFT JOIN runtime_event_outbox AS o "
+                "ON o.scope=d.scope AND o.event_id=d.event_id "
+                "WHERE d.scope=? GROUP BY d.event_type ORDER BY d.event_type",
+                (scope,)).fetchall()
+            latest_failure = database.execute(
+                "SELECT last_failure_at, last_error_class "
+                "FROM runtime_event_delivery WHERE scope=? "
+                "AND last_failure_at IS NOT NULL "
+                "ORDER BY last_failure_at DESC LIMIT 1", (scope,)).fetchone()
+            last_success = database.execute(
+                "SELECT MAX(delivered_at) FROM runtime_event_delivery WHERE scope=?",
+                (scope,)).fetchone()
+        by_type: dict[str, dict[str, int]] = {}
+        for event_type, committed, delivered, pending in rows:
+            by_type[str(event_type)] = {
+                "committed": int(committed), "enqueued": int(committed),
+                "delivered": int(delivered), "authenticated": 0,
+                "pending": int(pending),
+            }
+        authenticated = set(authenticated_event_ids or ())
+        if authenticated_event_ids is not None:
+            records = self.outbox_delivery_records(scope)
+            for item in records:
+                if item["event_id"] in authenticated:
+                    by_type[item["event_type"]]["authenticated"] += 1
+        elif authenticated_event_type_counts is not None:
+            for event_type, counts in by_type.items():
+                observed = authenticated_event_type_counts.get(event_type, 0)
+                if type(observed) is int and observed >= 0:
+                    counts["authenticated"] = min(counts["committed"], observed)
+        total = sum(item["committed"] for item in by_type.values())
+        delivered = sum(item["delivered"] for item in by_type.values())
+        pending = sum(item["pending"] for item in by_type.values())
+        authenticated_total = sum(item["authenticated"] for item in by_type.values())
+        return {
+            "committed_count": total,
+            # Enqueue and behavior commit share one SQLite transaction.
+            "enqueued_count": total,
+            "delivered_count": delivered,
+            "authenticated_count": authenticated_total,
+            "pending_count": pending,
+            "last_dispatch_failure": ({
+                "at": latest_failure[0], "error_class": latest_failure[1],
+            } if latest_failure is not None else None),
+            "last_successful_delivery_at": (last_success[0]
+                                             if last_success is not None else None),
+            "authenticated_status_available": (
+                authenticated_event_ids is not None
+                or authenticated_event_type_counts is not None),
+            "by_event_type": by_type,
+        }
+
     def acknowledge_outbox_event(self, scope: str, event_id: str) -> None:
         """Remove an event only after the idempotent event sink accepts it."""
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
+            now = datetime.now(timezone.utc).isoformat()
+            database.execute(
+                "UPDATE runtime_event_delivery SET delivered_at=COALESCE(delivered_at, ?) "
+                "WHERE scope=? AND event_id=?",
+                (now, scope, event_id))
             database.execute(
                 "DELETE FROM runtime_event_outbox WHERE scope=? AND event_id=?",
                 (scope, event_id))

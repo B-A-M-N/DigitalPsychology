@@ -555,6 +555,34 @@ def calibration_metrics(events: Iterable[Any], *, label: str = "progress_relatio
             "calibration_bins": _calibration_bins(rows)}
 
 
+def calibration_corpus_counts(events: Iterable[Any]) -> dict[str, dict[str, int]]:
+    """Return paired outcome and independent trajectory counts by question family."""
+    event_list = tuple(events)
+    result: dict[str, dict[str, int]] = {}
+    for question_id in QUESTION_REGISTRY:
+        outcome_rows = _paired_rows(event_list, question_id)
+        decisions = sum(
+            1 for event in event_list
+            if getattr(event, "event_type", None) == "system_one_decision"
+            and isinstance((getattr(event, "payload", {}) or {}).get(
+                "system_one_answers"), Mapping)
+            and question_id in (getattr(event, "payload", {}) or {}).get(
+                "system_one_answers", {}))
+        outcomes = sum(
+            1 for event in event_list
+            if getattr(event, "event_type", None) == "system_one_outcome"
+            and f"system_one_outcome_{question_id}" in
+            (getattr(event, "payload", {}) or {}))
+        result[question_id] = {
+            "authenticated_decisions": decisions,
+            "authenticated_outcomes": outcomes,
+            "paired_independent_outcomes": len(outcome_rows),
+            "independent_trajectories": len({
+                row["trajectory_id"] for row in outcome_rows}),
+        }
+    return result
+
+
 def _calibration_bins(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     bins: list[list[tuple[float, bool]]] = [[] for _ in range(10)]
     for row in rows:
@@ -684,5 +712,6 @@ def calibration_record_from_events(
 
 
 __all__ = ["CalibrationRecord", "CalibrationBundle", "calibration_metrics",
+           "calibration_corpus_counts",
            "calibration_record_from_events", "task_instance_hash",
            "calibration_task_instance_hashes"]

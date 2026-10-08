@@ -624,13 +624,25 @@ class RuntimeSession:
         """Deliver committed events idempotently, retaining any failed event."""
         for item in self.state_store.pending_outbox(self.scope):
             try:
+                self.state_store.record_outbox_dispatch_attempt(
+                    self.scope, item.event_id)
+            except Exception:
+                # Diagnostic persistence must not replace the durable event
+                # delivery path or make an already committed turn fail.
+                pass
+            try:
                 delivered_id = self.controller.dispatch_runtime_event(item.event)
                 if delivered_id != item.event_id:
                     raise RuntimeError("event sink returned another outbox event ID")
                 self.state_store.acknowledge_outbox_event(self.scope, item.event_id)
-            except Exception:
+            except Exception as exc:
                 # The durable outbox is the source of retry. A transport/store
                 # failure cannot roll back the already committed behavior turn.
+                try:
+                    self.state_store.record_outbox_dispatch_failure(
+                        self.scope, item.event_id, type(exc).__name__)
+                except Exception:
+                    pass
                 break
 
     def close(self) -> None:

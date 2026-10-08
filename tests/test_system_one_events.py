@@ -8,7 +8,8 @@ import pytest
 from lib.feedback_loop import Event, EventFactory, SQLiteSink
 from lib.protocol_artifact import QUESTION_REGISTRY
 from lib.system_one_calibration import calibration_metrics
-from lib.system_one_cli import load_authenticated_system_one_events
+from lib.system_one_cli import (laya_corpus_status, laya_corpus_status_main,
+                                load_authenticated_system_one_events)
 from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnswer,
                                       QuestionProbability, QuestionSpec, SemanticState,
                                       SystemOneFrame, SystemOneIdentity,
@@ -178,7 +179,7 @@ def _stored_decision_event():
         })
 
 
-def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path):
+def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path, capsys):
     sink = SQLiteSink(tmp_path / "events.sqlite3")
     try:
         decision = _stored_decision_event()
@@ -202,8 +203,35 @@ def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path):
         assert outcome.category == "validation"
         assert outcome.payload["system_one_independent_outcome"] is True
         assert calibration_metrics([decision, outcome])["independent_outcomes"] == 1
+        assert sink.authenticated_event_ids(
+            [decision.event_id, outcome_id, "untrusted-id"],
+            namespace_id="tenant", application_instance_id="app-1") == {
+                decision.event_id, outcome_id}
+        assert sink.authenticated_event_type_counts(
+            scope="scope-1", task_id="task", namespace_id="tenant",
+            application_instance_id="app-1",
+            event_types=("system_one_decision", "system_one_outcome")) == {
+                "system_one_decision": 1, "system_one_outcome": 1}
         loaded = load_authenticated_system_one_events(sink.path)
         assert {item.event_id for item in loaded} == {decision.event_id, outcome_id}
+        status = laya_corpus_status(sink.path)
+        assert status["event_database_path"] == str(sink.path.resolve())
+        assert status["read_only"] is True
+        assert status["event_type_counts"]["system_one_decision"] == {
+            "total": 1, "authenticated": 1}
+        assert status["event_type_counts"]["system_one_outcome"] == {
+            "total": 1, "authenticated": 1}
+        assert status["question_families"]["progress_relation"] == {
+            "authenticated_decisions": 1,
+            "authenticated_outcomes": 1,
+            "paired_independent_outcomes": 1,
+            "independent_trajectories": 1,
+        }
+        assert laya_corpus_status_main(["--event-db", str(sink.path)]) == 0
+        cli_output = capsys.readouterr().out
+        assert "\"paired_independent_outcomes\": 1" in cli_output
+        assert "validator-evidence-1" not in cli_output
+        assert "system_one_answers" not in cli_output
         with pytest.raises(ValueError, match="different independent outcome"):
             labeler.record(
                 decision_event_id=decision.event_id,
