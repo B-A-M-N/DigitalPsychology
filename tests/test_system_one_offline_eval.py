@@ -76,6 +76,20 @@ def test_replay_metric_ties_are_independent_of_probability_insertion_order():
     assert forward["confusion_matrix"] == reverse["confusion_matrix"]
 
 
+def test_overconfident_wrong_prediction_receives_large_proper_score_penalties():
+    row = _rows(1)[0]
+    row["probabilities"] = {"no": 0.0001, "yes": 0.9999}
+    row["selected"] = "yes"
+
+    metrics = _metrics([row], ("no", "yes"), majority_label="no",
+                       split_name="holdout")
+
+    assert metrics["top1_accuracy"] == 0.0
+    assert metrics["multiclass_brier_score"] > 1.9
+    assert metrics["top_label_brier_score"] > 0.99
+    assert metrics["log_loss"] > 5.0
+
+
 def test_empty_authenticated_corpus_reports_no_replay_without_loading_laya(tmp_path):
     event_db = tmp_path / "events.sqlite3"
     with sqlite3.connect(event_db) as database:

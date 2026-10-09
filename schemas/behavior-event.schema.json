@@ -1047,7 +1047,10 @@
           "additionalProperties": false
         },
         "system_one_host_baseline_version": {
-          "const": "deterministic-host-baseline/v1"
+          "enum": [
+            "deterministic-host-baseline/v1",
+            "deterministic-host-baseline/v2"
+          ]
         },
         "system_one_host_baseline_labels": {
           "type": "object", "maxProperties": 5,

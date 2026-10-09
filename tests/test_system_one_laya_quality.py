@@ -91,6 +91,14 @@ def test_progress_projection_never_promotes_a_proposed_action_to_observed_fact()
     assert "host_declared_relation" not in str(observed)
 
 
+def test_projection_keeps_missing_criterion_evidence_explicit():
+    projected = laya_state_projection(
+        _frame(_state(), family="progress_relation"))
+
+    assert projected["criteria"][0]["evidence_status"] == "none"
+    assert projected["criteria"][0]["status"] == "unmet"
+
+
 def test_candidate_projection_does_not_expose_target_relation_label():
     projected = laya_state_projection(_frame(_state(), family="action_relation"))
     assert "host_declared_relation" not in str(projected)

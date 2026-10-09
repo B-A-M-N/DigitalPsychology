@@ -1,23 +1,26 @@
 """Durable decision observations and independent System-1 outcome labels."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from typing import Any
 
 from .feedback_loop import Event, EventFactory, SQLiteSink
 from .protocol_artifact import QUESTION_REGISTRY
-from .system_one_calibration import (VALID_OUTCOME_AUTHORITIES,
-                                     validate_host_evaluator_receipt)
+from .system_one_calibration import (
+    VALID_OUTCOME_AUTHORITIES,
+    validate_host_evaluator_receipt,
+)
 from .system_one_contracts import SystemOneFrame, SystemOneJudgment
 from .system_one_diagnostics import validate_laya_diagnostics
 
-
-_HOST_BASELINE_VERSION = "deterministic-host-baseline/v1"
+_HOST_BASELINE_VERSION = "deterministic-host-baseline/v2"
 _PROGRESS_BASELINES = {
     "GOAL_PROGRESS": "goal_progress",
     "BLOCKER_REMOVED": "blocker_removed",
     "DIAGNOSTIC_PROGRESS": "diagnostic_progress",
+    "VALIDATION_EVIDENCE": "verification_progress",
     "VERIFICATION_PROGRESS": "verification_progress",
     "RECOVERY_PROGRESS": "recovery_progress",
 }

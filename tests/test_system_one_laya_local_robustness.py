@@ -1,11 +1,17 @@
 """Opt-in local checkpoint consistency canary (no API and no real trajectories)."""
+import json
 import os
+from dataclasses import replace
 
 import pytest
 
 from lib.laya_configuration import model_settings
 from lib.protocol_artifact import PROTOCOL_HASH, PROTOCOL_VERSION, QUESTION_REGISTRY
-from lib.system_one_backends import PROVIDER_PROTOCOL_HASH, LayaProvider
+from lib.system_one_backends import (
+    PROVIDER_PROTOCOL_HASH,
+    LayaProvider,
+    laya_state_projection,
+)
 from lib.system_one_contracts import (
     ActivityFact,
     AttemptSemanticDescriptor,
@@ -32,8 +38,8 @@ def local_laya():
     provider.close()
 
 
-def _frame(family: str, objective: str, *, reverse_options: bool) -> SystemOneFrame:
-    criterion_id = "incidental-criterion-a"
+def _frame(family: str, objective: str, *, reverse_options: bool,
+           criterion_id: str = "incidental-criterion-a") -> SystemOneFrame:
     activity = ActivityFact(
         sequence=4,
         activity_type="action",
@@ -154,6 +160,19 @@ def _frame(family: str, objective: str, *, reverse_options: bool) -> SystemOneFr
     )
 
 
+def _with_state(frame: SystemOneFrame, state: SemanticState) -> SystemOneFrame:
+    state_digest = canonical_hash(state.to_dict())
+    request_digest = canonical_hash({
+        "identity": frame.identity.to_dict(), "sequence": frame.sequence,
+        "state_digest": state_digest,
+        "question_bundle_digest": frame.question_bundle_digest,
+        "policy_hash": frame.policy_hash,
+    })
+    return replace(frame, state=state, state_digest=state_digest,
+                   request_digest=request_digest,
+                   request_id="synthetic-" + request_digest[:32])
+
+
 @pytest.mark.parametrize("family", tuple(QUESTION_REGISTRY))
 def test_local_laya_is_stable_for_paraphrase_and_option_order(local_laya, family):
     original = "Complete the requested artifact and verify it against the acceptance criteria."
@@ -162,12 +181,42 @@ def test_local_laya_is_stable_for_paraphrase_and_option_order(local_laya, family
         _frame(family, original, reverse_options=False),
         _frame(family, paraphrase, reverse_options=False),
         _frame(family, original, reverse_options=True),
+        _frame(family, original, reverse_options=False,
+               criterion_id="renamed-incidental-criterion-b"),
     )
     judgments = [local_laya.judge(frame) for frame in frames]
     answers = [judgment.answer(family) for judgment in judgments]
     assert all(answer is not None for answer in answers)
     assert answers[0].selected == answers[1].selected, family
     assert answers[0].selected == answers[2].selected, family
-    assert judgments[0].local_inference_diagnostics["advisory_eligible"] is True
-    assert judgments[1].local_inference_diagnostics["advisory_eligible"] is True
-    assert judgments[2].local_inference_diagnostics["advisory_eligible"] is True
+    assert answers[0].selected == answers[3].selected, family
+    assert all(judgment.local_inference_diagnostics["advisory_eligible"] is True
+               for judgment in judgments)
+
+
+def test_local_laya_keeps_relevant_evidence_from_oversized_host_state(local_laya):
+    frame = _frame(
+        "action_relation",
+        "Complete the requested artifact and verify it against the acceptance criteria.",
+        reverse_options=False)
+    expanded_state = replace(
+        frame.state,
+        convergence=tuple((f"irrelevant-host-context-{index:03d}-" + "x" * 20, index)
+                          for index in range(240)),
+    )
+    frame = _with_state(frame, expanded_state)
+    serialized_size = len(json.dumps(
+        frame.canonical_payload(), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode("utf-8"))
+    projection = laya_state_projection(frame)
+
+    assert serialized_size > 12_000
+    assert projection["criteria"][0]["claim"] == (
+        "Produce and verify the requested repository artifact.")
+    assert projection["candidate_hypothesis"]["proposed_purpose"] == (
+        "Inspect the artifact and verify the requested result.")
+    assert "irrelevant-host-context" not in str(projection)
+
+    judgment = local_laya.judge(frame)
+    assert judgment.local_inference_diagnostics["advisory_eligible"] is True
+    assert judgment.local_inference_diagnostics["truncation_status"] == "complete"

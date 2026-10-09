@@ -1,28 +1,43 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import sqlite3
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from lib.feedback_loop import Event, EventFactory, SQLiteSink
 from lib.behavior_state import BehaviorState
 from lib.control.service import ControlPlaneService
+from lib.control.transaction_service import _digest, _system_one_decision_refs
+from lib.feedback_loop import Event, EventFactory, SQLiteSink
 from lib.protocol_artifact import QUESTION_REGISTRY
-from lib.system_one_calibration import calibration_metrics, task_instance_hash
-from lib.system_one_cli import (laya_corpus_status, laya_corpus_status_main,
-                                load_authenticated_system_one_events)
-from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnswer,
-                                      QuestionProbability, QuestionSpec, SemanticState,
-                                      SystemOneFrame, SystemOneIdentity,
-                                      SystemOneJudgment, canonical_hash)
-from lib.system_one_events import (SystemOneOutcomeLabeler,
-                                   prepare_system_one_decision_event)
 from lib.runtime.store import BehaviorStateStore
 from lib.service import DigitalPsychologyService
-from lib.control.transaction_service import _digest, _system_one_decision_refs
+from lib.system_one_calibration import calibration_metrics, task_instance_hash
+from lib.system_one_cli import (
+    laya_corpus_status,
+    laya_corpus_status_main,
+    load_authenticated_system_one_events,
+)
+from lib.system_one_contracts import (
+    ActivityFact,
+    CriterionState,
+    QuestionAnswer,
+    QuestionProbability,
+    QuestionSpec,
+    SemanticState,
+    SystemOneFrame,
+    SystemOneIdentity,
+    SystemOneJudgment,
+    canonical_hash,
+)
+from lib.system_one_events import (
+    _HOST_BASELINE_VERSION,
+    SystemOneOutcomeLabeler,
+    _host_baseline_labels,
+    prepare_system_one_decision_event,
+)
 
 
 def _frame_and_judgment():
@@ -119,9 +134,30 @@ def test_committed_system_one_decision_event_contains_pinned_answers():
     assert event["payload"]["system_one_answers"]["progress_relation"][
         "raw_probabilities"] == [item.to_dict()
                                   for item in judgment.answers[0].raw_probabilities]
+    assert event["payload"]["system_one_host_baseline_version"] == (
+        "deterministic-host-baseline/v2")
     assert event["payload"]["system_one_domain_tags"] == ["software"]
     assert event["payload"]["system_one_semantic_influenced"] is True
     assert EventFactory.from_dict(event).event_type == "system_one_decision"
+
+
+def test_validation_evidence_has_verification_progress_host_baseline():
+    frame, _judgment = _frame_and_judgment()
+    activity = replace(frame.state.activity[0], progress_class="VALIDATION_EVIDENCE")
+    state = replace(frame.state, activity=(activity,), candidate=activity)
+    state_digest = canonical_hash(state.to_dict())
+    request_digest = canonical_hash({
+        "identity": frame.identity.to_dict(), "sequence": frame.sequence,
+        "state_digest": state_digest,
+        "question_bundle_digest": frame.question_bundle_digest,
+        "policy_hash": frame.policy_hash,
+    })
+    frame = replace(frame, state=state, state_digest=state_digest,
+                    request_digest=request_digest,
+                    request_id="baseline-" + request_digest[:32])
+
+    assert _HOST_BASELINE_VERSION == "deterministic-host-baseline/v2"
+    assert _host_baseline_labels(frame)["progress_relation"] == "verification_progress"
 
 
 def test_host_decision_reference_binds_candidate_and_domain_context():

@@ -31,6 +31,7 @@ from .system_one_calibration import (
 )
 from .system_one_contracts import SystemOneFrame, canonical_hash
 from .system_one_diagnostics import validate_laya_diagnostics
+from .system_one_events import _HOST_BASELINE_VERSION, _host_baseline_labels
 
 MAX_REPLAY_TICKS = 100_000
 MAX_REPLAY_CASES = 1_000
@@ -351,9 +352,22 @@ def run_offline_replay(event_db: str | Path, runtime_state_db: str | Path,
         if question_family not in frame.question_ids:
             missing_frames += 1
             continue
+        host_baseline = row.get("host_baseline")
+        host_baseline_source = "authenticated_event" if host_baseline else None
+        host_baseline_version = (
+            str(event.payload.get("system_one_host_baseline_version") or "unknown")
+            if host_baseline_source == "authenticated_event" else None)
+        if not host_baseline:
+            host_baseline = _host_baseline_labels(frame).get(question_family)
+            if host_baseline:
+                host_baseline_source = "immutable_frame_derived"
+                host_baseline_version = _HOST_BASELINE_VERSION
         question = next(item for item in frame.questions
                         if item.question_id == question_family)
         cases.append({**row, "frame": frame,
+                      "host_baseline": host_baseline,
+                      "host_baseline_source": host_baseline_source,
+                      "host_baseline_version": host_baseline_version,
                       "source_frame_digest": stored["source_frame_digest"],
                       "question_labels": [label for label, _desc in question.criteria],
                       "original_backend_id": str(event.payload.get(
@@ -424,6 +438,8 @@ def run_offline_replay(event_db: str | Path, runtime_state_db: str | Path,
                         "selected": answer.selected,
                         "probabilities": probabilities,
                         "host_baseline": case.get("host_baseline"),
+                        "host_baseline_source": case.get("host_baseline_source"),
+                        "host_baseline_version": case.get("host_baseline_version"),
                         "advisory_eligible": eligible,
                         "diagnostics": diagnostics,
                         "source_frame_digest": case["source_frame_digest"],
@@ -442,6 +458,9 @@ def run_offline_replay(event_db: str | Path, runtime_state_db: str | Path,
                         "fixture_set_hash": case["fixture_set_hash"],
                         "split": case["split"], "actual": case["actual"],
                         "failure_class": type(exc).__name__,
+                        "host_baseline": case.get("host_baseline"),
+                        "host_baseline_source": case.get("host_baseline_source"),
+                        "host_baseline_version": case.get("host_baseline_version"),
                         "advisory_eligible": False,
                         "source_frame_digest": case["source_frame_digest"],
                         "original_policy_influenced": case["original_policy_influenced"],
@@ -457,6 +476,9 @@ def run_offline_replay(event_db: str | Path, runtime_state_db: str | Path,
                 "fixture_set_hash": case["fixture_set_hash"],
                 "split": case["split"], "actual": case["actual"],
                 "failure_class": provider_error,
+                "host_baseline": case.get("host_baseline"),
+                "host_baseline_source": case.get("host_baseline_source"),
+                "host_baseline_version": case.get("host_baseline_version"),
                 "advisory_eligible": False,
                 "source_frame_digest": case["source_frame_digest"],
             } for case in matching)
@@ -502,6 +524,10 @@ def run_offline_replay(event_db: str | Path, runtime_state_db: str | Path,
         "provider_load_ms": provider_load_ms,
         "provider_error_class": provider_error,
         "paired_independent_outcomes": len(paired),
+        "host_baseline_policy": _HOST_BASELINE_VERSION,
+        "host_baseline_sources": dict(sorted(Counter(
+            str(row.get("host_baseline_source") or "unavailable")
+            for row in outputs).items())),
         "authenticated_frames_loaded": frame_stats["authenticated_frame_matches"],
         "paired_cases_with_immutable_frames": len(cases),
         "paired_cases_missing_frames": missing_frames,
