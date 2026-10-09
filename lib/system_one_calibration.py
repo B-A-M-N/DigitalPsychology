@@ -185,7 +185,9 @@ def _normalise_probabilities(raw: Any) -> dict[str, float]:
     total = sum(values.values())
     if total <= 0 or abs(total - 1.0) > 0.03:
         return {}
-    return {label: value / total for label, value in values.items()}
+    # Stable lexical ordering makes equal-probability tie breaks independent
+    # of provider option order.
+    return {label: values[label] / total for label in sorted(values)}
 
 
 def _apply_temperature(probabilities: Mapping[str, float], temperature: float) -> dict[str, float]:
@@ -234,14 +236,16 @@ def _class_metrics(rows: list[dict[str, Any]], labels: Iterable[str]
     return tuple(metrics)
 
 
-def _ece(rows: list[tuple[dict[str, float], str]], temperature: float) -> float:
+def _ece(rows: list[tuple[dict[str, float], str]], temperature: float,
+         bins_count: int = 10) -> float:
     if not rows:
         return 1.0
-    bins: list[list[tuple[float, bool]]] = [[] for _ in range(10)]
+    bins: list[list[tuple[float, bool]]] = [[] for _ in range(bins_count)]
     for probs, actual in rows:
         calibrated = _apply_temperature(probs, temperature)
         label, confidence = max(calibrated.items(), key=lambda item: item[1])
-        bins[min(9, int(confidence * 10))].append((confidence, label == actual))
+        bins[min(bins_count - 1, int(confidence * bins_count))].append(
+            (confidence, label == actual))
     return sum(len(bucket) / len(rows) * abs(
         sum(item[0] for item in bucket) / len(bucket)
         - sum(int(item[1]) for item in bucket) / len(bucket))
@@ -615,7 +619,8 @@ class CalibrationBundle:
         return bundle
 
 
-def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]]:
+def _paired_rows(events: Iterable[Any], question_id: str, *,
+                 eligible_only: bool = False) -> list[dict[str, Any]]:
     if question_id not in QUESTION_REGISTRY:
         raise ValueError("unsupported calibration question family")
     event_list = tuple(events)
@@ -682,8 +687,13 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
         probabilities = _normalise_probabilities(answer.get("raw_probabilities"))
         selected = answer.get("selected")
         actual = payload[outcome_key]
+        prediction_labels = set(allowed_labels)
+        if question_id == "route_preference":
+            legal_routes = decision_payload.get("system_one_legal_routes")
+            prediction_labels = (set(map(str, legal_routes))
+                                 if isinstance(legal_routes, list) else set())
         if (not probabilities or selected not in probabilities
-                or (allowed_labels and set(probabilities) != allowed_labels)
+                or set(probabilities) != prediction_labels
                 or actual not in probabilities):
             continue
         if decision_payload.get("system_one_independent_outcome") is True:
@@ -695,6 +705,27 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
                              "system_one_deliverable_kind")
         if any(not decision_payload.get(field) for field in required_identity):
             continue
+        diagnostics = decision_payload.get("system_one_inference_diagnostics")
+        if decision_payload.get("system_one_backend_id") == "digitalpsychology-laya-native":
+            try:
+                from .system_one_diagnostics import validate_laya_diagnostics
+                diagnostics = validate_laya_diagnostics(diagnostics)
+            except ValueError:
+                diagnostics = None
+            advisory_eligible = bool(
+                diagnostics and diagnostics.get("advisory_eligible") is True)
+        else:
+            advisory_eligible = True
+        if eligible_only and not advisory_eligible:
+            continue
+        host_baselines = decision_payload.get("system_one_host_baseline_labels")
+        host_baseline = (host_baselines.get(question_id)
+                         if isinstance(host_baselines, Mapping) else None)
+        baseline_labels = allowed_labels
+        if question_id == "route_preference":
+            baseline_labels = set(decision_payload.get("system_one_legal_routes") or ())
+        if host_baseline not in baseline_labels:
+            host_baseline = None
         legal_routes = decision_payload.get("system_one_legal_routes")
         domain_tags = decision_payload.get("system_one_domain_tags")
         candidate_context = None
@@ -711,8 +742,11 @@ def _paired_rows(events: Iterable[Any], question_id: str) -> list[dict[str, Any]
             "task_instance_hash": task_hash,
             "fixture_set_hash": fixture_hash,
             "decision_id": key[1], "probabilities": probabilities,
+            "labels": tuple(sorted(prediction_labels)),
             "selected": selected, "actual": actual,
             "model_identity": tuple(str(decision_payload[field]) for field in required_identity[:5]),
+            "advisory_eligible": advisory_eligible,
+            "host_baseline": host_baseline,
             "work_mode": str(decision_payload["system_one_work_mode"]),
             "deliverable_kind": str(decision_payload["system_one_deliverable_kind"]),
             "evidence_ref": payload["system_one_outcome_evidence_ref"],
@@ -743,7 +777,7 @@ def calibration_task_instance_hashes(events: Iterable[Any], *, question_id: str
                                      ) -> tuple[str, ...]:
     """Hash task IDs for authenticated decisions with later independent labels."""
     return tuple(sorted({task_instance_hash(row["identity"][6])
-                         for row in _paired_rows(events, question_id)
+        for row in _paired_rows(events, question_id, eligible_only=True)
                          if len(row["identity"]) > 6 and row["identity"][6]}))
 
 
@@ -751,7 +785,7 @@ def calibration_task_fixture_hashes(events: Iterable[Any], *, question_id: str
                                     ) -> dict[str, str]:
     """Bind each independently labeled task instance to its pristine fixture."""
     fixtures: dict[str, str] = {}
-    for row in _paired_rows(events, question_id):
+    for row in _paired_rows(events, question_id, eligible_only=True):
         task_hash = row["task_instance_hash"]
         fixture_hash = row["fixture_set_hash"]
         prior = fixtures.setdefault(task_hash, fixture_hash)
@@ -760,20 +794,152 @@ def calibration_task_fixture_hashes(events: Iterable[Any], *, question_id: str
     return dict(sorted(fixtures.items()))
 
 
+def _top_label_brier(rows: list[dict[str, Any]]) -> float:
+    if not rows:
+        return 1.0
+    total = 0.0
+    for row in rows:
+        _predicted, confidence = max(row["probabilities"].items(),
+                                     key=lambda item: item[1])
+        correct = max(row["probabilities"].items(),
+                      key=lambda item: item[1])[0] == row["actual"]
+        total += (confidence - float(correct)) ** 2
+    return total / len(rows)
+
+
+def _risk_coverage(rows: list[dict[str, Any]], *, maximum_points: int = 200
+                   ) -> tuple[float, list[dict[str, float]]]:
+    ranked = sorted(rows, key=lambda row: (
+        -max(row["probabilities"].values()), row["decision_id"]))
+    if not ranked:
+        return 1.0, []
+    cumulative_errors = 0
+    risk_sum = 0.0
+    curve = []
+    stride = max(1, len(ranked) // maximum_points)
+    for index, row in enumerate(ranked, start=1):
+        predicted, confidence = max(row["probabilities"].items(),
+                                    key=lambda item: item[1])
+        cumulative_errors += int(predicted != row["actual"])
+        risk = cumulative_errors / index
+        risk_sum += risk
+        if index == 1 or index == len(ranked) or index % stride == 0:
+            curve.append({"coverage": index / len(ranked), "risk": risk,
+                          "confidence_threshold": confidence})
+    return risk_sum / len(ranked), curve
+
+
+def _cluster_accuracy_interval(rows: list[dict[str, Any]], cluster_key: str
+                               ) -> dict[str, Any] | None:
+    clusters: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = str(row.get(cluster_key) or "")
+        if key:
+            clusters.setdefault(key, []).append(row)
+    if len(clusters) < 2:
+        return None
+    import random
+    rng = random.Random(0)
+    groups = list(clusters.values())
+    samples = []
+    for _ in range(500):
+        selected = [rng.choice(groups) for _ in groups]
+        sample = [row for group in selected for row in group]
+        if sample:
+            samples.append(sum(
+                max(row["probabilities"].items(), key=lambda item: item[1])[0]
+                == row["actual"] for row in sample) / len(sample))
+    samples.sort()
+    return {"lower_95": samples[int(0.025 * (len(samples) - 1))],
+            "upper_95": samples[int(0.975 * (len(samples) - 1))],
+            "independent_clusters": len(clusters),
+            "method": "cluster_bootstrap_500_seed_0"}
+
+
 def calibration_metrics(events: Iterable[Any], *, label: str = "progress_relation") -> dict[str, Any]:
-    rows = _paired_rows(events, label)
+    event_list = tuple(events)
+    rows = _paired_rows(event_list, label)
     correct = [max(row["probabilities"].items(), key=lambda item: item[1])[0]
                == row["actual"] for row in rows]
     probability_rows = [(row["probabilities"], row["actual"]) for row in rows]
     raw_brier = _brier(probability_rows)
-    return {"label": label, "independent_outcomes": len(rows),
-            "accuracy": sum(map(int, correct)) / len(rows) if rows else 0.0,
-            "brier_score": raw_brier,
-            "log_loss": _log_loss(probability_rows),
-            "expected_calibration_error": _ece(probability_rows, 1.0),
-            "per_class": [list(item) for item in _class_metrics(
-                rows, QUESTION_REGISTRY[label]["criteria"])],
-            "calibration_bins": _calibration_bins(rows)}
+    metric_labels = sorted({class_label for row in rows
+                            for class_label in row.get("labels", ())})
+    if not metric_labels:
+        metric_labels = sorted(QUESTION_REGISTRY[label]["criteria"])
+    classes = _class_metrics(rows, metric_labels)
+    per_class = []
+    for name, tp, fp, fn, precision, recall in classes:
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        per_class.append({"label": name, "support": tp + fn, "true_positive": tp,
+                          "false_positive": fp, "false_negative": fn,
+                          "precision": precision, "recall": recall, "f1": f1})
+    aurc, risk_curve = _risk_coverage(rows)
+    host_rows = [row for row in rows if row.get("host_baseline") is not None]
+    host_correct = [row["host_baseline"] == row["actual"] for row in host_rows]
+    majority_counts: dict[str, int] = {}
+    for row in rows:
+        majority_counts[row["actual"]] = majority_counts.get(row["actual"], 0) + 1
+    majority_label = (max(sorted(majority_counts), key=lambda item: majority_counts[item])
+                      if majority_counts else None)
+    confusion_matrix = {actual: {predicted: 0 for predicted in metric_labels}
+                        for actual in metric_labels}
+    for row in rows:
+        predicted = max(row["probabilities"].items(), key=lambda item: item[1])[0]
+        confusion_matrix.setdefault(row["actual"], {item: 0 for item in metric_labels})
+        confusion_matrix[row["actual"]][predicted] += 1
+    valid_predictions = sum(
+        1 for event in event_list
+        if getattr(event, "event_type", None) == "system_one_decision"
+        and isinstance((getattr(event, "payload", {}) or {}).get(
+            "system_one_answers"), Mapping)
+        and label in (getattr(event, "payload", {}) or {}).get("system_one_answers", {}))
+    eligible_rows = [row for row in rows if row["advisory_eligible"]]
+    return {
+        "label": label,
+        "independent_outcomes": len(rows),
+        "paired_independent_outcomes": len(rows),
+        "valid_predictions": valid_predictions,
+        "unpaired_predictions": max(0, valid_predictions - len(rows)),
+        "provider_failures": None,
+        "abstentions": None,
+        "advisory_eligible_outcomes": len(eligible_rows),
+        "independent_trajectories": len({row["trajectory_id"] for row in rows}),
+        "independent_fixtures": len({row["fixture_set_hash"] for row in rows}),
+        "top1_accuracy": sum(map(int, correct)) / len(rows) if rows else 0.0,
+        "accuracy": sum(map(int, correct)) / len(rows) if rows else 0.0,
+        "macro_f1": (sum(item["f1"] for item in per_class) / len(per_class)
+                     if per_class else 0.0),
+        "multiclass_brier_score": raw_brier,
+        "brier_score": raw_brier,
+        "top_label_brier_score": _top_label_brier(rows),
+        "log_loss": _log_loss(probability_rows),
+        "ece_bin_count": 10,
+        "expected_calibration_error": _ece(probability_rows, 1.0, bins_count=10),
+        "per_class": [list(item) for item in classes],
+        "per_class_detailed": per_class,
+        "confusion_matrix": confusion_matrix,
+        "reliability_bins": _calibration_bins(rows),
+        "calibration_bins": _calibration_bins(rows),
+        "risk_coverage_curve": risk_curve,
+        "aurc": aurc,
+        "majority_class_reference_label": majority_label,
+        "majority_class_reference_accuracy": (
+            max(majority_counts.values()) / len(rows) if rows else 0.0),
+        "host_baseline_count": len(host_rows),
+        "host_baseline_accuracy": (
+            sum(map(int, host_correct)) / len(host_correct) if host_correct else None),
+        "accuracy_95_ci_by_trajectory": _cluster_accuracy_interval(
+            rows, "trajectory_id"),
+        "accuracy_95_ci_by_fixture": _cluster_accuracy_interval(
+            rows, "fixture_set_hash"),
+        "eligible_only_top1_accuracy": (
+            sum(max(row["probabilities"].items(), key=lambda item: item[1])[0]
+                == row["actual"] for row in eligible_rows) / len(eligible_rows)
+            if eligible_rows else None),
+        "eligible_only_multiclass_brier_score": _brier([
+            (row["probabilities"], row["actual"]) for row in eligible_rows]),
+    }
 
 
 def calibration_corpus_counts(events: Iterable[Any]) -> dict[str, dict[str, int]]:
@@ -782,6 +948,7 @@ def calibration_corpus_counts(events: Iterable[Any]) -> dict[str, dict[str, int]
     result: dict[str, dict[str, int]] = {}
     for question_id in QUESTION_REGISTRY:
         outcome_rows = _paired_rows(event_list, question_id)
+        eligible_rows = _paired_rows(event_list, question_id, eligible_only=True)
         decisions = sum(
             1 for event in event_list
             if getattr(event, "event_type", None) == "system_one_decision"
@@ -798,6 +965,7 @@ def calibration_corpus_counts(events: Iterable[Any]) -> dict[str, dict[str, int]
             "authenticated_decisions": decisions,
             "authenticated_outcomes": outcomes,
             "paired_independent_outcomes": len(outcome_rows),
+            "advisory_eligible_outcomes": len(eligible_rows),
             "independent_trajectories": len({
                 row["trajectory_id"] for row in outcome_rows}),
             "task_instances": len({row["task_instance_hash"] for row in outcome_rows}),
@@ -806,16 +974,21 @@ def calibration_corpus_counts(events: Iterable[Any]) -> dict[str, dict[str, int]
     return result
 
 
-def _calibration_bins(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    bins: list[list[tuple[float, bool]]] = [[] for _ in range(10)]
+def _calibration_bins(rows: list[dict[str, Any]], *, bins_count: int = 10
+                      ) -> list[dict[str, Any]]:
+    bins: list[list[tuple[float, bool]]] = [[] for _ in range(bins_count)]
     for row in rows:
         confidence = max(row["probabilities"].values())
         predicted = max(row["probabilities"].items(), key=lambda item: item[1])[0]
-        bins[min(9, int(confidence * 10))].append((confidence, predicted == row["actual"]))
-    return [{"lower": index / 10, "upper": (index + 1) / 10,
+        bins[min(bins_count - 1, int(confidence * bins_count))].append(
+            (confidence, predicted == row["actual"]))
+    return [{"lower": index / bins_count, "upper": (index + 1) / bins_count,
              "count": len(bucket),
              "mean_confidence": sum(item[0] for item in bucket) / len(bucket),
-             "accuracy": sum(int(item[1]) for item in bucket) / len(bucket)}
+             "accuracy": sum(int(item[1]) for item in bucket) / len(bucket),
+             "absolute_gap": abs(
+                 sum(item[0] for item in bucket) / len(bucket)
+                 - sum(int(item[1]) for item in bucket) / len(bucket))}
             for index, bucket in enumerate(bins) if bucket]
 
 
@@ -844,7 +1017,7 @@ def calibration_record_from_events(
             or maximum_brier > 0.25
             or maximum_ece > 0.12):
         raise ValueError("calibration qualification thresholds cannot be weakened")
-    rows = _paired_rows(events, question_id)
+    rows = _paired_rows(events, question_id, eligible_only=True)
     if len(rows) < minimum_outcomes:
         raise ValueError("insufficient later independent outcomes for calibration")
     trajectory_ids = sorted({row["trajectory_id"] for row in rows})

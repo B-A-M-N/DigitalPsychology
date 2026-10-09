@@ -1003,6 +1003,90 @@ def laya_corpus_status_main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def laya_offline_replay_main(argv: list[str] | None = None) -> int:
+    """Replay authenticated historical frames through only the pinned local Laya."""
+    parser = argparse.ArgumentParser(
+        description="Evaluate local Laya on authenticated, independently labeled frames")
+    parser.add_argument("--event-db", default=os.environ.get(
+        "DIGITALPSYCHOLOGY_EVENT_DB", str(trusted_state_root() / "events.sqlite3")))
+    parser.add_argument("--runtime-state-db", default=os.environ.get(
+        "DIGITALPSYCHOLOGY_BEHAVIOR_STATE_DB",
+        str(trusted_state_root() / "behavior-state.sqlite3")))
+    parser.add_argument("--question-family", required=True,
+                        choices=tuple(QUESTION_REGISTRY))
+    parser.add_argument("--split-manifest",
+                        help="optional mode-0600 train/calibration/holdout manifest")
+    parser.add_argument("--split-manifest-out",
+                        help="write the deterministic split manifest when enough clusters exist")
+    parser.add_argument("--output", help="private JSON report path; defaults to stdout")
+    args = parser.parse_args(argv)
+    try:
+        from .system_one_offline_eval import (
+            load_split_manifest,
+            run_offline_replay,
+        )
+        manifest = (load_split_manifest(args.split_manifest)
+                    if args.split_manifest else None)
+        report = run_offline_replay(
+            args.event_db, args.runtime_state_db, args.question_family,
+            split_manifest=manifest)
+        if args.split_manifest_out:
+            split_report = report["split_manifest"]
+            if split_report.get("status") != "available":
+                raise ValueError("not enough independent clusters to write splits")
+            target_path = Path(args.split_manifest_out).expanduser()
+            parent = _trusted_output_parent(target_path)
+            target = parent / target_path.name
+            if target.exists() or target.is_symlink():
+                raise ValueError("split manifest output already exists")
+            fd, temporary = tempfile.mkstemp(prefix=".laya-splits-", dir=parent)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(split_report, stream, sort_keys=True, separators=(",", ":"))
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if target.exists() or target.is_symlink():
+                    raise ValueError("split manifest output appeared during write")
+                os.replace(temporary, target)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+        encoded = json.dumps(report, sort_keys=True, indent=2)
+        if args.output:
+            target_path = Path(args.output).expanduser()
+            parent = _trusted_output_parent(target_path)
+            target = parent / target_path.name
+            if target.exists() or target.is_symlink():
+                raise ValueError("replay report output already exists")
+            fd, temporary = tempfile.mkstemp(prefix=".laya-replay-", dir=parent)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(encoded + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if target.exists() or target.is_symlink():
+                    raise ValueError("replay report output appeared during write")
+                os.replace(temporary, target)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+        else:
+            print(encoded)
+        return 0
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        print(f"offline replay failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def _write_candidate(path: Path, record: CalibrationRecord) -> None:
     path = path.expanduser()
     parent = _trusted_output_parent(path)

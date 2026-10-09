@@ -89,10 +89,7 @@ class DigitalPsychologyService:
         return self._system_one_service.judge(frame, mode=mode)
 
     def control_system_one_frame_factory(self):
-        """Build frames only when an enabled host-only System-1 backend exists."""
-        if (self._system_one_service is None
-                or self._system_one_service.mode == "disabled"):
-            return None
+        """Plan host semantic opportunities; build frames only when enabled."""
         from .control.system_one import create_system_one_frame_factory
         return create_system_one_frame_factory(self._system_one_service)
 

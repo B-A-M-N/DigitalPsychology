@@ -1,7 +1,7 @@
 """Typed CFW-owned state and response contracts for System-1 providers."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -588,6 +588,10 @@ class SystemOneJudgment:
     answers: Tuple[QuestionAnswer, ...]
     protocol_version: str = PROTOCOL_VERSION
     protocol_hash: str = PROTOCOL_HASH
+    # Runtime-only provider telemetry; deliberately omitted from the typed
+    # judgment wire contract and its protocol hash.
+    local_inference_diagnostics: Mapping[str, Any] | None = field(
+        default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.protocol_version != PROTOCOL_VERSION or self.protocol_hash != PROTOCOL_HASH:
@@ -601,6 +605,9 @@ class SystemOneJudgment:
             _digest(self.calibration_bundle_hash, "calibration_bundle_hash")
         if self.sequence < 1 or not self.answers or len(self.answers) > 8:
             raise ValueError("judgment sequence or answer count is invalid")
+        if self.local_inference_diagnostics is not None:
+            from .system_one_diagnostics import validate_laya_diagnostics
+            validate_laya_diagnostics(self.local_inference_diagnostics)
         ids = [answer.question_id for answer in self.answers]
         if len(ids) != len(set(ids)):
             raise ValueError("judgment question answers must be unique")

@@ -26,6 +26,9 @@ class FastLoopInput:
     attention_last_seen: Mapping[str, int] = field(default_factory=dict)
     cfw_signals: tuple[FrameworkSignal, ...] = ()
     active_trigger_codes: tuple[str, ...] = ()
+    # Host-computed semantic query opportunity. This controls which soft
+    # alternatives enter the candidate pool; the provider answer never does.
+    semantic_opportunity_question_id: str | None = None
     actions_since_goal_progress: int = 0
     equivalent_retry_count: int = 0
     host_action_index: int = 0
@@ -52,6 +55,11 @@ class FastLoopInput:
                 or len(set(self.objective_criteria)) != len(self.objective_criteria)):
             raise ValueError(
                 f"objective criteria must be unique and bounded to {MAX_GOAL_CRITERIA}")
+        if (self.semantic_opportunity_question_id is not None
+                and self.semantic_opportunity_question_id not in {
+                    "action_relation", "progress_relation", "retry_relation",
+                    "goal_drift", "route_preference"}):
+            raise ValueError("unsupported host semantic query opportunity")
         if any(not isinstance(value, str) or not value or len(value) > 128
                for value in self.objective_criteria):
             raise ValueError("objective criterion IDs must be bounded text")

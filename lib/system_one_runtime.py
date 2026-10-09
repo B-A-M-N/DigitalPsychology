@@ -26,6 +26,7 @@ class SystemOneResult:
     calibrated_question_ids: tuple[str, ...] = ()
     cache_hit: bool = False
     reason: Optional[str] = None
+    inference_diagnostics: Mapping[str, object] | None = None
 
     @property
     def calibrated(self) -> bool:
@@ -33,13 +34,18 @@ class SystemOneResult:
 
     def to_dict(self) -> dict[str, object]:
         """Serialize a bounded provider observation for the trusted host audit."""
-        return {
+        value = {
             "status": self.status,
             "calibrated_question_ids": list(self.calibrated_question_ids),
             "cache_hit": self.cache_hit,
             "reason": self.reason,
             "judgment": self.judgment.to_dict() if self.judgment is not None else None,
         }
+        if self.inference_diagnostics is not None:
+            from .system_one_diagnostics import validate_laya_diagnostics
+            value["inference_diagnostics"] = validate_laya_diagnostics(
+                self.inference_diagnostics)
+        return value
 
 
 class CircuitBreaker:
@@ -263,7 +269,9 @@ class SystemOneRuntime:
                 calibrated_answer, calibrated_ids = self._calibrate(frame, rebound)
                 return self._mode_result(mode, calibrated_answer, calibrated_ids,
                                          question_ids=frame.question_ids,
-                                         cache_hit=True)
+                                         cache_hit=True,
+                                         inference_diagnostics=(
+                                             rebound.local_inference_diagnostics))
             if not self.breaker.permits():
                 return SystemOneResult(None, "unavailable", reason="circuit_open")
 
@@ -307,21 +315,35 @@ class SystemOneRuntime:
                 self._cache.move_to_end(cache_key)
                 while len(self._cache) > self.cache_size:
                     self._cache.popitem(last=False)
-        return self._mode_result(mode, calibrated_answer, calibrated_ids,
-                                 question_ids=frame.question_ids)
+        return self._mode_result(
+            mode, calibrated_answer, calibrated_ids,
+            question_ids=frame.question_ids,
+            inference_diagnostics=answer.local_inference_diagnostics)
 
     @staticmethod
     def _mode_result(mode: str, judgment: SystemOneJudgment,
                      calibrated_ids: tuple[str, ...], *,
                      question_ids: tuple[str, ...],
-                     cache_hit: bool = False) -> SystemOneResult:
+                     cache_hit: bool = False,
+                     inference_diagnostics: Mapping[str, object] | None = None
+                     ) -> SystemOneResult:
+        if (mode == "advisory" and judgment.backend_id == "digitalpsychology-laya-native"
+                and (not isinstance(inference_diagnostics, Mapping)
+                     or inference_diagnostics.get("advisory_eligible") is not True)):
+            return SystemOneResult(
+                judgment, "shadow", calibrated_ids, cache_hit,
+                reason="laya_inference_coverage_unverified",
+                inference_diagnostics=inference_diagnostics)
         if mode == "advisory" and not set(question_ids).issubset(calibrated_ids):
             return SystemOneResult(judgment, "shadow", calibrated_ids, cache_hit,
-                                   reason="uncalibrated_or_shifted_context")
+                                   reason="uncalibrated_or_shifted_context",
+                                   inference_diagnostics=inference_diagnostics)
         if mode == "shadow":
             return SystemOneResult(judgment, "shadow", calibrated_ids, cache_hit,
-                                   reason="shadow_mode")
-        return SystemOneResult(judgment, "ok", calibrated_ids, cache_hit)
+                                   reason="shadow_mode",
+                                   inference_diagnostics=inference_diagnostics)
+        return SystemOneResult(judgment, "ok", calibrated_ids, cache_hit,
+                               inference_diagnostics=inference_diagnostics)
 
     def close(self) -> None:
         close = getattr(self.backend, "close", None)

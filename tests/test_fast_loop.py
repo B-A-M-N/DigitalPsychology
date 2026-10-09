@@ -73,7 +73,6 @@ def test_omitted_cfw_capabilities_do_not_assume_a_full_framework_installation():
 def test_cfw_only_retry_and_drift_codes_drive_fast_loop_conditions():
     """OWL/FUSE codes reach the same retry/drift decisions as normalized host codes."""
     from lib.control.detectors import evaluate_conditions
-    from lib.control.semantic_assessment import SemanticAssessment
 
     controller = BehavioralController()
     goals = GoalSetSnapshot(revision=0, items=(
@@ -89,8 +88,7 @@ def test_cfw_only_retry_and_drift_codes_drive_fast_loop_conditions():
     retry = FastLoopInput(**common, cfw_signals=(FrameworkSignal(
         source="owl", code="owl.approach_failed", criterion_id="criterion-1"),))
     retry_conditions = evaluate_conditions(
-        retry, SemanticAssessment(), retry_threshold=2, support_action_threshold=4,
-        semantic_threshold=0.8)
+        retry, retry_threshold=2, support_action_threshold=4)
     assert retry_conditions.retry is True
     assert "equivalent_retry" in retry_conditions.trigger_codes
     retry_decision = controller.decide(retry)
@@ -100,8 +98,7 @@ def test_cfw_only_retry_and_drift_codes_drive_fast_loop_conditions():
     drift = FastLoopInput(**common, cfw_signals=(FrameworkSignal(
         source="owl", code="owl.constraint_drift", criterion_id="criterion-1"),))
     drift_conditions = evaluate_conditions(
-        drift, SemanticAssessment(), retry_threshold=2, support_action_threshold=4,
-        semantic_threshold=0.8)
+        drift, retry_threshold=2, support_action_threshold=4)
     assert drift_conditions.drift is True
     assert "goal_drift" in drift_conditions.trigger_codes
     drift_decision = controller.decide(drift)

@@ -30,6 +30,7 @@ digital-psychology-laya-smoke = "digital_psychology.system_one_cli:laya_smoke_ma
 digital-psychology-laya-qualify = "digital_psychology.system_one_cli:laya_qualify_main"
 digital-psychology-laya-activate = "digital_psychology.system_one_cli:laya_activate_main"
 digital-psychology-laya-corpus-status = "digital_psychology.system_one_cli:laya_corpus_status_main"
+digital-psychology-laya-offline-replay = "digital_psychology.system_one_cli:laya_offline_replay_main"
 
 [tool.setuptools]
 packages = ["digital_psychology", "digital_psychology.runtime",

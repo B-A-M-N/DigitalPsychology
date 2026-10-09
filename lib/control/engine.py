@@ -131,6 +131,7 @@ class ControlDecisionEngine:
         system_one_opportunity_question_id = None
         system_one_judgment_returned = False
         system_one_query_failed = False
+        planned_question = None
         policy_context = {
             **dict(descriptor.host_capabilities.get("policy_context") or {}),
             **identity.to_dict(),
@@ -205,6 +206,10 @@ class ControlDecisionEngine:
             attention_last_seen=attention.last_seen,
             cfw_signals=request.cfw_signals,
             active_trigger_codes=request.observation.active_trigger_codes,
+            semantic_opportunity_question_id=(
+                planned_question if planned_question in {
+                    "action_relation", "progress_relation", "retry_relation",
+                    "goal_drift", "route_preference"} else None),
             actions_since_goal_progress=request.observation.actions_since_goal_progress,
             equivalent_retry_count=request.observation.equivalent_retry_count,
             host_action_index=request.observation.action_index,

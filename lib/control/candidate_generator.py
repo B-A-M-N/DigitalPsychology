@@ -27,6 +27,7 @@ class CandidateConditions:
     no_runnable_work: bool = False
     retry: bool = False
     retry_ambiguity: bool = False
+    goal_drift_ambiguity: bool = False
     drift: bool = False
     action_relation_uncertain: bool = False
     progress_relation_uncertain: bool = False
@@ -95,8 +96,6 @@ class BehaviorCandidateGenerator:
                  semantic_progress_relation: str | None = None,
                  semantic_retry_relation: str | None = None,
                  semantic_goal_drift: bool | None = None,
-                 semantic_statework_preference: str | None = None,
-                 semantic_statework_confidence: float = 0.0,
                  semantic_action_confidence: float = 0.0,
                  semantic_progress_confidence: float = 0.0,
                  semantic_retry_confidence: float = 0.0,
@@ -129,8 +128,6 @@ class BehaviorCandidateGenerator:
             preferences = rank_stateworks(
                 next_state.cognitive_mode, csw_snapshot.eligible_stateworks,
                 csw_snapshot.active_stateworks,
-                semantic_preference=semantic_statework_preference,
-                semantic_confidence=semantic_statework_confidence,
             )[:1]
             reason_codes = (
                 (("deterministic_rule",) + conditions.trigger_codes) if deterministic
@@ -191,9 +188,9 @@ class BehaviorCandidateGenerator:
                 effect="Wait for the host to unblock or reprioritize required work.",
                 deterministic=True)
         elif (conditions.retry or conditions.retry_ambiguity or conditions.drift
+              or conditions.goal_drift_ambiguity
               or conditions.action_relation_uncertain
-              or conditions.progress_relation_uncertain
-              or semantic_action_relation == "unrelated"):
+              or conditions.progress_relation_uncertain):
             cause = ("equivalent_retry" if conditions.retry else
                      "goal_drift" if conditions.drift else "policy_ambiguity")
             recovery = add(
@@ -219,12 +216,15 @@ class BehaviorCandidateGenerator:
                 effect="Gather discriminating evidence before choosing a recovery path.",
                 fallback=True)
             fallback_id = diagnostic.candidate.candidate_id
-            if conditions.drift:
+            if conditions.drift or conditions.goal_drift_ambiguity:
                 add("REPLAN", mode="REPLAN",
                     framework_changes={"owl": "reset", "anchor": "recovery",
                                        "fuse": "constrained"},
-                    cause="goal_drift",
-                    effect="Replan remaining runnable criteria after evidence of drift.")
+                    cause="goal_drift" if conditions.drift else "policy_ambiguity",
+                    effect=("Replan remaining runnable criteria after host evidence of drift."
+                            if conditions.drift else
+                            "Re-evaluate remaining criteria under unresolved policy ambiguity."),
+                    deterministic=conditions.drift)
         elif conditions.pressure:
             add("CONTEXT_FOCUSED", control_changes={
                 "context_strategy": "criterion_focused",
@@ -253,46 +253,29 @@ class BehaviorCandidateGenerator:
         if not conditions.contradiction and not conditions.task_complete \
                 and not conditions.no_runnable_work:
             roles = {item.role for item in options}
-            if semantic_action_relation == "required_verification" and "VERIFY" not in roles:
+            if ((conditions.action_relation_uncertain
+                 or conditions.progress_relation_uncertain) and "VERIFY" not in roles):
                 add("VERIFY", mode="VERIFY",
                     control_changes={"verification_intensity": "high"},
-                    cause="semantic_verification_support",
-                    effect="Verify the proposed result before relying on it.")
-            if (semantic_action_relation == "diagnostic_support"
-                    or semantic_progress_relation in {
-                        "diagnostic_progress", "no_progress"}
-                    or semantic_goal_drift is True) and "DIAGNOSE" not in roles:
+                    cause="policy_ambiguity",
+                    effect="Verify the relevant result while policy evidence remains ambiguous.")
+            if (conditions.retry_ambiguity or conditions.goal_drift_ambiguity
+                    or conditions.action_relation_uncertain
+                    or conditions.progress_relation_uncertain) and "DIAGNOSE" not in roles:
                 diagnostic = add(
                     "DIAGNOSE", mode="DIAGNOSE",
                     framework_changes={"owl": "elevated", "anchor": "recovery",
                                        "fuse": "constrained"},
                     control_changes={"verification_intensity": "high",
                                      "exploration_budget": "low"},
-                    cause="semantic_policy_ambiguity",
+                    cause="policy_ambiguity",
                     effect="Gather evidence that distinguishes the remaining legal policies.",
                     fallback=True)
                 if fallback_id is None:
                     fallback_id = diagnostic.candidate.candidate_id
-            if (semantic_retry_relation == "equivalent_retry"
-                    and "RECOVER" not in roles):
-                add("RECOVER", mode="RECOVER",
-                    framework_changes={"owl": "reset", "anchor": "recovery",
-                                       "fuse": "constrained"},
-                    control_changes={"verification_intensity": "high",
-                                     "exploration_budget": "low",
-                                     "retry_policy": "materially_different_only",
-                                     "recovery_level": min(3, state.recovery_level + 1)},
-                    cause="semantic_equivalent_retry",
-                    effect="Avoid repeating an approach judged equivalent to a failed attempt.")
-            if semantic_goal_drift is True and "REPLAN" not in roles:
-                add("REPLAN", mode="REPLAN",
-                    framework_changes={"owl": "reset", "anchor": "recovery",
-                                       "fuse": "constrained"},
-                    cause="semantic_goal_drift",
-                    effect="Replan toward the remaining required criteria.")
 
-        # A pre-action semantic result is advisory: it changes ranking among
-        # these legal configurations while CFW retains final action authority.
+        # Semantic results only score this host-built set. They cannot create
+        # candidates, add host triggers, or change candidate identity.
         semantic_evidence = _semantic_support(
             options, action_relation=semantic_action_relation,
             progress_relation=semantic_progress_relation,

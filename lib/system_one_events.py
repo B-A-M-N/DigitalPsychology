@@ -10,6 +10,58 @@ from .protocol_artifact import QUESTION_REGISTRY
 from .system_one_calibration import (VALID_OUTCOME_AUTHORITIES,
                                      validate_host_evaluator_receipt)
 from .system_one_contracts import SystemOneFrame, SystemOneJudgment
+from .system_one_diagnostics import validate_laya_diagnostics
+
+
+_HOST_BASELINE_VERSION = "deterministic-host-baseline/v1"
+_PROGRESS_BASELINES = {
+    "GOAL_PROGRESS": "goal_progress",
+    "BLOCKER_REMOVED": "blocker_removed",
+    "DIAGNOSTIC_PROGRESS": "diagnostic_progress",
+    "VERIFICATION_PROGRESS": "verification_progress",
+    "RECOVERY_PROGRESS": "recovery_progress",
+}
+
+
+def _host_baseline_labels(frame: SystemOneFrame) -> dict[str, str]:
+    """Emit only baselines directly derivable from the immutable host frame."""
+    result: dict[str, str] = {}
+    legal_labels = {question.question_id: {label for label, _ in question.criteria}
+                    for question in frame.questions}
+    candidate = frame.state.candidate
+    if ("action_relation" in legal_labels
+            and candidate.host_declared_relation in legal_labels["action_relation"]):
+        result["action_relation"] = str(candidate.host_declared_relation)
+    if "progress_relation" in legal_labels:
+        observed = [item for item in frame.state.activity
+                    if item.source == "host_observed"]
+        if observed:
+            latest = max(observed, key=lambda item: item.sequence)
+            baseline = _PROGRESS_BASELINES.get(latest.progress_class or "", "no_progress")
+            if baseline in legal_labels["progress_relation"]:
+                result["progress_relation"] = baseline
+    if "retry_relation" in legal_labels and frame.state.failed_approaches:
+        prior_actions = {item.planned_action_class
+                         for item in frame.state.failed_approaches}
+        if candidate.action_class in prior_actions:
+            result["retry_relation"] = "equivalent_retry"
+        elif candidate.action_class and None not in prior_actions:
+            result["retry_relation"] = "materially_new"
+    if "goal_drift" in legal_labels and candidate.affected_criterion_ids:
+        statuses = {item.criterion_id: item.status for item in frame.state.criteria}
+        affected = [statuses[item] for item in candidate.affected_criterion_ids
+                    if item in statuses]
+        if affected and len(affected) == len(candidate.affected_criterion_ids):
+            if any(status in {"unmet", "active", "partially_observed"}
+                   for status in affected):
+                result["goal_drift"] = "no"
+            elif all(status == "satisfied" for status in affected):
+                result["goal_drift"] = "yes"
+    if "route_preference" in legal_labels:
+        legal_routes = tuple(frame.state.legal_routes)
+        if legal_routes and legal_routes[0] in legal_labels["route_preference"]:
+            result["route_preference"] = legal_routes[0]
+    return result
 
 
 def prepare_system_one_decision_event(
@@ -98,7 +150,13 @@ def prepare_system_one_decision_event(
             receipt.get("changed_frameworks") or ()),
         "system_one_changed_statework_preference": bool(
             receipt.get("changed_statework_preference", False)),
+        "system_one_host_baseline_version": _HOST_BASELINE_VERSION,
+        "system_one_host_baseline_labels": _host_baseline_labels(frame),
     }
+    raw_diagnostics = raw_result.get("inference_diagnostics")
+    if isinstance(raw_diagnostics, Mapping):
+        payload["system_one_inference_diagnostics"] = validate_laya_diagnostics(
+            raw_diagnostics)
     event_id = "dp-s1-" + hashlib.sha256(
         f"{identity.scope}|{judgment.request_id}".encode("utf-8")).hexdigest()[:40]
     event = Event(

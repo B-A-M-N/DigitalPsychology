@@ -41,10 +41,11 @@ MODEL_FILES = (
 )
 _PROVIDER_PROTOCOL = {
     "adapter": "digitalpsychology-laya-native",
-    "adapter_version": "1",
+    "adapter_version": "2",
     "laya_api": "Agent.decide-json-questions-v1",
-    "state_rendering": "semantic-state-json-v1",
+    "state_rendering": "family-specific-host-projection-v2",
     "response": "selected-label-and-option-probabilities-v1",
+    "diagnostics": "laya-inference-diagnostics/v1",
 }
 PROVIDER_PROTOCOL_HASH = canonical_hash(_PROVIDER_PROTOCOL)
 
@@ -168,7 +169,8 @@ def _laya_questions(frame: SystemOneFrame) -> dict[str, dict[str, Any]]:
     for question in frame.questions:
         if question.question_type != "choice":
             raise ValueError("Laya adapter currently accepts fixed choice questions only")
-        options = dict(question.criteria)
+        options = {label: description for label, description
+                   in sorted(question.criteria, key=lambda item: item[0])}
         if not options or len(options) > 24:
             raise ValueError("Laya choice questions require one to 24 fixed options")
         questions[question.question_id] = {
@@ -177,6 +179,240 @@ def _laya_questions(frame: SystemOneFrame) -> dict[str, dict[str, Any]]:
             "criteria": options,
         }
     return questions
+
+
+def _criterion_slots(state: Mapping[str, Any]) -> dict[str, str]:
+    criteria = state.get("criteria") or ()
+    return {str(item["criterion_id"]): f"criterion_{index + 1}"
+            for index, item in enumerate(criteria)
+            if isinstance(item, Mapping) and isinstance(item.get("criterion_id"), str)}
+
+
+def _slots(values: Any, slots: Mapping[str, str]) -> list[str]:
+    if not isinstance(values, (tuple, list)):
+        return []
+    return [slots[item] for item in values if item in slots]
+
+
+def _host_blocker_view(values: Any, slots: Mapping[str, str]) -> list[dict[str, Any]]:
+    result = []
+    answer_terms = {
+        "action_relation", "progress_relation", "retry_relation", "goal_drift",
+        "route_preference", "advances_primary_goal", "removes_concrete_blocker",
+        "required_verification", "diagnostic_support", "unrelated",
+        "goal_progress", "blocker_removed", "diagnostic_progress",
+        "verification_progress", "recovery_progress", "no_progress",
+        "materially_new", "same_premise_new_action", "equivalent_retry",
+    }
+    if not isinstance(values, (tuple, list)):
+        return result
+    for value in values[:8]:
+        if not isinstance(value, str):
+            continue
+        parts = {}
+        for part in value.split(";"):
+            if "=" in part:
+                key, item = part.split("=", 1)
+                parts[key] = item
+        # CFW semantic triggers are hypotheses and frequently repeat the
+        # question label. Keep structured host codes, but strip answer hints.
+        code = parts.get("codes") or ""
+        actions = parts.get("actions", "")
+        criteria = parts.get("criteria", "")
+        trigger_codes = [item for item in code.split(",") if item][:8]
+        trigger_codes = [item for item in trigger_codes
+                         if not any(term in item.lower() for term in answer_terms)]
+        result.append({
+            "trigger_codes": trigger_codes,
+            "required_actions": [item for item in actions.split(",") if item][:8],
+            "criteria": _slots([item for item in criteria.split(",") if item], slots),
+        })
+    return result
+
+
+def laya_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
+    """Build a compact, family-specific view from the host-owned frame facts."""
+    state = frame.state.to_dict()
+    task = state["task"]
+    situation = state["situation"]
+    slots = _criterion_slots(state)
+    family = frame.questions[0].question_id
+    projection: dict[str, Any] = {
+        "projection_schema": "laya-semantic-projection/v2",
+        "question_family": family,
+        "task": {key: task[key] for key in (
+            "objective", "work_mode", "deliverable_kind", "task_complexity",
+            "non_goals", "domain_tags")},
+        "criteria": [{"ref": slots.get(item["criterion_id"], "criterion"),
+                      "claim": item["claim"], "kind": item["kind"],
+                      "status": item["status"],
+                      "evidence_status": item["evidence_status"]}
+                     for item in state["criteria"]],
+        "situation": {
+            "current_state": situation["current_state"],
+            "blockers": _host_blocker_view(situation["blockers"], slots),
+            "actions_since_goal_progress": situation["actions_since_goal_progress"],
+            "actions_since_artifact_change": situation["actions_since_artifact_change"],
+            "verification_actions_since_artifact_change": (
+                situation["verification_actions_since_artifact_change"]),
+            "recovery_epochs": situation["recovery_epochs"],
+            "repeated_branch_count": situation["repeated_branch_count"],
+        },
+    }
+    if family in {"action_relation", "goal_drift", "retry_relation"}:
+        candidate = state["candidate"]
+        projection["candidate_hypothesis"] = {
+            "source": candidate["source"],
+            "action_class": candidate["action_class"],
+            "target_kind": candidate["target_kind"],
+            "target_scope": candidate["target_scope"],
+            "proposed_purpose": candidate["proposed_purpose"],
+            "proposed_purpose_source": candidate["proposed_purpose_source"],
+            "affected_criteria": _slots(candidate["affected_criterion_ids"], slots),
+            "relation_certainty": candidate["relation_certainty"],
+        }
+    if family == "progress_relation":
+        observed = [item for item in state["activity"]
+                    if item.get("source") == "host_observed"]
+        projection["host_observed_activities"] = [{
+            "sequence": item["sequence"],
+            "action_class": item["action_class"],
+            "result_class": item["result_class"],
+            "artifact_changed": item["artifact_changed"],
+            "evidence_kinds": item["evidence_kinds"],
+            "affected_criteria": _slots(item["affected_criterion_ids"], slots),
+        } for item in observed]
+        projection["host_observed_activity_present"] = bool(observed)
+    elif family == "retry_relation":
+        projection["host_recorded_failed_approaches"] = [{
+            key: item[key] for key in (
+                "cause_class", "hypothesis_summary", "mechanism", "evidence_target",
+                "planned_action_class", "planned_target_kind", "failed_result_class",
+                "source")
+        } | {"affected_criteria": _slots(item["affected_criterion_ids"], slots)}
+            for item in state["failed_approaches"]]
+    elif family == "route_preference":
+        projection["legal_routes"] = list(state["legal_routes"])
+        projection["eligible_workflows"] = [{
+            key: item[key] for key in (
+                "statework_id", "domain", "purpose", "current_state",
+                "progress_class", "legal_next_states", "active", "eligible")
+        } for item in state["workflows"] if item["eligible"]]
+    return projection
+
+
+def _laya_preflight(agent: Any, state: Mapping[str, Any],
+                    questions: Mapping[str, Any]) -> dict[str, Any]:
+    """Use Laya's own tokenizer/sequence builder when the installed API exposes it."""
+    encode = getattr(agent, "_encode_state", None)
+    to_internal = getattr(agent, "_to_internal", None)
+    if not callable(encode) or not callable(to_internal):
+        return {"status": "unknown", "state_tokens": None,
+                "tokens_dropped": None, "truncated_questions": []}
+    try:
+        ids = list(questions)
+        internal = {qid: to_internal(spec) for qid, spec in questions.items()}
+        items = encode(state, ids, internal)
+        stats = [item["state_stats"] for item in items]
+        state_tokens = max(int(item["state_tokens"]) for item in stats)
+        dropped = max(int(item["state_tokens_dropped"]) for item in stats)
+        truncated_questions = [qid for qid, item in zip(ids, stats)
+                               if item.get("truncated")]
+        return {"status": "truncated" if dropped > 0 else "complete",
+                "state_tokens": state_tokens, "tokens_dropped": dropped,
+                "truncated_questions": truncated_questions[:8]}
+    except Exception:  # noqa: BLE001 - preflight failure must downgrade coverage only
+        return {"status": "unknown", "state_tokens": None,
+                "tokens_dropped": None, "truncated_questions": []}
+
+
+def _usage_int(usage: Any, name: str) -> int | None:
+    value = usage.get(name) if isinstance(usage, Mapping) else None
+    return value if type(value) is int and 0 <= value <= 65536 else None
+
+
+def _laya_diagnostics(frame: SystemOneFrame, result: Any,
+                      projection: Mapping[str, Any], preflight: Mapping[str, Any],
+                      latency_ms: float) -> dict[str, Any]:
+    usage = getattr(result, "usage", None)
+    input_tokens = _usage_int(usage, "input_tokens")
+    state_tokens = _usage_int(usage, "state_tokens")
+    dropped = _usage_int(usage, "state_tokens_dropped")
+    raw_truncated = usage.get("truncated") if isinstance(usage, Mapping) else None
+    if type(raw_truncated) is bool:
+        usage_truncated = raw_truncated
+    elif type(raw_truncated) is int and raw_truncated >= 0:
+        usage_truncated = raw_truncated > 0
+    else:
+        usage_truncated = None
+    raw_truncated_questions = (usage.get("truncated_questions")
+                               if isinstance(usage, Mapping) else None)
+    usage_questions_known = (isinstance(raw_truncated_questions, (list, tuple))
+                             and all(item in QUESTION_REGISTRY
+                                     for item in raw_truncated_questions))
+    preflight_status = preflight.get("status", "unknown")
+    if (preflight_status == "truncated" or usage_truncated is True
+            or (dropped is not None and dropped > 0)):
+        truncation_status = "truncated"
+    elif (preflight_status == "complete" and usage_truncated is False
+          and dropped == 0 and usage_questions_known):
+        truncation_status = "complete"
+    else:
+        truncation_status = "unknown"
+    truncated_questions = list(dict.fromkeys((
+        *(preflight.get("truncated_questions") or ()),
+        *(raw_truncated_questions if usage_questions_known else ()),
+    )))[:8]
+    raw_probabilities = getattr(result, "probabilities", None)
+    option_coverage: dict[str, dict[str, Any]] = {}
+    for question in frame.questions:
+        expected = {label for label, _description in question.criteria}
+        returned = (set(map(str, raw_probabilities.get(question.question_id, {})))
+                    if isinstance(raw_probabilities, Mapping)
+                    and isinstance(raw_probabilities.get(question.question_id), Mapping)
+                    else None)
+        status = ("unknown" if returned is None else
+                  "complete" if returned == expected else "incomplete")
+        option_coverage[question.question_id] = {
+            "expected_options": len(expected),
+            "returned_options": len(returned) if returned is not None else 0,
+            "status": status,
+        }
+    coverage_status = ("complete" if all(item["status"] == "complete"
+                                          for item in option_coverage.values())
+                       else "incomplete" if any(item["status"] == "incomplete"
+                                                 for item in option_coverage.values())
+                       else "unknown")
+    preflight_tokens_dropped = preflight.get("tokens_dropped")
+    if type(preflight_tokens_dropped) is not int:
+        preflight_tokens_dropped = None
+    preflight_state_tokens = preflight.get("state_tokens")
+    if type(preflight_state_tokens) is not int:
+        preflight_state_tokens = None
+    advisory_eligible = (preflight_status == "complete"
+                         and truncation_status == "complete"
+                         and coverage_status == "complete")
+    return {
+        "schema_version": "laya-inference-diagnostics/v1",
+        "projection_schema": "laya-semantic-projection/v2",
+        "projection_digest": canonical_hash(projection),
+        "projection_bytes": len(json.dumps(
+            projection, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False).encode("utf-8")),
+        "latency_ms": min(30000, max(0, round(latency_ms))),
+        "preflight_status": (preflight_status if preflight_status in {
+            "complete", "truncated"} else "unknown"),
+        "preflight_state_tokens": preflight_state_tokens,
+        "preflight_tokens_dropped": preflight_tokens_dropped,
+        "input_tokens": input_tokens,
+        "state_tokens": state_tokens,
+        "state_tokens_dropped": dropped,
+        "truncation_status": truncation_status,
+        "truncated_questions": truncated_questions,
+        "coverage_status": coverage_status,
+        "option_coverage": option_coverage,
+        "advisory_eligible": advisory_eligible,
+    }
 
 
 def _probabilities(value: Any, labels: tuple[str, ...]) -> tuple[QuestionProbability, ...]:
@@ -192,7 +428,9 @@ def _probabilities(value: Any, labels: tuple[str, ...]) -> tuple[QuestionProbabi
                  for label, probability in zip(labels, raw))
 
 
-def _judgment_from_laya(frame: SystemOneFrame, result: Any) -> SystemOneJudgment:
+def _judgment_from_laya(frame: SystemOneFrame, result: Any,
+                        diagnostics: Mapping[str, Any] | None = None
+                        ) -> SystemOneJudgment:
     values = getattr(result, "values", None)
     probabilities = getattr(result, "probabilities", None)
     if not isinstance(values, Mapping) or not isinstance(probabilities, Mapping):
@@ -230,7 +468,8 @@ def _judgment_from_laya(frame: SystemOneFrame, result: Any) -> SystemOneJudgment
         provider_protocol_hash=frame.provider_protocol_hash,
         calibration_bundle_hash=frame.calibration_bundle_hash,
         answers=tuple(answers), protocol_version=frame.protocol_version,
-        protocol_hash=frame.protocol_hash)
+        protocol_hash=frame.protocol_hash,
+        local_inference_diagnostics=diagnostics)
 
 
 @dataclass
@@ -398,10 +637,23 @@ class LayaProvider:
                     job.done.set()
                     continue
                 assert self._agent is not None
+                questions = _laya_questions(job.frame)
+                projection = laya_state_projection(job.frame)
+                projection_bytes = json.dumps(
+                    projection, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False).encode("utf-8")
+                if len(projection_bytes) > MAX_FRAME_BYTES:
+                    raise ProviderContractError(
+                        "Laya semantic projection exceeds provider byte limit")
+                preflight = _laya_preflight(self._agent, projection, questions)
+                inference_started = time.monotonic()
                 result = self._agent.decide(
-                    job.frame.state.to_dict(), questions=_laya_questions(job.frame),
+                    projection, questions=questions,
                     return_details=True, lang="en")
-                job.judgment = _judgment_from_laya(job.frame, result)
+                diagnostics = _laya_diagnostics(
+                    job.frame, result, projection, preflight,
+                    (time.monotonic() - inference_started) * 1000.0)
+                job.judgment = _judgment_from_laya(job.frame, result, diagnostics)
             except ProviderContractError as exc:
                 job.error = exc
             except (TypeError, ValueError, KeyError) as exc:

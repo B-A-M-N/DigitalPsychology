@@ -7,6 +7,7 @@ from lib.behavior_state import (BEHAVIOR_MODES, AttentionLease, BehaviorState,
                                 GoalItemSnapshot, GoalSetSnapshot,
                                 StateWorkOption)
 from lib.attention import schedule_attention
+from lib.control.candidate_generator import BehaviorCandidateGenerator, CandidateConditions
 from lib.control.policy_selector import (
     BehaviorCandidate, BehaviorConstraintResolver, BehaviorPolicyConstraints,
     BehaviorPolicyPrior, BehaviorPolicySelector, CandidateEvidence,
@@ -474,6 +475,7 @@ def test_unrelated_laya_action_relation_supports_replanning_before_execution():
             objective_criteria=("criterion-1",),
             goal_set=goals,
             pre_action=True,
+            semantic_opportunity_question_id="action_relation",
         ),
         judgment=Judgment(),
     )
@@ -507,6 +509,7 @@ def test_laya_statework_preference_changes_only_a_csw_eligible_choice():
             state=BehaviorState(cognitive_mode="DIAGNOSE"),
             csw_snapshot=csw,
             objective_criteria=("criterion-1",),
+            semantic_opportunity_question_id="route_preference",
         ),
         judgment=Judgment(),
     )
@@ -542,6 +545,7 @@ def _ambiguous_retry_case(judgment):
             objective_criteria=("criterion-1",),
             goal_set=goals,
             pre_action=True,
+            semantic_opportunity_question_id="action_relation",
         ),
         judgment=provider_judgment,
     )
@@ -593,10 +597,9 @@ def test_semantic_action_relation_changes_decision_without_taking_authority():
     baseline = _ambiguous_retry_case(None)
     treatment = _ambiguous_retry_case("required_verification")
 
-    # The baseline and treatment share the same ambiguous pre-action retry
-    # context. Without a provider the controller delivers; a verification
-    # relation moves the choice to VERIFY.
-    assert baseline.state.cognitive_mode == "DELIVER"
+    # The host planner creates one fixed candidate set. Laya can only reorder
+    # those options; it cannot create the VERIFY candidate itself.
+    assert baseline.state.cognitive_mode == "DIAGNOSE"
     assert treatment.state.cognitive_mode == "VERIFY"
     assert any(item.operation == "set_mode" and item.value == "VERIFY"
                for item in treatment.directives)
@@ -617,6 +620,28 @@ def test_semantic_action_relation_changes_decision_without_taking_authority():
     # authority for a policy directive.
     for receipt in getattr(treatment, "receipts", ()) or ():
         assert receipt.get("authority") != "semantic_provider"
+
+
+def test_laya_answers_cannot_change_the_host_built_candidate_pool():
+    generator = BehaviorCandidateGenerator()
+    common = dict(
+        state=BehaviorState(), next_focus=("criterion-1",),
+        conditions=CandidateConditions(action_relation_uncertain=True),
+        csw_snapshot=CSWBehaviorSnapshot(revision=0),
+        available_frameworks=ALL_FRAMEWORKS)
+    baseline = generator.generate(**common)
+    semantic = generator.generate(
+        **common, semantic_action_relation="unrelated",
+        semantic_progress_relation="verification_progress",
+        semantic_retry_relation="equivalent_retry",
+        semantic_goal_drift=True,
+        semantic_action_confidence=0.99,
+        semantic_progress_confidence=0.99,
+        semantic_retry_confidence=0.99,
+        semantic_drift_confidence=0.99)
+
+    assert baseline.options == semantic.options
+    assert set(baseline.semantic_evidence) != set(semantic.semantic_evidence)
 
 
 # -- P1-7: runnable fairness belongs to the attention scheduler ---------

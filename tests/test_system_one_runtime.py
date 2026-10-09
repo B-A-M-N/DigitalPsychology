@@ -332,8 +332,11 @@ def test_native_laya_adapter_renders_typed_questions_and_pins_local_content(tmp_
                     content_hash=backend.model_content_hash,
                     provider_hash=PROVIDER_PROTOCOL_HASH)
     response = backend.judge(request)
-    assert response.answers[0].selected == request.questions[0].criteria[0][0]
+    assert response.answers[0].selected == sorted(
+        label for label, _ in request.questions[0].criteria)[0]
     assert received["state"]["task"]["deliverable_kind"] == "code_behavior"
+    assert received["state"]["projection_schema"] == "laya-semantic-projection/v2"
+    assert "active_segment" not in received["state"]["task"]
     assert received["questions"]["progress_relation"]["type"] == "choice"
     assert received["return_details"] is True
     with pytest.raises(ValueError, match="content hash"):

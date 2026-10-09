@@ -122,16 +122,21 @@ class RuntimeSession:
                 cfw_connected=cfw_connected, csw_connected=csw_connected,
                 attestation=attestation),
             semantic_provider_status=provider_status(
-                attestation, factory_configured=system_one_frame_factory is not None),
+                attestation, factory_configured=bool(getattr(
+                    system_one_frame_factory, "system_one_provider_enabled",
+                    system_one_frame_factory is not None))),
             semantic_model_hash=(attestation.get("model_content_hash")
                                  if attestation else None),
             semantic_provider_attestation=attestation,
         )
         self._closed = False
-        if system_one_frame_factory is not None and not callable(
-                getattr(controller, "judge", None)):
+        if (system_one_frame_factory is not None and getattr(
+                system_one_frame_factory, "system_one_provider_enabled", True)
+                and not callable(
+                getattr(controller, "judge", None))):
             raise TypeError("System-1 frame construction requires a DP host judge")
-        if system_one_frame_factory is not None:
+        if system_one_frame_factory is not None and getattr(
+                system_one_frame_factory, "system_one_provider_enabled", True):
             # Fail at session startup rather than on the first decision: the
             # semantic protocol cannot express an unknown task kind, so DP
             # refuses to consult a provider the host has not given real task

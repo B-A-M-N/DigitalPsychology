@@ -83,9 +83,8 @@ class BehavioralController:
         semantic = self._semantic(judgment)
         next_revision = original.revision + 1
         detected = evaluate_conditions(
-            context, semantic, retry_threshold=self.retry_threshold,
-            support_action_threshold=self.support_action_threshold,
-            semantic_threshold=self.semantic_threshold)
+            context, retry_threshold=self.retry_threshold,
+            support_action_threshold=self.support_action_threshold)
         attention_ids = detected.attention_ids
         focused_progress = detected.focused_progress
         runnable_count = detected.runnable_count
@@ -145,6 +144,14 @@ class BehavioralController:
                 or (failed_intervention and context.goal_set is None
                     and not context.objective_criteria)),
             retry=retry,
+            retry_ambiguity=(context.semantic_opportunity_question_id ==
+                             "retry_relation"),
+            goal_drift_ambiguity=(context.semantic_opportunity_question_id ==
+                                  "goal_drift"),
+            action_relation_uncertain=(context.semantic_opportunity_question_id ==
+                                       "action_relation"),
+            progress_relation_uncertain=(context.semantic_opportunity_question_id ==
+                                         "progress_relation"),
             drift=drift,
             pressure=pressure,
             focused_progress=focused_progress,
@@ -154,18 +161,23 @@ class BehavioralController:
                                  if "operator_contradiction" in triggers
                                  else "stale_assumption"),
         )
+        def qualified(value: Any, confidence: float) -> Any:
+            return value if confidence >= self.semantic_threshold else None
+
         candidate_pool = self.candidate_generator.generate(
             working,
             next_focus=next_focus,
             conditions=candidate_conditions,
             csw_snapshot=context.csw_snapshot,
             available_frameworks=context.available_frameworks,
-            semantic_action_relation=semantic.action_relation,
-            semantic_progress_relation=semantic.progress_relation,
-            semantic_retry_relation=semantic.retry_relation,
-            semantic_goal_drift=semantic.goal_drift,
-            semantic_statework_preference=semantic.statework_preference,
-            semantic_statework_confidence=semantic.statework_confidence,
+            semantic_action_relation=qualified(
+                semantic.action_relation, semantic.action_confidence),
+            semantic_progress_relation=qualified(
+                semantic.progress_relation, semantic.progress_confidence),
+            semantic_retry_relation=qualified(
+                semantic.retry_relation, semantic.retry_confidence),
+            semantic_goal_drift=qualified(
+                semantic.goal_drift, semantic.goal_drift_confidence),
             semantic_action_confidence=semantic.action_confidence,
             semantic_progress_confidence=semantic.progress_confidence,
             semantic_retry_confidence=semantic.retry_confidence,
@@ -208,7 +220,10 @@ class BehavioralController:
             directives=directives, selection=selection, candidate_pool=candidate_pool,
             current_condition_ids=current_condition_ids,
             previously_effective=previously_effective, triggers=triggers,
-            condition_for=condition_for, applies_to_attention=applies_to_attention)
+            condition_for=condition_for, applies_to_attention=applies_to_attention,
+            semantic_statework_preference=qualified(
+                semantic.statework_preference, semantic.statework_confidence),
+            semantic_statework_confidence=semantic.statework_confidence)
 
 
 __all__ = ["BehavioralController", "FastLoopInput", "SemanticAssessment"]

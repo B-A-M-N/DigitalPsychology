@@ -104,24 +104,27 @@ def _deliverable_kind(policy_context: Mapping[str, Any], *,
 
 
 def create_system_one_frame_factory(system_one_service: Any):
-    """Return a provider-neutral frame factory bound to pinned provider metadata."""
-    if getattr(system_one_service, "mode", "disabled") == "disabled":
-        return None
-    capability = system_one_service.capability()
+    """Return host query planning plus an optional pinned-provider frame factory."""
+    provider_enabled = (system_one_service is not None
+                        and getattr(system_one_service, "mode", "disabled") != "disabled")
+    capability = system_one_service.capability() if provider_enabled else None
     def field(name: str):
+        if capability is None:
+            return "disabled"
         return (getattr(capability, name) if hasattr(capability, name)
                 else capability[name])
-    enabled = set(system_one_service.enabled_question_families)
-    supported = set(field("supported_question_families"))
+    enabled = (set(system_one_service.enabled_question_families)
+               if provider_enabled else set())
+    supported = set(field("supported_question_families")) if provider_enabled else set()
     effective_enabled_questions = sorted(enabled & supported)
     available_questions = tuple(item for item in (
         "action_relation", "progress_relation", "retry_relation", "goal_drift",
         "route_preference")
         if item in effective_enabled_questions)
-    if not available_questions:
-        return None
-    capability_payload = (capability.to_dict() if callable(
-        getattr(capability, "to_dict", None)) else dict(capability))
+    capability_payload = (
+        None if capability is None else
+        capability.to_dict() if callable(getattr(capability, "to_dict", None))
+        else dict(capability))
     query_planner = SemanticQueryPlanner()
     candidate_generator = BehaviorCandidateGenerator()
     def build(identity: RuntimeIdentity, objective: str,
@@ -441,20 +444,24 @@ def create_system_one_frame_factory(system_one_service: Any):
         "model_revision": str(field("model_revision")),
         "model_content_hash": str(field("model_content_hash")),
         "provider_protocol_hash": str(field("provider_protocol_hash")),
-        "calibration_bundle_hash": str(system_one_service.calibration_bundle_hash),
+        "calibration_bundle_hash": str(
+            getattr(system_one_service, "calibration_bundle_hash", "")),
         "enabled_question_families": effective_enabled_questions,
-        "provider_mode": str(system_one_service.mode),
+        "provider_mode": str(getattr(system_one_service, "mode", "disabled")),
         "runtime_warmed": bool(getattr(system_one_service, "runtime_warmed", False)),
         "warmup_latency_ms": getattr(system_one_service, "warmup_latency_ms", None),
         "capability_digest": canonical_hash({
             "capability": capability_payload,
-            "provider_mode": system_one_service.mode,
+            "provider_mode": getattr(system_one_service, "mode", "disabled"),
             "enabled_question_families": effective_enabled_questions,
-            "calibration_bundle_hash": system_one_service.calibration_bundle_hash,
+            "calibration_bundle_hash": getattr(
+                system_one_service, "calibration_bundle_hash", ""),
         }),
     }
     build.system_one_attestation = attestation
     build.last_query_plan = None
+    build.system_one_provider_enabled = bool(
+        provider_enabled and effective_enabled_questions)
     return build
 
 

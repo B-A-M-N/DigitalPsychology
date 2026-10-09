@@ -24,7 +24,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "2.9.0"
+      "const": "2.10.0"
     },
     "event_id": {
       "type": "string",
@@ -635,6 +635,28 @@
             "disabled"
           ]
         },
+        "system_one_criterion_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
+        },
+        "system_one_candidate_relation_certainty": {
+          "enum": ["explicit", "inferred", "unknown", null]
+        },
+        "system_one_candidate_host_relation": {
+          "enum": [
+            "advances_primary_goal", "removes_concrete_blocker",
+            "required_verification", "diagnostic_support", "unrelated",
+            "ambiguous", null
+          ]
+        },
+        "system_one_candidate_criterion_ids": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128}
+        },
         "system_one_action_relation": {
           "enum": [
             "advances_primary_goal",
@@ -854,6 +876,66 @@
           "type": "string",
           "maxLength": 256
         },
+        "system_one_outcome_evidence_receipt": {
+          "type": "object",
+          "required": [
+            "schema_version", "decision_event_id", "question_id",
+            "ground_truth_label", "evidence_ref", "evidence_digest",
+            "evidence_authority", "evidence_observed_at", "task_scope",
+            "task_family", "source_action_receipt_id",
+            "source_action_result_digest", "evaluator_observation_digest",
+            "control_scope", "criterion_ids", "evaluator_contract_hash",
+            "task_instance_hash", "fixture_set_hash"
+          ],
+          "properties": {
+            "schema_version": {"enum": [
+              "host-evaluator-receipt/v2", "host-evaluator-receipt/v3"
+            ]},
+            "decision_event_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "question_id": {"type": "string", "minLength": 1, "maxLength": 64},
+            "ground_truth_label": {"type": "string", "minLength": 1, "maxLength": 128},
+            "evidence_ref": {"type": "string", "minLength": 1, "maxLength": 256},
+            "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "evidence_authority": {
+              "enum": ["host_evidence", "validator", "csw_fact", "operator"]
+            },
+            "evidence_observed_at": {"type": "string", "format": "date-time"},
+            "task_family": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+            "source_action_receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "source_action_result_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "evaluator_observation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "task_scope": {"type": "string", "minLength": 1, "maxLength": 256},
+            "control_scope": {"type": "string", "minLength": 1, "maxLength": 256},
+            "criterion_ids": {
+              "type": "array", "minItems": 1, "maxItems": 8,
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1, "maxLength": 128}
+            },
+            "evaluator_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "task_instance_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "fixture_set_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "source_action_index": {"type": "integer", "minimum": 1}
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "schema_version": {"const": "host-evaluator-receipt/v2"}
+                }
+              },
+              "then": {"not": {"required": ["source_action_index"]}}
+            },
+            {
+              "if": {
+                "properties": {
+                  "schema_version": {"const": "host-evaluator-receipt/v3"}
+                }
+              },
+              "then": {"required": ["source_action_index"]}
+            }
+          ],
+          "additionalProperties": false
+        },
         "system_one_independent_outcome": {
           "type": "boolean"
         },
@@ -912,6 +994,69 @@
         },
         "system_one_changed_statework_preference": {
           "type": "boolean"
+        },
+        "system_one_inference_diagnostics": {
+          "type": "object",
+          "required": ["schema_version", "projection_schema", "projection_digest",
+                       "projection_bytes", "latency_ms", "preflight_status",
+                       "preflight_state_tokens", "preflight_tokens_dropped",
+                       "input_tokens", "state_tokens", "state_tokens_dropped",
+                       "truncation_status", "truncated_questions", "coverage_status",
+                       "option_coverage", "advisory_eligible"],
+          "properties": {
+            "schema_version": {"const": "laya-inference-diagnostics/v1"},
+            "projection_schema": {"const": "laya-semantic-projection/v2"},
+            "projection_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "projection_bytes": {"type": "integer", "minimum": 0, "maximum": 32768},
+            "latency_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
+            "preflight_status": {"enum": ["complete", "truncated", "unknown"]},
+            "preflight_state_tokens": {"type": ["integer", "null"], "minimum": 0,
+                                       "maximum": 65536},
+            "preflight_tokens_dropped": {"type": ["integer", "null"], "minimum": 0,
+                                         "maximum": 65536},
+            "input_tokens": {"type": ["integer", "null"], "minimum": 0,
+                             "maximum": 65536},
+            "state_tokens": {"type": ["integer", "null"], "minimum": 0,
+                             "maximum": 65536},
+            "state_tokens_dropped": {"type": ["integer", "null"], "minimum": 0,
+                                     "maximum": 65536},
+            "truncation_status": {"enum": ["complete", "truncated", "unknown"]},
+            "truncated_questions": {"type": "array", "maxItems": 8,
+                                    "uniqueItems": true,
+                                    "items": {"enum": ["action_relation", "progress_relation",
+                                                       "retry_relation", "goal_drift",
+                                                       "route_preference"]}},
+            "coverage_status": {"enum": ["complete", "incomplete", "unknown"]},
+            "option_coverage": {
+              "type": "object", "maxProperties": 8,
+              "patternProperties": {
+                "^(action_relation|progress_relation|retry_relation|goal_drift|route_preference)$": {
+                  "type": "object", "required": ["expected_options", "returned_options", "status"],
+                  "properties": {
+                    "expected_options": {"type": "integer", "minimum": 1, "maximum": 24},
+                    "returned_options": {"type": "integer", "minimum": 0, "maximum": 24},
+                    "status": {"enum": ["complete", "incomplete", "unknown"]}
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "advisory_eligible": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "system_one_host_baseline_version": {
+          "const": "deterministic-host-baseline/v1"
+        },
+        "system_one_host_baseline_labels": {
+          "type": "object", "maxProperties": 5,
+          "patternProperties": {
+            "^(action_relation|progress_relation|retry_relation|goal_drift|route_preference)$": {
+              "type": "string", "minLength": 1, "maxLength": 128
+            }
+          },
+          "additionalProperties": false
         },
         "metacognitive_control_changed": {
           "type": "boolean"
@@ -1029,6 +1174,10 @@
           "type": "string",
           "maxLength": 128
         },
+        "behavior_recovery_epoch_id": {
+          "type": ["string", "null"],
+          "maxLength": 128
+        },
         "behavior_intervention_criterion_progress": {
           "type": "array",
           "maxItems": 8,
@@ -1083,6 +1232,16 @@
         },
         "behavior_intervention_verification_quality": {
           "enum": ["improved", "unchanged", "degraded", "unknown"]
+        },
+        "semantic_decision_refs": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "semantic_influence_receipt_id": {
+          "type": ["string", "null"],
+          "maxLength": 128
         },
         "source_decision_id": {
           "type": "string",

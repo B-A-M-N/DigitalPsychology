@@ -132,13 +132,16 @@ def test_control_frame_factory_builds_a_valid_host_grounded_frame():
     service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
     try:
         factory = create_system_one_frame_factory(service)
-        frame = factory(
+        arguments = (
             identity, "Render the requested page", ("criterion-visual",),
-            BehaviorState(),
-            observation, CSWBehaviorSnapshot(revision=2), (),
+            BehaviorState(), observation, CSWBehaviorSnapshot(revision=2), (),
             # The host must declare real task semantics; DP will not guess.
             {"deliverable_kind": "visual_ui"},
         )
+        frame = factory(*arguments)
+        host_only_factory = create_system_one_frame_factory(None)
+        assert host_only_factory(*arguments) is None
+        assert host_only_factory.last_query_plan == factory.last_query_plan
         restored = SystemOneFrame.from_mapping(frame.canonical_payload())
     finally:
         service.close()

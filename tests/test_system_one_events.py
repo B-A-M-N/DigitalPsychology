@@ -268,6 +268,7 @@ def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path, ca
             "authenticated_decisions": 1,
             "authenticated_outcomes": 1,
             "paired_independent_outcomes": 1,
+                "advisory_eligible_outcomes": 1,
             "independent_trajectories": 1,
             "task_instances": 1,
             "independent_fixtures": 1,

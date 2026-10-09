@@ -20,10 +20,9 @@ class DetectedConditions:
     trigger_codes: tuple[str, ...]
 
 
-def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
-                        support_action_threshold: int,
-                        semantic_threshold: float) -> DetectedConditions:
-    """Derive bounded triggers from host facts and calibrated semantic advice."""
+def evaluate_conditions(context: Any, *, retry_threshold: int,
+                        support_action_threshold: int) -> DetectedConditions:
+    """Derive policy triggers only from host facts and host-owned signals."""
     causes = context.behavioral_causes
     signal_codes = tuple(code for cause in causes for code in cause.codes)
     codes = set(normalized_behavior_codes(context.active_trigger_codes, signal_codes))
@@ -75,15 +74,11 @@ def evaluate_conditions(context: Any, semantic: Any, *, retry_threshold: int,
 
     contradiction = bool(codes & {"operator_contradiction", "stale_assumption"})
     retry = (focused_retry_count >= retry_threshold
-             or (semantic.retry_relation == "equivalent_retry"
-                 and semantic.retry_confidence >= semantic_threshold)
              or scoped_retry_signal or unscoped_retry)
     drift = (focused_stall_count >= support_action_threshold
              or scoped_support_signal or scoped_drift_signal or unscoped_support
              or ("goal_drift" in codes and not multi_item_task)
-             or (semantic.goal_drift is True
-                 and semantic.goal_drift_confidence >= semantic_threshold)) \
-            and not focused_progress
+             ) and not focused_progress
     pressure = (context.context_pressure >= 0.85
                 or "context_pressure_high" in codes)
     triggers: set[str] = set()

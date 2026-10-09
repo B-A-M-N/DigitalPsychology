@@ -104,7 +104,8 @@ class SessionRegistryMethods:
         from ..telemetry.behavioral_trace import provider_attestation
         factory = self.engine.system_one_frame_factory
         provider_identity = {
-            "factory_configured": factory is not None,
+            "factory_configured": bool(getattr(
+                factory, "system_one_provider_enabled", factory is not None)),
             "attestation": provider_attestation(factory),
             "execution_identity": self._execution_identity(),
         }
@@ -166,7 +167,9 @@ class SessionRegistryMethods:
                 raise ValueError(
                     f"CSW workflow port version {actual!r} is incompatible "
                     f"with DP's {CSW_WORKFLOW_PORT_VERSION!r}")
-        if self.engine.system_one_frame_factory is not None:
+        factory = self.engine.system_one_frame_factory
+        if factory is not None and getattr(
+                factory, "system_one_provider_enabled", True):
             from .system_one import _deliverable_kind
             policy_context = capabilities.get("policy_context") or {}
             if not isinstance(policy_context, Mapping):

@@ -12,6 +12,7 @@ from ..behavior_state import (
 from .fast_loop_input import FastLoopInput
 from .interventions import InterventionStateBuilder, _mode_exit_condition
 from ..lease_window import lease_window
+from .statework_selector import rank_stateworks
 
 
 class DirectiveBuilder:
@@ -31,7 +32,9 @@ class DirectiveBuilder:
               candidate_pool: Any, current_condition_ids: Mapping[str, str],
               previously_effective: set[str], triggers: set[str],
               condition_for: Callable[..., Any],
-              applies_to_attention: Callable[[tuple[str, ...]], bool]
+              applies_to_attention: Callable[[tuple[str, ...]], bool],
+              semantic_statework_preference: str | None = None,
+              semantic_statework_confidence: float = 0.0,
               ) -> BehavioralDecision:
             selected_option = (candidate_pool.option_for(selection.candidate.candidate_id)
                                if selection.candidate is not None else None)
@@ -151,7 +154,17 @@ class DirectiveBuilder:
                 framework_modes={**dict(working.framework_modes), "ward": "mandatory"},
             )
 
-            preference = selected_candidate.statework_preferences[:1]
+            if (context.semantic_opportunity_question_id == "route_preference"
+                    and semantic_statework_preference is not None):
+                preference = rank_stateworks(
+                    selected_candidate.cognitive_mode,
+                    context.csw_snapshot.eligible_stateworks,
+                    context.csw_snapshot.active_stateworks,
+                    semantic_preference=semantic_statework_preference,
+                    semantic_confidence=semantic_statework_confidence,
+                    limit=1)
+            else:
+                preference = selected_candidate.statework_preferences[:1]
             if preference and not any(
                     any(target.target == f"statework:{preference[0]}" for target in item.targets)
                     for item in working.active_interventions):

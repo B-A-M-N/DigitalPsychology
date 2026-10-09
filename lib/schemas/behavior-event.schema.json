@@ -995,6 +995,69 @@
         "system_one_changed_statework_preference": {
           "type": "boolean"
         },
+        "system_one_inference_diagnostics": {
+          "type": "object",
+          "required": ["schema_version", "projection_schema", "projection_digest",
+                       "projection_bytes", "latency_ms", "preflight_status",
+                       "preflight_state_tokens", "preflight_tokens_dropped",
+                       "input_tokens", "state_tokens", "state_tokens_dropped",
+                       "truncation_status", "truncated_questions", "coverage_status",
+                       "option_coverage", "advisory_eligible"],
+          "properties": {
+            "schema_version": {"const": "laya-inference-diagnostics/v1"},
+            "projection_schema": {"const": "laya-semantic-projection/v2"},
+            "projection_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "projection_bytes": {"type": "integer", "minimum": 0, "maximum": 32768},
+            "latency_ms": {"type": "integer", "minimum": 0, "maximum": 30000},
+            "preflight_status": {"enum": ["complete", "truncated", "unknown"]},
+            "preflight_state_tokens": {"type": ["integer", "null"], "minimum": 0,
+                                       "maximum": 65536},
+            "preflight_tokens_dropped": {"type": ["integer", "null"], "minimum": 0,
+                                         "maximum": 65536},
+            "input_tokens": {"type": ["integer", "null"], "minimum": 0,
+                             "maximum": 65536},
+            "state_tokens": {"type": ["integer", "null"], "minimum": 0,
+                             "maximum": 65536},
+            "state_tokens_dropped": {"type": ["integer", "null"], "minimum": 0,
+                                     "maximum": 65536},
+            "truncation_status": {"enum": ["complete", "truncated", "unknown"]},
+            "truncated_questions": {"type": "array", "maxItems": 8,
+                                    "uniqueItems": true,
+                                    "items": {"enum": ["action_relation", "progress_relation",
+                                                       "retry_relation", "goal_drift",
+                                                       "route_preference"]}},
+            "coverage_status": {"enum": ["complete", "incomplete", "unknown"]},
+            "option_coverage": {
+              "type": "object", "maxProperties": 8,
+              "patternProperties": {
+                "^(action_relation|progress_relation|retry_relation|goal_drift|route_preference)$": {
+                  "type": "object", "required": ["expected_options", "returned_options", "status"],
+                  "properties": {
+                    "expected_options": {"type": "integer", "minimum": 1, "maximum": 24},
+                    "returned_options": {"type": "integer", "minimum": 0, "maximum": 24},
+                    "status": {"enum": ["complete", "incomplete", "unknown"]}
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "advisory_eligible": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "system_one_host_baseline_version": {
+          "const": "deterministic-host-baseline/v1"
+        },
+        "system_one_host_baseline_labels": {
+          "type": "object", "maxProperties": 5,
+          "patternProperties": {
+            "^(action_relation|progress_relation|retry_relation|goal_drift|route_preference)$": {
+              "type": "string", "minLength": 1, "maxLength": 128
+            }
+          },
+          "additionalProperties": false
+        },
         "metacognitive_control_changed": {
           "type": "boolean"
         },
