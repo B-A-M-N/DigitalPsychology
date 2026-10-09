@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from .laya_configuration import model_settings
-from .protocol_artifact import QUESTION_REGISTRY
+from .protocol_artifact import (PROTOCOL_HASH, PROTOCOL_VERSION,
+                                QUESTION_REGISTRY, QUESTION_REGISTRY_HASH,
+                                STATE_PROJECTION_SCHEMA_HASH)
 from .system_one_backends import (
     PROVIDER_PROTOCOL_HASH,
     LayaProvider,
@@ -44,6 +46,104 @@ def _json_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _replay_frame(raw_frame: Mapping[str, Any]) -> SystemOneFrame:
+    """Parse current frames or normalize the authenticated 2.5 frame for replay.
+
+    The legacy schema is kept only so old retained frames can be authenticated
+    and replayed after the temporal criterion field was added. The normalized
+    frame explicitly marks its missing before snapshot unavailable.
+    """
+    if raw_frame.get("protocol_version") == PROTOCOL_VERSION:
+        return SystemOneFrame.from_mapping(raw_frame)
+    if raw_frame.get("protocol_version") != "2.5.0":
+        raise ValueError("unsupported historical System-1 frame")
+    legacy_path = (Path(__file__).resolve().parent / "schemas"
+                   / "system-one-protocol-2.5.0.schema.json")
+    legacy_schema = json.loads(legacy_path.read_text(encoding="utf-8"))
+    if legacy_schema.get("protocol_version") != "2.5.0":
+        raise ValueError("legacy System-1 replay schema is malformed")
+    legacy_hash = canonical_hash(legacy_schema)
+    legacy_state_hash = canonical_hash(legacy_schema["$defs"]["SemanticState"])
+    frame_fields = {
+        "protocol_version", "protocol_hash", "identity", "request_id", "sequence",
+        "state_digest", "question_bundle_digest", "request_digest", "policy_hash",
+        "backend_id", "model_id", "model_revision", "model_content_hash",
+        "provider_protocol_hash", "question_registry_hash",
+        "state_projection_schema_hash", "calibration_bundle_hash", "state", "questions",
+    }
+    if set(raw_frame) != frame_fields:
+        raise ValueError("malformed historical System-1 frame")
+    if (raw_frame.get("protocol_hash") != legacy_hash
+            or raw_frame.get("question_registry_hash") != canonical_hash(
+                legacy_schema["x-question-registry"])
+            or raw_frame.get("state_projection_schema_hash") != legacy_state_hash):
+        raise ValueError("historical System-1 frame protocol hashes do not match")
+    state_data = raw_frame.get("state")
+    legacy_state_fields = {
+        "task", "situation", "criteria", "activity", "workflows", "convergence",
+        "candidate", "failed_approaches", "legal_routes",
+    }
+    if (not isinstance(state_data, Mapping)
+            or set(state_data) != legacy_state_fields
+            or canonical_hash(state_data) != raw_frame.get("state_digest")
+            or canonical_hash(raw_frame.get("questions"))
+            != raw_frame.get("question_bundle_digest")):
+        raise ValueError("historical System-1 frame content digest does not match")
+    expected_request = canonical_hash({
+        "identity": raw_frame.get("identity"),
+        "sequence": raw_frame.get("sequence"),
+        "state_digest": raw_frame.get("state_digest"),
+        "question_bundle_digest": raw_frame.get("question_bundle_digest"),
+        "policy_hash": raw_frame.get("policy_hash"),
+    })
+    if expected_request != raw_frame.get("request_digest"):
+        raise ValueError("historical System-1 request digest does not match")
+
+    normalized_state = {**dict(state_data), "criteria_before": None}
+    normalized_questions = []
+    for row in raw_frame["questions"]:
+        if not isinstance(row, Mapping):
+            raise TypeError("historical System-1 question must be a mapping")
+        question_id = row.get("question_id")
+        registry = QUESTION_REGISTRY.get(question_id)
+        if (registry is None or row.get("family") != registry["family"]
+                or row.get("type") != registry["type"]
+                or not isinstance(row.get("criteria"), Mapping)):
+            raise ValueError("historical System-1 question family is unsupported")
+        if question_id == "route_preference":
+            criteria = dict(row["criteria"])
+        else:
+            if set(row["criteria"]) != set(registry["criteria"]):
+                raise ValueError("historical System-1 labels are unsupported")
+            criteria = dict(registry["criteria"])
+        normalized_questions.append({
+            "question_id": question_id, "family": registry["family"],
+            "type": registry["type"], "instructions": registry["instructions"],
+            "criteria": criteria,
+        })
+    state_digest = canonical_hash(normalized_state)
+    question_bundle_digest = canonical_hash(normalized_questions)
+    normalized = {
+        **dict(raw_frame),
+        "protocol_version": PROTOCOL_VERSION,
+        "protocol_hash": PROTOCOL_HASH,
+        "question_registry_hash": QUESTION_REGISTRY_HASH,
+        "state_projection_schema_hash": STATE_PROJECTION_SCHEMA_HASH,
+        "state": normalized_state,
+        "questions": normalized_questions,
+        "state_digest": state_digest,
+        "question_bundle_digest": question_bundle_digest,
+        "request_digest": canonical_hash({
+            "identity": raw_frame["identity"],
+            "sequence": raw_frame["sequence"],
+            "state_digest": state_digest,
+            "question_bundle_digest": question_bundle_digest,
+            "policy_hash": raw_frame["policy_hash"],
+        }),
+    }
+    return SystemOneFrame.from_mapping(normalized)
+
+
 def _event_identity(event: Any) -> tuple[str, ...]:
     return tuple(str(getattr(event, field, "") or "") for field in (
         "namespace_id", "application_id", "application_instance_id", "agent_id",
@@ -51,8 +151,13 @@ def _event_identity(event: Any) -> tuple[str, ...]:
 
 
 def _frame_event_matches(frame: SystemOneFrame, event: Any,
-                         tick_id: str, listed_event_ids: Sequence[str]) -> bool:
+                         tick_id: str, listed_event_ids: Sequence[str], *,
+                         source_frame: Mapping[str, Any] | None = None) -> bool:
     payload = getattr(event, "payload", {}) or {}
+    source = source_frame or frame.canonical_payload()
+    source_identity = source.get("identity") if isinstance(source, Mapping) else None
+    if not isinstance(source_identity, Mapping):
+        return False
     return bool(
         event.event_type == "system_one_decision"
         and event.category == "decision"
@@ -62,10 +167,11 @@ def _frame_event_matches(frame: SystemOneFrame, event: Any,
         and event.scope
         and (not payload.get("system_one_tick_id")
              or payload.get("system_one_tick_id") == tick_id)
-        and payload.get("system_one_decision_id") == frame.request_id
-        and payload.get("system_one_state_digest") == frame.state_digest
-        and payload.get("system_one_question_bundle_hash") == frame.question_bundle_digest
-        and _event_identity(event) == tuple(str(frame.identity.to_dict().get(key) or "")
+        and payload.get("system_one_decision_id") == source.get("request_id")
+        and payload.get("system_one_state_digest") == source.get("state_digest")
+        and payload.get("system_one_question_bundle_hash") == source.get(
+            "question_bundle_digest")
+        and _event_identity(event) == tuple(str(source_identity.get(key) or "")
                                              for key in (
             "namespace_id", "application_id", "application_instance_id", "agent_id",
             "agent_instance_id", "session_id", "task_id", "attempt_id", "interaction_id")))
@@ -114,16 +220,16 @@ def _load_committed_frames(path: str | Path, events: Sequence[Any]
             continue
         stats["committed_ticks_with_frame"] += 1
         try:
-            frame = SystemOneFrame.from_mapping(raw_frame)
+            frame = _replay_frame(raw_frame)
         except (TypeError, ValueError, KeyError):
             stats["unsupported_frames"] += 1
             continue
         for event_id in event_ids[:16]:
             event = event_by_scope_id.get((str(scope), str(event_id)))
             if event is None or not _frame_event_matches(
-                    frame, event, str(tick_id), event_ids):
+                    frame, event, str(tick_id), event_ids, source_frame=raw_frame):
                 continue
-            key = (_event_identity(event), frame.request_id)
+            key = (_event_identity(event), str(raw_frame.get("request_id") or ""))
             if key in frames:
                 raise ValueError("authenticated decision maps to multiple committed frames")
             frames[key] = {

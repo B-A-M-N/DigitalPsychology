@@ -460,7 +460,8 @@ class CSWWorkflowPort(Protocol):
 SystemOneFrameFactory = Callable[[RuntimeIdentity, str, Sequence[str], BehaviorState,
                                   RuntimeObservation, CSWBehaviorSnapshot,
                                   Sequence[FrameworkSignal],
-                                  Mapping[str, Any], Sequence[str]], SystemOneFrame]
+                                  Mapping[str, Any], Sequence[str],
+                                  GoalSetSnapshot | None], SystemOneFrame | None]
 
 
 class BehavioralDecisionService(Protocol):

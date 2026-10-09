@@ -273,6 +273,7 @@ class SemanticState:
     candidate: ActivityFact
     failed_approaches: Tuple[AttemptSemanticDescriptor, ...] = ()
     legal_routes: Tuple[str, ...] = ()
+    criteria_before: tuple[CriterionState, ...] | None = None
 
     def __post_init__(self) -> None:
         required_task = {"objective", "work_mode", "deliverable_kind", "task_complexity", "phase",
@@ -300,6 +301,11 @@ class SemanticState:
             _bounded_text(self.task[field], field, 64, optional=True)
         if len(self.task["non_goals"]) > 8 or len(self.criteria) > 8 or len(self.activity) > 16:
             raise ValueError("semantic state exceeds projection bounds")
+        if self.criteria_before is not None:
+            before_ids = tuple(item.criterion_id for item in self.criteria_before)
+            current_ids = tuple(item.criterion_id for item in self.criteria)
+            if len(before_ids) > 8 or before_ids != current_ids:
+                raise ValueError("before criteria must match the current criterion projection")
         domain_tags = self.task["domain_tags"]
         if (not isinstance(domain_tags, (tuple, list)) or len(domain_tags) > 16
                 or any(not isinstance(item, str) or not item.strip() or len(item) > 128
@@ -316,7 +322,9 @@ class SemanticState:
                 "workflows": [item.to_dict() for item in self.workflows],
                 "convergence": dict(self.convergence), "candidate": self.candidate.to_dict(),
                 "failed_approaches": [item.to_dict() for item in self.failed_approaches],
-                "legal_routes": list(self.legal_routes)}
+                "legal_routes": list(self.legal_routes),
+                "criteria_before": ([item.to_dict() for item in self.criteria_before]
+                                    if self.criteria_before is not None else None)}
 
 
 @dataclass(frozen=True)
@@ -438,7 +446,8 @@ class SystemOneFrame:
             raise ValueError("malformed System-1 identity")
         state_data = value["state"]
         state_fields = {"task", "situation", "criteria", "activity", "workflows",
-                        "convergence", "candidate", "failed_approaches", "legal_routes"}
+                        "convergence", "candidate", "failed_approaches", "legal_routes",
+                        "criteria_before"}
         if not isinstance(state_data, Mapping) or set(state_data) != state_fields:
             raise ValueError("malformed System-1 semantic state")
         task = dict(state_data["task"])
@@ -485,7 +494,10 @@ class SystemOneFrame:
             convergence=tuple(sorted(state_data["convergence"].items())),
             candidate=candidate,
             failed_approaches=tuple(attempt(row) for row in state_data["failed_approaches"]),
-            legal_routes=tuple(state_data["legal_routes"]))
+            legal_routes=tuple(state_data["legal_routes"]),
+            criteria_before=(
+                tuple(criterion(row) for row in state_data["criteria_before"])
+                if state_data["criteria_before"] is not None else None))
         questions = []
         for row in value["questions"]:
             if not isinstance(row, Mapping) or set(row) != {

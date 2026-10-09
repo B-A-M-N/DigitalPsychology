@@ -6,7 +6,10 @@ from collections.abc import Mapping
 from typing import Any
 
 LAYA_DIAGNOSTICS_SCHEMA = "laya-inference-diagnostics/v1"
-PROJECTION_SCHEMA = "laya-semantic-projection/v2"
+PROJECTION_SCHEMA = "laya-semantic-projection/v3"
+SUPPORTED_PROJECTION_SCHEMAS = frozenset({
+    "laya-semantic-projection/v2", PROJECTION_SCHEMA,
+})
 _QUESTION_IDS = frozenset({
     "action_relation", "progress_relation", "retry_relation", "goal_drift",
     "route_preference",
@@ -28,7 +31,7 @@ def validate_laya_diagnostics(value: Any) -> dict[str, Any]:
         raise ValueError("Laya inference diagnostics are malformed")
     if value["schema_version"] != LAYA_DIAGNOSTICS_SCHEMA:
         raise ValueError("unsupported Laya inference diagnostics schema")
-    if value["projection_schema"] != PROJECTION_SCHEMA:
+    if value["projection_schema"] not in SUPPORTED_PROJECTION_SCHEMAS:
         raise ValueError("unsupported Laya semantic projection schema")
     if (not isinstance(value["projection_digest"], str)
             or not _DIGEST.fullmatch(value["projection_digest"])):

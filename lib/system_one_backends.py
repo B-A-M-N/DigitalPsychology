@@ -41,9 +41,9 @@ MODEL_FILES = (
 )
 _PROVIDER_PROTOCOL = {
     "adapter": "digitalpsychology-laya-native",
-    "adapter_version": "2",
+    "adapter_version": "3",
     "laya_api": "Agent.decide-json-questions-v1",
-    "state_rendering": "family-specific-host-projection-v2",
+    "state_rendering": "family-specific-host-projection-v3",
     "response": "selected-label-and-option-probabilities-v1",
     "diagnostics": "laya-inference-diagnostics/v1",
 }
@@ -237,12 +237,14 @@ def laya_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
     situation = state["situation"]
     slots = _criterion_slots(state)
     family = frame.questions[0].question_id
+    task_keys = (("work_mode", "deliverable_kind", "task_complexity", "domain_tags")
+                 if family == "retry_relation" else
+                 ("objective", "work_mode", "deliverable_kind", "task_complexity",
+                  "non_goals", "domain_tags"))
     projection: dict[str, Any] = {
-        "projection_schema": "laya-semantic-projection/v2",
+        "projection_schema": "laya-semantic-projection/v3",
         "question_family": family,
-        "task": {key: task[key] for key in (
-            "objective", "work_mode", "deliverable_kind", "task_complexity",
-            "non_goals", "domain_tags")},
+        "task": {key: task[key] for key in task_keys},
         "criteria": [{"ref": slots.get(item["criterion_id"], "criterion"),
                       "claim": item["claim"], "kind": item["kind"],
                       "status": item["status"],
@@ -261,7 +263,7 @@ def laya_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
     }
     if family in {"action_relation", "goal_drift", "retry_relation"}:
         candidate = state["candidate"]
-        projection["candidate_hypothesis"] = {
+        candidate_hypothesis = {
             "source": candidate["source"],
             "action_class": candidate["action_class"],
             "target_kind": candidate["target_kind"],
@@ -271,9 +273,26 @@ def laya_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
             "affected_criteria": _slots(candidate["affected_criterion_ids"], slots),
             "relation_certainty": candidate["relation_certainty"],
         }
+        if family != "retry_relation":
+            projection["candidate_hypothesis"] = candidate_hypothesis
     if family == "progress_relation":
         observed = [item for item in state["activity"]
                     if item.get("source") == "host_observed"]
+        def criterion_evidence_view(values: Any) -> list[dict[str, Any]] | None:
+            if values is None:
+                return None
+            return [{
+                "ref": slots.get(item["criterion_id"], "criterion"),
+                "claim": item["claim"],
+                "status": item["status"],
+                "evidence_status": item["evidence_status"],
+            } for item in values]
+
+        projection["criterion_progress_context"] = {
+            "before_available": state["criteria_before"] is not None,
+            "before": criterion_evidence_view(state["criteria_before"]),
+            "after": criterion_evidence_view(state["criteria"]),
+        }
         projection["host_observed_activities"] = [{
             "sequence": item["sequence"],
             "action_class": item["action_class"],
@@ -284,13 +303,17 @@ def laya_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
         } for item in observed]
         projection["host_observed_activity_present"] = bool(observed)
     elif family == "retry_relation":
-        projection["host_recorded_failed_approaches"] = [{
+        previous_failures = [{
             key: item[key] for key in (
                 "cause_class", "hypothesis_summary", "mechanism", "evidence_target",
                 "planned_action_class", "planned_target_kind", "failed_result_class",
                 "source")
         } | {"affected_criteria": _slots(item["affected_criterion_ids"], slots)}
             for item in state["failed_approaches"]]
+        projection["approach_comparison"] = {
+            "proposed": candidate_hypothesis,
+            "previous_failures": previous_failures,
+        }
     elif family == "route_preference":
         projection["legal_routes"] = list(state["legal_routes"])
         projection["eligible_workflows"] = [{
@@ -394,7 +417,7 @@ def _laya_diagnostics(frame: SystemOneFrame, result: Any,
                          and coverage_status == "complete")
     return {
         "schema_version": "laya-inference-diagnostics/v1",
-        "projection_schema": "laya-semantic-projection/v2",
+        "projection_schema": "laya-semantic-projection/v3",
         "projection_digest": canonical_hash(projection),
         "projection_bytes": len(json.dumps(
             projection, sort_keys=True, separators=(",", ":"),

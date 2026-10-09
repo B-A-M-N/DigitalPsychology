@@ -132,7 +132,9 @@ def create_system_one_frame_factory(system_one_service: Any):
               observation: RuntimeObservation, csw: CSWBehaviorSnapshot,
               cfw_signals: Sequence[FrameworkSignal],
               policy_context: Mapping[str, Any] | None = None,
-              available_frameworks: Sequence[str] = ()) -> SystemOneFrame | None:
+              available_frameworks: Sequence[str] = (),
+              previous_goal_set: GoalSetSnapshot | None = None
+              ) -> SystemOneFrame | None:
         signals = tuple(signal for signal in cfw_signals if signal.active)
         causes = group_behavioral_causes(signals)
         signal_codes = tuple((source + "." + code).lower()
@@ -265,6 +267,32 @@ def create_system_one_frame_factory(system_one_service: Any):
             last_progress_sequence=(goal_items[criterion_id].last_progress_action
                                     if criterion_id in goal_items else None),
         ) for criterion_id in criterion_ids)
+        criteria_before = None
+        if previous_goal_set is not None:
+            previous_items = {item.criterion_id: item for item in previous_goal_set.items}
+            missing_prior = set(criterion_ids) - set(previous_items)
+            if missing_prior:
+                raise ValueError(
+                    "previous host goal set omits projected criteria: "
+                    + ", ".join(sorted(missing_prior)))
+            if all(previous_items[item].claim for item in criterion_ids):
+                criteria_before = tuple(CriterionState(
+                    criterion_id=criterion_id,
+                    claim=previous_items[criterion_id].claim[:512],
+                    kind="objective",
+                    status=status_map.get(previous_items[criterion_id].status, "unmet"),
+                    evidence_status=(
+                        "verified" if (
+                            previous_items[criterion_id].status == "VERIFIED"
+                            and previous_items[criterion_id].evidence_refs)
+                        else "available" if previous_items[criterion_id].evidence_refs
+                        else "none"),
+                    evidence_ref_digests=tuple(
+                        hashlib.sha256(ref.encode()).hexdigest()
+                        for ref in previous_items[criterion_id].evidence_refs[:8]),
+                    last_progress_sequence=(
+                        previous_items[criterion_id].last_progress_action),
+                ) for criterion_id in criterion_ids)
         progress_class = ("GOAL_PROGRESS" if observation.progress_made else
                           "VALIDATION_EVIDENCE" if observation.evidence_refs else None)
         sequence = (observation.action_index * 2
@@ -381,6 +409,7 @@ def create_system_one_frame_factory(system_one_service: Any):
             failed_approaches=observation.failed_approaches,
             legal_routes=tuple(statework_id for statework_id, _description
                                in legal_stateworks),
+            criteria_before=criteria_before,
         )
         questions = tuple(QuestionSpec(
             question_id=question_id,

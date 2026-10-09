@@ -1,10 +1,24 @@
 import sqlite3
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from lib.system_one_contracts import canonical_hash
+from lib.protocol_artifact import PROTOCOL_VERSION, QUESTION_REGISTRY
+from lib.system_one_contracts import (
+    ActivityFact,
+    CriterionState,
+    QuestionSpec,
+    SemanticState,
+    SystemOneFrame,
+    SystemOneIdentity,
+    canonical_hash,
+)
 from lib.system_one_offline_eval import (
     _metrics,
+    _frame_event_matches,
+    _replay_frame,
     _union_find_split_manifest,
     _validate_split_manifest,
     run_offline_replay,
@@ -30,6 +44,67 @@ def _rows(count=5):
     return rows
 
 
+def _legacy_frame_mapping():
+    question_data = QUESTION_REGISTRY["progress_relation"]
+    question = QuestionSpec(
+        question_id="progress_relation", family="progress_relation",
+        question_type="choice", instructions=question_data["instructions"],
+        criteria=tuple(question_data["criteria"].items()))
+    identity = SystemOneIdentity(
+        namespace_id="tenant", application_id="app", application_instance_id="app-1",
+        agent_id="agent", agent_instance_id="agent-1", session_id="session",
+        task_id="task", attempt_id="attempt")
+    activity = ActivityFact(
+        sequence=1, activity_type="action", source="host_observed",
+        action_class="verification", host_declared_relation="ambiguous",
+        target_kind="workspace", proposed_purpose="verify the requested result",
+        affected_criterion_ids=("criterion",))
+    state = SemanticState(
+        task={"objective": "Verify the requested artifact.", "work_mode": "review",
+              "deliverable_kind": "document", "task_complexity": "standard",
+              "phase": "review", "active_segment": "segment", "active_statework": None,
+              "active_flow": None, "non_goals": [], "domain_tags": []},
+        situation={"current_state": "REVIEW", "blockers": [],
+                   "actions_since_goal_progress": 0, "actions_since_artifact_change": 0,
+                   "verification_actions_since_artifact_change": 0, "recovery_epochs": 0,
+                   "repeated_branch_count": 0},
+        criteria=(CriterionState("criterion", "The artifact passes review.", "objective"),),
+        activity=(activity,), workflows=(), convergence=(), candidate=activity)
+    legacy_schema = json.loads((Path(__file__).parents[1] / "lib" / "schemas" /
+                                "system-one-protocol-2.5.0.schema.json").read_text())
+    raw = {
+        "protocol_version": "2.5.0",
+        "protocol_hash": canonical_hash(legacy_schema),
+        "identity": identity.to_dict(),
+        "request_id": "legacy-frame-request",
+        "sequence": 1,
+        "state_digest": "",
+        "question_bundle_digest": canonical_hash([question.to_dict()]),
+        "request_digest": "",
+        "policy_hash": "c" * 64,
+        "backend_id": "legacy-laya",
+        "model_id": "model",
+        "model_revision": "revision",
+        "model_content_hash": "a" * 64,
+        "provider_protocol_hash": "b" * 64,
+        "question_registry_hash": canonical_hash(legacy_schema["x-question-registry"]),
+        "state_projection_schema_hash": canonical_hash(
+            legacy_schema["$defs"]["SemanticState"]),
+        "calibration_bundle_hash": "",
+        "state": state.to_dict(),
+        "questions": [question.to_dict()],
+    }
+    raw["state"].pop("criteria_before")
+    raw["state_digest"] = canonical_hash(raw["state"])
+    raw["request_digest"] = canonical_hash({
+        "identity": raw["identity"], "sequence": raw["sequence"],
+        "state_digest": raw["state_digest"],
+        "question_bundle_digest": raw["question_bundle_digest"],
+        "policy_hash": raw["policy_hash"],
+    })
+    return raw
+
+
 def test_split_manifest_groups_and_validates_independent_clusters():
     rows = _rows()
     manifest = _union_find_split_manifest(rows, "goal_drift")
@@ -38,6 +113,34 @@ def test_split_manifest_groups_and_validates_independent_clusters():
         "training", "calibration", "holdout"}
     checked = _validate_split_manifest(manifest, rows, "goal_drift")
     assert checked["manifest_digest"] == manifest["manifest_digest"]
+
+
+def test_offline_replay_normalizes_authenticated_legacy_frame_without_prior_snapshot():
+    raw = _legacy_frame_mapping()
+    with pytest.raises(ValueError, match="projection registry"):
+        SystemOneFrame.from_mapping(raw)
+
+    replay = _replay_frame(raw)
+
+    assert replay.protocol_version == PROTOCOL_VERSION
+    assert replay.state.criteria_before is None
+    assert replay.state.to_dict()["criteria_before"] is None
+    identity = raw["identity"]
+    event = SimpleNamespace(
+        event_type="system_one_decision", category="decision",
+        actor_id="digitalpsychology_runtime",
+        authority_source="digitalpsychology_system_one", event_id="event-1",
+        scope="scope-1", payload={
+            "system_one_tick_id": "tick-1",
+            "system_one_decision_id": raw["request_id"],
+            "system_one_state_digest": raw["state_digest"],
+            "system_one_question_bundle_hash": raw["question_bundle_digest"],
+        }, **identity)
+    assert _frame_event_matches(
+        replay, event, "tick-1", ("event-1",), source_frame=raw)
+    tampered = {**raw, "state_digest": "0" * 64}
+    with pytest.raises(ValueError, match="content digest"):
+        _replay_frame(tampered)
 
 
 def test_split_manifest_rejects_trajectory_leakage_even_with_valid_digest():

@@ -1005,7 +1005,7 @@
                        "option_coverage", "advisory_eligible"],
           "properties": {
             "schema_version": {"const": "laya-inference-diagnostics/v1"},
-            "projection_schema": {"const": "laya-semantic-projection/v2"},
+            "projection_schema": {"enum": ["laya-semantic-projection/v2", "laya-semantic-projection/v3"]},
             "projection_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "projection_bytes": {"type": "integer", "minimum": 0, "maximum": 32768},
             "latency_ms": {"type": "integer", "minimum": 0, "maximum": 30000},

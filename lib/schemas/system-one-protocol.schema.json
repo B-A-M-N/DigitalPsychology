@@ -3,7 +3,7 @@
   "$id": "https://digitalpsychology.dev/contracts/laya-semantic-protocol.schema.json",
   "title": "DigitalPsychology Laya semantic protocol",
   "type": "object",
-  "protocol_version": "2.5.0",
+  "protocol_version": "2.6.0",
   "x-question-registry": {
     "action_relation": {
       "family": "action_relation",
@@ -33,11 +33,11 @@
     "retry_relation": {
       "family": "retry_relation",
       "type": "choice",
-      "instructions": "Compare the semantic descriptions of the previous failed approach and the proposed approach.",
+      "instructions": "Compare the prior failure's hypothesis, mechanism, and evidence target with the proposed approach. A changed action or evidence target under the same premise is different from an equivalent retry.",
       "criteria": {
         "materially_new": "The proposed approach uses a materially different causal hypothesis, mechanism, or evidence target.",
-        "same_premise_new_action": "The underlying hypothesis is retained but the planned action or evidence target materially changes.",
-        "equivalent_retry": "The proposed approach is semantically equivalent to an already failed approach despite wording or tool differences.",
+        "same_premise_new_action": "The underlying hypothesis is retained, but the substantive method or evidence target changes; this is not an equivalent retry.",
+        "equivalent_retry": "The proposed approach repeats the same causal hypothesis and materially same method and evidence target; wording or tool-name changes do not make it new.",
         "unrelated": "The proposed approach does not address the recorded failure or cause."
       }
     },
@@ -552,6 +552,7 @@
         "task",
         "situation",
         "criteria",
+        "criteria_before",
         "activity",
         "workflows",
         "convergence",
@@ -704,6 +705,20 @@
           "items": {
             "$ref": "#/$defs/CriterionState"
           }
+        },
+        "criteria_before": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "maxItems": 8,
+              "items": {
+                "$ref": "#/$defs/CriterionState"
+              }
+            }
+          ]
         },
         "activity": {
           "type": "array",
@@ -883,7 +898,7 @@
       ],
       "properties": {
         "protocol_version": {
-          "const": "2.1.0"
+          "const": "2.6.0"
         },
         "protocol_hash": {
           "type": "string",
@@ -988,7 +1003,7 @@
       ],
       "properties": {
         "protocol_version": {
-          "const": "2.1.0"
+          "const": "2.6.0"
         },
         "protocol_hash": {
           "type": "string",
@@ -1102,7 +1117,7 @@
           "pattern": "^[0-9a-f]{64}$"
         },
         "protocol_version": {
-          "const": "2.1.0"
+          "const": "2.6.0"
         },
         "protocol_hash": {
           "type": "string",

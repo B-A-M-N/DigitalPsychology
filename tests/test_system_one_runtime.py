@@ -15,14 +15,16 @@ from lib.protocol_artifact import (PROTOCOL_HASH, PROTOCOL_VERSION,
                                    QUESTION_REGISTRY, QUESTION_REGISTRY_HASH,
                                    STATE_PROJECTION_SCHEMA_HASH)
 from lib.system_one_backends import (LayaSystemOneBackend, PROVIDER_PROTOCOL_HASH,
-                                     ProviderHealthError, model_content_digest)
+                                     ProviderHealthError, laya_state_projection,
+                                     model_content_digest)
 from lib.system_one_calibration import (CalibrationBundle, CalibrationRecord,
                                         calibration_metrics,
                                         calibration_record_from_events,
                                         calibration_task_instance_hashes,
                                         calibration_task_fixture_hashes,
                                         task_instance_hash)
-from lib.system_one_contracts import (ActivityFact, CriterionState, QuestionAnswer,
+from lib.system_one_contracts import (ActivityFact, AttemptSemanticDescriptor,
+                                      CriterionState, QuestionAnswer,
                                       QuestionProbability, QuestionSpec, SemanticState,
                                       SystemOneCapability, SystemOneFrame,
                                       SystemOneIdentity, SystemOneJudgment,
@@ -31,6 +33,7 @@ from lib.system_one_learning import (CalibrationLifecycleError,
                                      SystemOneCalibrationLifecycle)
 from lib.system_one_runtime import CircuitBreaker, SystemOneRuntime
 from lib.system_one_service import SystemOneService
+from lib.system_one_diagnostics import validate_laya_diagnostics
 
 
 BACKEND_ID = "test-backend"
@@ -140,6 +143,71 @@ def judgment(request, *, selected=None):
         provider_protocol_hash=request.provider_protocol_hash,
         calibration_bundle_hash=request.calibration_bundle_hash,
         answers=tuple(answers))
+
+
+def test_retry_projection_pairs_the_proposed_attempt_with_prior_failures():
+    request = frame(question_ids=("retry_relation",))
+    candidate = replace(
+        request.state.candidate, action_class="regenerate_then_verify",
+        proposed_purpose=("Retain the stale-output hypothesis, rebuild from current source, "
+                          "then verify a newly generated report digest."))
+    failure = AttemptSemanticDescriptor(
+        cause_class="stale_generated_output",
+        hypothesis_summary="The existing report predates the current source revision.",
+        mechanism="Run verification against the existing report without regenerating it.",
+        evidence_target="the current report's failed verification output",
+        planned_action_class="verify_existing_report",
+        planned_target_kind="workspace",
+        failed_result_class="no_change",
+        premise_digest="d" * 64,
+        action_plan_digest="e" * 64,
+        affected_criterion_ids=("C1",),
+        source="host_observed")
+    state = replace(request.state, candidate=candidate, activity=(candidate,),
+                    failed_approaches=(failure,))
+    state_digest = canonical_hash(state.to_dict())
+    request_digest = canonical_hash({
+        "identity": request.identity.to_dict(), "sequence": request.sequence,
+        "state_digest": state_digest,
+        "question_bundle_digest": request.question_bundle_digest,
+        "policy_hash": request.policy_hash,
+    })
+    request = replace(request, state=state, state_digest=state_digest,
+                      request_digest=request_digest)
+
+    projection = laya_state_projection(request)
+
+    assert "objective" not in projection["task"]
+    assert projection["approach_comparison"]["proposed"]["action_class"] == (
+        "regenerate_then_verify")
+    assert projection["approach_comparison"]["previous_failures"][0][
+        "planned_action_class"] == "verify_existing_report"
+    assert "candidate_hypothesis" not in projection
+
+
+def test_laya_diagnostics_still_reads_retained_projection_v2_records():
+    diagnostics = {
+        "schema_version": "laya-inference-diagnostics/v1",
+        "projection_schema": "laya-semantic-projection/v2",
+        "projection_digest": "a" * 64,
+        "projection_bytes": 100,
+        "latency_ms": 20,
+        "preflight_status": "complete",
+        "preflight_state_tokens": 25,
+        "preflight_tokens_dropped": 0,
+        "input_tokens": 40,
+        "state_tokens": 25,
+        "state_tokens_dropped": 0,
+        "truncation_status": "complete",
+        "truncated_questions": [],
+        "coverage_status": "complete",
+        "option_coverage": {"action_relation": {
+            "expected_options": 5, "returned_options": 5, "status": "complete"}},
+        "advisory_eligible": True,
+    }
+
+    assert validate_laya_diagnostics(diagnostics)["projection_schema"] == (
+        "laya-semantic-projection/v2")
 
 
 class FixedBackend:
@@ -335,7 +403,7 @@ def test_native_laya_adapter_renders_typed_questions_and_pins_local_content(tmp_
     assert response.answers[0].selected == sorted(
         label for label, _ in request.questions[0].criteria)[0]
     assert received["state"]["task"]["deliverable_kind"] == "code_behavior"
-    assert received["state"]["projection_schema"] == "laya-semantic-projection/v2"
+    assert received["state"]["projection_schema"] == "laya-semantic-projection/v3"
     assert "active_segment" not in received["state"]["task"]
     assert received["questions"]["progress_relation"]["type"] == "choice"
     assert received["return_details"] is True
@@ -814,4 +882,7 @@ def test_packaged_protocol_schema_is_canonical_copy():
     schema = json.loads(schema_path.read_text())
     assert schema["protocol_version"] == PROTOCOL_VERSION
     assert schema["$defs"]["SystemOneFrame"]["additionalProperties"] is False
+    assert schema["$defs"]["SystemOneFrame"]["properties"][
+        "protocol_version"]["const"] == PROTOCOL_VERSION
     assert schema["x-question-registry"] == QUESTION_REGISTRY
+    assert "criteria_before" in schema["$defs"]["SemanticState"]["required"]

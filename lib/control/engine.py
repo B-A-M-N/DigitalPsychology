@@ -73,7 +73,9 @@ class ControlDecisionEngine:
 
     def prepare(self, descriptor: ControlSessionDescriptor,
                 record: RuntimeStateRecord,
-                request: ControlTickRequest) -> DecisionPreparation:
+                request: ControlTickRequest, *,
+                previous_goal_set: GoalSetSnapshot | None = None
+                ) -> DecisionPreparation:
         identity = descriptor.identity
         goal_set = request.goal_set
         goal_ids = {item.criterion_id for item in goal_set.items}
@@ -143,7 +145,7 @@ class ControlDecisionEngine:
                 attention.lease.criterion_ids if attention.lease else (),
                 record.state, request.observation, request.csw_snapshot,
                 request.cfw_signals, policy_context,
-                descriptor.available_frameworks)
+                descriptor.available_frameworks, previous_goal_set)
             query_plan = getattr(self.system_one_frame_factory,
                                  "last_query_plan", None)
             planned_question = getattr(query_plan, "question_id", None)

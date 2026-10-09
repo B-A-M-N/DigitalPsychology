@@ -313,9 +313,9 @@ def test_required_laya_query_bypasses_unchanged_shortcut(tmp_path):
             engine = service.engine
 
             class _QueryAttemptEngine:
-                def prepare(self, descriptor, runtime_record, control_request):
+                def prepare(self, descriptor, runtime_record, control_request, **kwargs):
                     preparation = engine.prepare(
-                        descriptor, runtime_record, control_request)
+                        descriptor, runtime_record, control_request, **kwargs)
                     return replace(
                         preparation, system_one_query_attempted=True,
                         system_one_frame={"query": "attempted"})
@@ -379,9 +379,9 @@ def test_committed_system_one_decision_uses_durable_outbox_once(
             engine = service.engine
 
             class _SystemOneAttemptEngine:
-                def prepare(self, descriptor, runtime_record, control_request):
+                def prepare(self, descriptor, runtime_record, control_request, **kwargs):
                     preparation = engine.prepare(
-                        descriptor, runtime_record, control_request)
+                        descriptor, runtime_record, control_request, **kwargs)
                     return replace(
                         preparation,
                         system_one_query_attempted=True,
@@ -440,9 +440,9 @@ def test_aborted_system_one_decision_never_enters_event_outbox(
             engine = service.engine
 
             class _SystemOneAttemptEngine:
-                def prepare(self, descriptor, runtime_record, control_request):
+                def prepare(self, descriptor, runtime_record, control_request, **kwargs):
                     preparation = engine.prepare(
-                        descriptor, runtime_record, control_request)
+                        descriptor, runtime_record, control_request, **kwargs)
                     return replace(
                         preparation,
                         system_one_query_attempted=True,
@@ -490,9 +490,9 @@ def test_nontrivial_preparation_guards_bypass_unchanged_result(tmp_path, guard):
             engine = service.engine
 
             class _GuardEngine:
-                def prepare(self, descriptor, runtime_record, control_request):
+                def prepare(self, descriptor, runtime_record, control_request, **kwargs):
                     preparation = engine.prepare(
-                        descriptor, runtime_record, control_request)
+                        descriptor, runtime_record, control_request, **kwargs)
                     decision = preparation.decision
                     if guard == "starvation_prevented":
                         return replace(

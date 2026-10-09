@@ -22,7 +22,7 @@ from lib.control.system_one import create_system_one_frame_factory
 from lib.runtime.contracts import ActionCandidate, RuntimeIdentity, RuntimeObservation
 from lib.runtime.store import BehaviorStateStore
 from lib.service import DigitalPsychologyService
-from lib.system_one_backends import DisabledSystemOneBackend
+from lib.system_one_backends import DisabledSystemOneBackend, laya_state_projection
 from lib.system_one_backends import ProviderHealthError
 from lib.runtime.transactions import HostTransactionCoordinator
 from lib.system_one_contracts import (AttemptSemanticDescriptor, QuestionAnswer,
@@ -216,6 +216,74 @@ def test_laya_frame_uses_host_claims_scoped_evidence_and_non_goals():
         for digest in criterion.evidence_ref_digests}
     assert frame.state.task["non_goals"] == ["unrelated refactoring"]
     assert frame.state.task["domain_tags"] == ["frontend", "accessibility"]
+
+
+def test_laya_progress_projection_includes_trusted_before_and_after_evidence():
+    identity = RuntimeIdentity(
+        namespace_id="tenant-a", application_id="codex",
+        application_instance_id="codex-local", agent_instance_id="agent-progress-delta",
+        session_id="session-progress-delta", task_id="task-progress-delta",
+        attempt_id="attempt-1", workflow_id="implementation",
+        subject_ref="repo:example", segment_id="segment-0", agent_id="codex",
+        behavioral_subject="task-progress-delta")
+    previous = GoalSetSnapshot(3, (GoalItemSnapshot(
+        "criterion-verify", status="READY",
+        claim="The generated report passes the acceptance check."),))
+    current = GoalSetSnapshot(4, (GoalItemSnapshot(
+        "criterion-verify", status="ACTIVE",
+        claim="The generated report passes the acceptance check.",
+        evidence_refs=("acceptance-output-after",)),))
+    observation = RuntimeObservation(
+        action_index=5, action_completed=True, artifact_changed=True,
+        goal_set=current, evidence_refs=("acceptance-output-after",),
+        criterion_evidence_refs={
+            "criterion-verify": ("acceptance-output-after",)})
+    service = SystemOneService(DisabledSystemOneBackend(), mode="shadow")
+    try:
+        factory = create_system_one_frame_factory(service)
+        frame = factory(
+            identity, "Verify the generated report against the acceptance check.",
+            ("criterion-verify",), BehaviorState(), observation,
+            CSWBehaviorSnapshot(revision=0), (),
+            {"deliverable_kind": "code_behavior"}, (), previous)
+        missing_claim_frame = factory(
+            identity, "Verify the generated report against the acceptance check.",
+            ("criterion-verify",), BehaviorState(), observation,
+            CSWBehaviorSnapshot(revision=0), (),
+            {"deliverable_kind": "code_behavior"}, (), GoalSetSnapshot(2, (
+                GoalItemSnapshot("criterion-verify", status="READY"),)))
+    finally:
+        service.close()
+
+    assert frame is not None
+    assert frame.question_ids == ("progress_relation",)
+    assert frame.state.criteria_before is not None
+    assert frame.state.criteria_before[0].status == "unmet"
+    assert frame.state.criteria_before[0].evidence_status == "none"
+    assert frame.state.criteria[0].status == "active"
+    assert frame.state.criteria[0].evidence_status == "available"
+    context = laya_state_projection(frame)["criterion_progress_context"]
+    assert context == {
+        "before_available": True,
+        "before": [{
+            "ref": "criterion_1",
+            "claim": "The generated report passes the acceptance check.",
+            "status": "unmet", "evidence_status": "none"}],
+        "after": [{
+            "ref": "criterion_1",
+            "claim": "The generated report passes the acceptance check.",
+            "status": "active", "evidence_status": "available"}],
+    }
+    assert "progress_class" not in str(context)
+    assert "host_declared_relation" not in str(context)
+    assert missing_claim_frame is not None
+    missing_context = laya_state_projection(missing_claim_frame)[
+        "criterion_progress_context"]
+    assert missing_claim_frame.state.criteria_before is None
+    assert missing_context == {
+        "before_available": False, "before": None,
+        "after": context["after"],
+    }
 
 
 def test_laya_candidate_generation_receives_actual_host_framework_ids(monkeypatch):
@@ -626,9 +694,13 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
         segment_id="segment-0", agent_id="codex", behavioral_subject="task-shadow",
         goal_contract_hash="c" * 64,
     )
+    initial_goals = GoalSetSnapshot(3, (GoalItemSnapshot(
+        "criterion-visual", status="READY",
+        claim="Render the requested page at the target viewport."),))
     goals = GoalSetSnapshot(4, (GoalItemSnapshot(
         "criterion-visual", status="ACTIVE",
         claim="Render the requested page at the target viewport.",
+        evidence_refs=("visual-evidence",),
         actions_since_progress=2),))
     csw = CSWBehaviorSnapshot(
         revision=3, active_stateworks=("repair",), workflow_states={"repair": "INSPECTING"},
@@ -644,7 +716,7 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
     control = ControlPlaneService(decision_service=dp, state_store=state_store)
     descriptor = ControlSessionDescriptor(
         identity=identity, objective="Render the requested page",
-        objective_criteria=("criterion-visual",), initial_goal_set=goals,
+        objective_criteria=("criterion-visual",), initial_goal_set=initial_goals,
         available_frameworks=("owl", "anchor", "fuse", "ward", "flow", "sispis", "dox"),
         cfw_authority_identity={
             "adapter_kind": "cfw-component-runtime", "authority_id": "test-cfw",
@@ -708,6 +780,10 @@ def test_private_control_tick_audits_shadow_laya_with_cfw_and_csw_context(tmp_pa
     audited = prepared["basis"]["system_one"]
     frame = audited["frame"]
     blockers = frame["state"]["situation"]["blockers"]
+    assert frame["state"]["criteria_before"][0]["status"] == "unmet"
+    assert frame["state"]["criteria_before"][0]["evidence_status"] == "none"
+    assert frame["state"]["criteria"][0]["status"] == "active"
+    assert frame["state"]["criteria"][0]["evidence_status"] == "available"
     assert len(blockers) == 1
     assert blockers[0].startswith("cfw_cause=unattributed:0:owl:owl.approach_failed")
     assert "codes=owl.approach_failed" in blockers[0]

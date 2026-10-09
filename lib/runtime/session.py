@@ -202,7 +202,7 @@ class RuntimeSession:
                     self.identity, self.objective,
                     (attention.lease.criterion_ids if attention and attention.lease else ()),
                     record.state, observation, snapshot, signals,
-                    self.policy_context, available_frameworks)
+                    self.policy_context, available_frameworks, previous_goal_set)
                 if frame is not None and not isinstance(frame, SystemOneFrame):
                     raise TypeError("System-1 frame factory must return a validated frame")
                 if frame is not None:

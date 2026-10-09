@@ -351,8 +351,14 @@ class ControlTransactionMethods:
             # Diagnostic persistence must never change the control decision.
             _LOG.warning("could not start control tick diagnostic", exc_info=True)
             attempt_id = None
+        previous_basis = self.state_store.latest_control_tick_basis(scope)
+        previous_goal_set = (parse_goal_set(previous_basis["goal_set"])
+                             if previous_basis and previous_basis.get("goal_set")
+                             else descriptor.initial_goal_set)
         try:
-            preparation = self.engine.prepare(descriptor, record, request)
+            preparation = self.engine.prepare(
+                descriptor, record, request,
+                previous_goal_set=previous_goal_set)
         except Exception as exc:
             _record_control_tick_attempt(
                 self, attempt_id, status="failed",
@@ -459,7 +465,6 @@ class ControlTransactionMethods:
             decision.state, request.csw_snapshot, objective=descriptor.objective,
             goal_set=request.goal_set, **_projection_capabilities(descriptor),
         )
-        previous_basis = self.state_store.latest_control_tick_basis(scope)
         prior_projection_index = max(
             record.action_index,
             int(previous_basis.get("cfw_projection_action_index", record.action_index))
@@ -467,9 +472,6 @@ class ControlTransactionMethods:
         )
         cfw_projection_action_index = max(
             prior_projection_index, request.observation.action_index)
-        previous_goal_set = (parse_goal_set(previous_basis["goal_set"])
-                             if previous_basis and previous_basis.get("goal_set")
-                             else descriptor.initial_goal_set)
         from ..telemetry.material_progress import material_progress_delta
         material_criteria = material_progress_delta(previous_goal_set, request.goal_set)
         basis = {
