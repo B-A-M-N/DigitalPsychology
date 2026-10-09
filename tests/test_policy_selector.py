@@ -520,15 +520,19 @@ def _ambiguous_retry_case(judgment):
     """A stuck retry where the semantic provider points at the right relation."""
     goals = GoalSetSnapshot(1, (GoalItemSnapshot("criterion-1"),))
 
-    class BaseJudgment:
-        def answer(self, question_id):
-            if question_id != "action_relation":
-                return None
-            return type("Answer", (), {
-                "selected": judgment,
-                "raw_confidence": 0.93,
-                "calibrated_confidence": 0.93,
-            })()
+    provider_judgment = None
+    if judgment is not None:
+        class BaseJudgment:
+            def answer(self, question_id):
+                if question_id != "action_relation":
+                    return None
+                return type("Answer", (), {
+                    "selected": judgment,
+                    "raw_confidence": 0.93,
+                    "calibrated_confidence": 0.93,
+                })()
+
+        provider_judgment = BaseJudgment()
 
     return BehavioralController().decide(
         FastLoopInput(
@@ -539,7 +543,7 @@ def _ambiguous_retry_case(judgment):
             goal_set=goals,
             pre_action=True,
         ),
-        judgment=BaseJudgment(),
+        judgment=provider_judgment,
     )
 
 
@@ -584,15 +588,18 @@ def test_laya_disabled_parity_preserves_deterministic_safety_and_cws_eligibility
     assert runs[0].state.cognitive_mode in BEHAVIOR_MODES
 
 
-def test_laya_semantic_gain_improves_retry_decision_without_taking_authority():
-    """Gate: paired baseline/treatment evidence for the semantic provider.
-
-    Baseline (provider disabled) and treatment (provider prefers an equivalent
-    but materially different approach) must both remain legal, and the
-    treatment must differ only by advisory support - CFW/WARD still gate it.
-    """
-    baseline = _ambiguous_retry_case("unrelated")
+def test_semantic_action_relation_changes_decision_without_taking_authority():
+    """A semantic hint changes the deterministic choice but not its authority."""
+    baseline = _ambiguous_retry_case(None)
     treatment = _ambiguous_retry_case("required_verification")
+
+    # The baseline and treatment share the same ambiguous pre-action retry
+    # context. Without a provider the controller delivers; a verification
+    # relation moves the choice to VERIFY.
+    assert baseline.state.cognitive_mode == "DELIVER"
+    assert treatment.state.cognitive_mode == "VERIFY"
+    assert any(item.operation == "set_mode" and item.value == "VERIFY"
+               for item in treatment.directives)
 
     # Neither outcome may invent a control value outside the legal set.
     legal = {"passive", "normal", "high", "strict"}
@@ -606,9 +613,9 @@ def test_laya_semantic_gain_improves_retry_decision_without_taking_authority():
     assert baseline.state.cognitive_mode in BEHAVIOR_MODES
     assert treatment.state.cognitive_mode in BEHAVIOR_MODES
 
-    # With no validated priors the selector must not claim a learned win; the
-    # gain is advisory ranking, which the receipts record rather than assert.
-    for receipt in getattr(baseline, "receipts", ()) or ():
+    # The semantic provider contributes a preference only; it is never the
+    # authority for a policy directive.
+    for receipt in getattr(treatment, "receipts", ()) or ():
         assert receipt.get("authority") != "semantic_provider"
 
 
