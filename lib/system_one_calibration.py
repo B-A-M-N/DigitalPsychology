@@ -25,6 +25,11 @@ _HOST_EVALUATOR_RECEIPT_FIELDS = frozenset({
     "task_scope", "control_scope", "criterion_ids",
     "evaluator_contract_hash", "task_instance_hash", "fixture_set_hash",
 })
+_ACTION_BOUND_OUTCOME_QUESTIONS = frozenset({
+    "action_relation", "goal_drift", "progress_relation", "retry_relation",
+})
+_HOST_EVALUATOR_RECEIPT_V3_FIELDS = (
+    _HOST_EVALUATOR_RECEIPT_FIELDS | {"source_action_index"})
 PRODUCTION_MINIMUM_INDEPENDENT_TRAJECTORIES = 30
 PRODUCTION_MINIMUM_INDEPENDENT_FIXTURES = 30
 PRODUCTION_MINIMUM_COHORT_TRAJECTORIES = 20
@@ -41,9 +46,17 @@ def validate_host_evaluator_receipt(
     before submission. DP binds their digests to the authenticated prediction,
     task, session, criterion set, and timestamps.
     """
-    if not isinstance(receipt, Mapping) or set(receipt) != _HOST_EVALUATOR_RECEIPT_FIELDS:
+    if not isinstance(receipt, Mapping):
         raise ValueError("independent outcome requires a complete host evaluator receipt")
-    if receipt.get("schema_version") != HOST_EVALUATOR_RECEIPT_SCHEMA:
+    schema = receipt.get("schema_version")
+    if (schema == HOST_EVALUATOR_RECEIPT_SCHEMA
+            and set(receipt) == _HOST_EVALUATOR_RECEIPT_FIELDS):
+        action_bound_v3 = False
+    elif (schema == "host-evaluator-receipt/v3"
+          and set(receipt) == _HOST_EVALUATOR_RECEIPT_V3_FIELDS
+          and question_id in _ACTION_BOUND_OUTCOME_QUESTIONS):
+        action_bound_v3 = True
+    else:
         raise ValueError("host evaluator receipt schema is unsupported")
     expected = {
         "decision_event_id": getattr(decision_event, "event_id", None),
@@ -109,8 +122,27 @@ def validate_host_evaluator_receipt(
     checked_at = evaluated_at or datetime.now(timezone.utc)
     if (decision_time is None or decision_time.tzinfo is None
             or observed_at is None or observed_at.tzinfo is None
-            or checked_at.tzinfo is None or observed_at <= decision_time
+            or checked_at.tzinfo is None or decision_time >= checked_at
             or observed_at > checked_at):
+        raise ValueError("host evidence must be observed after the decision and before labeling")
+    if action_bound_v3:
+        payload = getattr(decision_event, "payload", {}) or {}
+        decision_action_index = payload.get("system_one_action_index")
+        boundary_kind = payload.get("system_one_boundary_kind")
+        source_action_index = receipt.get("source_action_index")
+        if (type(decision_action_index) is not int or decision_action_index < 1
+                or type(source_action_index) is not int or source_action_index < 1
+                or source_action_index != decision_action_index):
+            raise ValueError("host evaluator receipt action index does not match the decision")
+        if boundary_kind == "post_action":
+            timing_valid = observed_at <= decision_time
+        elif boundary_kind in {"pre_action", "pre_action_rejected"}:
+            timing_valid = observed_at > decision_time
+        else:
+            timing_valid = False
+        if not timing_valid:
+            raise ValueError("host evidence timing does not match the action boundary")
+    elif observed_at <= decision_time:
         raise ValueError("host evidence must be observed after the decision and before labeling")
 
     normalized = dict(receipt)

@@ -56,6 +56,15 @@ def test_control_capability_negotiation_fails_closed_on_version_or_limit_drift()
     else:
         raise AssertionError("incompatible signal limit was accepted")
 
+    wrong_receipts = dict(capabilities, host_evaluator_receipt_schemas=[
+        "host-evaluator-receipt/v2"])
+    try:
+        validate_control_capabilities(wrong_receipts)
+    except ValueError as exc:
+        assert "receipt capability" in str(exc)
+    else:
+        raise AssertionError("action-bound receipt capability drift was accepted")
+
 
 def test_wire_schema_collection_limits_match_the_compatibility_registry():
     state_schema = json.loads(

@@ -140,6 +140,7 @@ class MCPControlClient:
         self.cwd = str(cwd) if cwd is not None else None
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
+        self._control_capabilities: dict[str, Any] | None = None
         self._lock = asyncio.Lock()
         self._latency = {
             name: {"count": 0, "failures": 0, "total_ms": 0.0, "max_ms": 0.0}
@@ -224,6 +225,7 @@ class MCPControlClient:
         async with self._lock:
             stack, self._stack = self._stack, None
             self._session = None
+            self._control_capabilities = None
             if stack is not None:
                 try:
                     await _within_timeout(
@@ -235,10 +237,18 @@ class MCPControlClient:
     async def open_control_session(self, descriptor: Mapping[str, Any]) -> dict[str, Any]:
         value = await self._call("open_control_session", {"session": dict(descriptor)})
         try:
-            validate_control_capabilities(value.get("capabilities"))
+            capabilities = value.get("capabilities")
+            validate_control_capabilities(capabilities)
         except ValueError as exc:
             raise RuntimeError("DigitalPsychology MCP capabilities are incompatible") from exc
+        self._control_capabilities = dict(capabilities)
         return value
+
+    @property
+    def control_capabilities(self) -> Mapping[str, Any] | None:
+        """Return the negotiated server contract for host protocol gates."""
+        return (dict(self._control_capabilities)
+                if self._control_capabilities is not None else None)
 
     async def prepare_control_tick(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return await self._call("prepare_control_tick", {"request": dict(request)})

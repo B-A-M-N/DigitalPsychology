@@ -20,6 +20,7 @@ from ..compatibility import (
     MAX_ELIGIBLE_STATEWORKS,
     MAX_GOAL_CRITERIA,
     MAX_OUTCOME_FACTS,
+    HOST_EVALUATOR_RECEIPT_SCHEMAS,
     advertised_control_capabilities,
     validate_control_capabilities,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "DP_CONTROL_PROTOCOL_VERSION", "MAX_ACTIVE_STATEWORKS",
     "MAX_AVAILABLE_FRAMEWORKS", "MAX_CFW_SIGNALS", "MAX_CONTROL_BATCH_ITEMS",
     "MAX_CONTROL_PAYLOAD_BYTES", "MAX_ELIGIBLE_STATEWORKS", "MAX_GOAL_CRITERIA",
-    "MAX_OUTCOME_FACTS", "advertised_control_capabilities",
+    "MAX_OUTCOME_FACTS", "HOST_EVALUATOR_RECEIPT_SCHEMAS",
+    "advertised_control_capabilities",
     "validate_control_capabilities",
 ]

@@ -299,6 +299,56 @@ def test_outcome_labeler_persists_only_later_authenticated_evidence(tmp_path, ca
         sink.close()
 
 
+@pytest.mark.parametrize(
+    ("boundary", "evidence_offset_seconds", "source_action_index", "accepted"),
+    [
+        ("post_action", -15, 3, True),
+        ("pre_action", -5, 3, True),
+        ("post_action", -5, 3, False),
+        ("pre_action", -15, 3, False),
+        ("post_action", -15, 4, False),
+    ],
+)
+def test_action_bound_outcome_receipts_bind_boundary_time_and_action_index(
+        tmp_path, boundary, evidence_offset_seconds, source_action_index, accepted):
+    now = datetime.now(timezone.utc)
+    base = _stored_decision_event()
+    decision = replace(
+        base,
+        timestamp=(now - timedelta(seconds=10)).isoformat().replace("+00:00", "Z"),
+        payload={**base.payload,
+                 "system_one_action_index": 3,
+                 "system_one_boundary_kind": boundary},
+    )
+    evidence_ref = "host-action://action-bound#sha256=" + "e" * 64
+    receipt = _evidence_receipt(decision, evidence_ref, "goal_progress")
+    receipt.update({
+        "schema_version": "host-evaluator-receipt/v3",
+        "source_action_index": source_action_index,
+        "evidence_observed_at": (
+            now + timedelta(seconds=evidence_offset_seconds)
+        ).isoformat().replace("+00:00", "Z"),
+    })
+    sink = SQLiteSink(tmp_path / "events.sqlite3")
+    try:
+        sink.emit_authenticated(decision, authenticated=True)
+        labeler = SystemOneOutcomeLabeler(sink)
+        call = lambda: labeler.record(
+            decision_event_id=decision.event_id,
+            namespace_id=decision.namespace_id,
+            application_instance_id=decision.application_instance_id,
+            question_id="progress_relation", label="goal_progress",
+            authority="validator", evidence_ref=evidence_ref,
+            evidence_receipt=receipt)
+        if accepted:
+            assert call()
+        else:
+            with pytest.raises(ValueError):
+                call()
+    finally:
+        sink.close()
+
+
 def test_committed_system_one_outbox_retries_after_sqlite_delivery_failure(tmp_path):
     decision = _stored_decision_event()
     behavior_path = tmp_path / "behavior.sqlite3"

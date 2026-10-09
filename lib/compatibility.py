@@ -5,7 +5,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
-DP_CONTROL_PROTOCOL_VERSION = "1.14.0"
+DP_CONTROL_PROTOCOL_VERSION = "1.15.0"
 CFW_ADAPTER_PROTOCOL_VERSION = "1.2.0"
 CFW_BEHAVIOR_PROJECTION_VERSION = "2.1.0"
 CFW_RUNTIME_EVENT_SCHEMA_VERSION = "1.0.0"
@@ -31,6 +31,8 @@ MAX_CFW_SIGNALS = 32
 MAX_AVAILABLE_FRAMEWORKS = 16
 MAX_CONTROL_BATCH_ITEMS = 32
 MAX_OUTCOME_FACTS = 128
+HOST_EVALUATOR_RECEIPT_SCHEMAS = (
+    "host-evaluator-receipt/v2", "host-evaluator-receipt/v3")
 
 CONTROL_LIMITS = MappingProxyType({
     "max_objective_criteria": MAX_GOAL_CRITERIA,
@@ -48,6 +50,7 @@ def advertised_control_capabilities() -> dict[str, Any]:
         "prepare_commit": True,
         "abort": True,
         "reconcile": True,
+        "host_evaluator_receipt_schemas": list(HOST_EVALUATOR_RECEIPT_SCHEMAS),
         **dict(CONTROL_LIMITS),
         "protocol_versions": dict(COMPATIBILITY),
     }
@@ -60,6 +63,9 @@ def validate_control_capabilities(value: Mapping[str, Any]) -> None:
     expected = advertised_control_capabilities()
     if value.get("protocol_versions") != expected["protocol_versions"]:
         raise ValueError("DP control protocol compatibility negotiation failed")
+    if value.get("host_evaluator_receipt_schemas") != expected[
+            "host_evaluator_receipt_schemas"]:
+        raise ValueError("DP host evaluator receipt capability is incompatible")
     for name, limit in CONTROL_LIMITS.items():
         offered = value.get(name)
         if type(offered) is not int or offered != limit:
