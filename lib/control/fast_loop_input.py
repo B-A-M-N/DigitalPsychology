@@ -140,6 +140,13 @@ class FastLoopInput:
         policy_context = dict(self.policy_context or {})
         if len(policy_context) > 32:
             raise ValueError("policy context exceeds its field bound")
+        experimental_route = policy_context.get("experimental_route_preference")
+        if experimental_route is not None and (
+                not isinstance(experimental_route, str)
+                or not experimental_route
+                or len(experimental_route) > 128):
+            raise ValueError(
+                "experimental_route_preference must be bounded text or absent")
         try:
             encoded_policy_context = json.dumps(
                 policy_context, sort_keys=True, separators=(",", ":"),

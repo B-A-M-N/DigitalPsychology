@@ -35,6 +35,7 @@ class DirectiveBuilder:
               applies_to_attention: Callable[[tuple[str, ...]], bool],
               semantic_statework_preference: str | None = None,
               semantic_statework_confidence: float = 0.0,
+              experimental_route_preference: str | None = None,
               ) -> BehavioralDecision:
             selected_option = (candidate_pool.option_for(selection.candidate.candidate_id)
                                if selection.candidate is not None else None)
@@ -154,7 +155,18 @@ class DirectiveBuilder:
                 framework_modes={**dict(working.framework_modes), "ward": "mandatory"},
             )
 
-            if (context.semantic_opportunity_question_id == "route_preference"
+            if experimental_route_preference is not None:
+                # Host-owned experimental assignment. Still restricted to the
+                # current CSW-eligible set and subject to the same lease
+                # capacity checks as a semantic route preference.
+                preference = rank_stateworks(
+                    selected_candidate.cognitive_mode,
+                    context.csw_snapshot.eligible_stateworks,
+                    context.csw_snapshot.active_stateworks,
+                    semantic_preference=experimental_route_preference,
+                    semantic_confidence=1.0,
+                    limit=1)
+            elif (context.semantic_opportunity_question_id == "route_preference"
                     and semantic_statework_preference is not None):
                 preference = rank_stateworks(
                     selected_candidate.cognitive_mode,

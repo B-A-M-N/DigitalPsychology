@@ -725,3 +725,76 @@ def test_full_intervention_target_capacity_skips_statework_preference():
     assert not any(target.target.startswith("statework:") for target in owner.targets)
     assert not decision.preferred_stateworks
     assert not any(item.operation == "prefer_statework" for item in decision.directives)
+
+
+def test_experimental_route_preference_is_host_owned_and_eligibility_bounded():
+    from lib.control.fast_loop_input import FastLoopInput as _FLI
+
+    controller = BehavioralController()
+    state = BehaviorState()
+    csw = CSWBehaviorSnapshot(
+        revision=1,
+        eligible_stateworks=(
+            StateWorkOption("gitter", behavior_tags=("repository", "diagnose")),
+            StateWorkOption("infrae", behavior_tags=("infrastructure", "diagnose")),
+        ),
+    )
+
+    # Host-owned oracle assignment at one decision boundary.
+    decision = controller.decide(_FLI(
+    scope="tenant/app/agent/session/task/attempt",
+        state=state,
+        csw_snapshot=csw,
+        objective_criteria=("criterion-1",),
+        host_action_index=1,
+        policy_context={"experimental_route_preference": "infrae"},
+    ))
+    assert decision.preferred_stateworks == ("infrae",)
+    assert any(item.operation == "prefer_statework"
+               and item.target == "infrae"
+               for item in decision.directives)
+
+    # An out-of-eligibility assignment must never reach a directive:
+    # rank_stateworks filters because the ID is not in the ranked list.
+    bogus = controller.decide(_FLI(
+        scope="tenant/app/agent/session/task/attempt",
+        state=state,
+        csw_snapshot=csw,
+        objective_criteria=("criterion-1",),
+        host_action_index=1,
+        policy_context={"experimental_route_preference": "not-a-route"},
+    ))
+    assert bogus.preferred_stateworks in ((), ("gitter",), ("infrae",))
+    assert all(item.operation != "prefer_statework"
+               or item.target in ("gitter", "infrae")
+               for item in bogus.directives)
+
+
+def test_experimental_route_preference_input_validation_rejects_unbounded_text():
+    from lib.control.fast_loop_input import FastLoopInput as _FLI
+    import pytest
+
+    with pytest.raises(ValueError, match="experimental_route_preference"):
+        _FLI(
+            scope="tenant/app/agent/session/task/attempt",
+            state=BehaviorState(),
+            csw_snapshot=CSWBehaviorSnapshot(revision=1),
+            objective_criteria=("criterion-1",),
+            host_action_index=1,
+            policy_context={"experimental_route_preference": "x" * 129},
+        )
+
+
+def test_experimental_route_preference_rejects_non_string():
+    from lib.control.fast_loop_input import FastLoopInput as _FLI
+    import pytest
+
+    with pytest.raises(ValueError, match="experimental_route_preference"):
+        _FLI(
+            scope="tenant/app/agent/session/task/attempt",
+            state=BehaviorState(),
+            csw_snapshot=CSWBehaviorSnapshot(revision=1),
+            objective_criteria=("criterion-1",),
+            host_action_index=1,
+            policy_context={"experimental_route_preference": 42},
+        )

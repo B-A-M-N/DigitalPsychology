@@ -223,7 +223,11 @@ class BehavioralController:
             condition_for=condition_for, applies_to_attention=applies_to_attention,
             semantic_statework_preference=qualified(
                 semantic.statework_preference, semantic.statework_confidence),
-            semantic_statework_confidence=semantic.statework_confidence)
+            semantic_statework_confidence=semantic.statework_confidence,
+            experimental_route_preference=(
+                context.policy_context.get("experimental_route_preference")
+                if isinstance(context.policy_context, dict)
+                else None))
 
 
 __all__ = ["BehavioralController", "FastLoopInput", "SemanticAssessment"]
