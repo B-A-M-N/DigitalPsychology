@@ -179,9 +179,19 @@ class HostReconciler:
             failure_class="host_restart_reconciliation",
             cfw_lifecycle_revision=recovery.cfw_lifecycle_revision,
             csw_snapshot=recovery.csw_snapshot,
+            # Preserve unresolved uncertainty across the restart boundary so the
+            # host does not read a failed authoritative re-read as a determinate
+            # not-committed outcome.
+            indeterminate=recovery.indeterminate,
         )
         await self.host.client.abort_control_tick(abort.to_dict())
-        if recovery.rollback_errors:
+        if recovery.indeterminate:
+            self.host._fault = (
+                "pending DP actuation outcome is UNRESOLVED after restart; "
+                "authoritative CSW state must be reconciled before retrying: "
+                + "; ".join(recovery.rollback_errors))
+            self.host._notify_fault(self.host._fault)
+        elif recovery.rollback_errors:
             self.host._fault = (
                 "pending DP actuation could not be fully rolled back: "
                 + "; ".join(recovery.rollback_errors))

@@ -547,6 +547,10 @@ class ControlAbortRequest:
     failure_class: str
     cfw_lifecycle_revision: int
     csw_snapshot: CSWBehaviorSnapshot
+    # Defaulted last so every existing positional/keyword constructor keeps
+    # working. True means the authority mutation may have committed but could
+    # not be verified; it is NOT inferable from failure_class or message text.
+    indeterminate: bool = False
 
     def __post_init__(self) -> None:
         for name in ("control_session_id", "tick_id", "decision_id", "basis_digest"):
@@ -564,6 +568,8 @@ class ControlAbortRequest:
             raise ValueError("directive application receipts are malformed")
         if not isinstance(self.rollback_completed, bool):
             raise ValueError("rollback_completed must be boolean")
+        if not isinstance(self.indeterminate, bool):
+            raise ValueError("indeterminate must be boolean")
         if (not isinstance(self.failure_class, str) or not self.failure_class
                 or len(self.failure_class) > 128):
             raise ValueError("failure_class must be bounded text")
@@ -578,7 +584,8 @@ class ControlAbortRequest:
         data = dict(_mapping(value, "control abort"))
         expected = {"protocol_version", "control_session_id", "tick_id", "decision_id",
                     "basis_digest", "applied_directive_ids", "rollback_completed",
-                    "failure_class", "cfw_lifecycle_revision", "csw_snapshot"}
+                    "failure_class", "cfw_lifecycle_revision", "csw_snapshot",
+                    "indeterminate"}
         if set(data) != expected or data["protocol_version"] != PROTOCOL_VERSION:
             raise ValueError("control abort protocol version or fields are invalid")
         return cls(
@@ -589,6 +596,7 @@ class ControlAbortRequest:
             failure_class=data["failure_class"],
             cfw_lifecycle_revision=data["cfw_lifecycle_revision"],
             csw_snapshot=parse_csw_snapshot(data["csw_snapshot"]),
+            indeterminate=data["indeterminate"],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -600,7 +608,8 @@ class ControlAbortRequest:
                 "rollback_completed": self.rollback_completed,
                 "failure_class": self.failure_class,
                 "cfw_lifecycle_revision": self.cfw_lifecycle_revision,
-                "csw_snapshot": self.csw_snapshot.to_dict()}
+                "csw_snapshot": self.csw_snapshot.to_dict(),
+                "indeterminate": self.indeterminate}
 
 
 def bounded_control_mapping(value: Any, name: str) -> dict[str, Any]:

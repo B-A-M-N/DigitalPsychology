@@ -186,6 +186,12 @@ class HostTransactionCoordinator:
                 applied_directive_ids=error.applied_directive_ids,
                 rollback_completed=error.rollback_completed,
                 failure_class=type(error.__cause__ or error).__name__,
+                # Preserve the actuator's classification. An indeterminate
+                # outcome means the authority mutation may have committed but
+                # could not be verified, so the host must reconcile rather than
+                # treat this as a clean refusal. This is NOT derivable from
+                # failure_class, which is only the underlying exception name.
+                indeterminate=getattr(error, "indeterminate", False),
                 cfw_lifecycle_revision=self.host._current_cfw_revision(),
                 csw_snapshot=current_snapshot,
             )

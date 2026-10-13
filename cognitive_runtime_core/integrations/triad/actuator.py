@@ -21,6 +21,37 @@ def _metric_increment(metrics: Any, name: str) -> None:
             _LOG.warning("could not persist an authority rejection metric", exc_info=True)
 
 
+class GuaranteedNoMutation(Exception):
+    """An authority refusal that GUARANTEES no mutation occurred.
+
+    A CSW port raises this (or a subclass) when it can prove it rejected the
+    request before committing anything. Only such refusals keep the determinate
+    failure path; any other exception from an invoked activation is treated as
+    indeterminate, because a failed acknowledgment does not establish a failed
+    mutation.
+    """
+
+
+class _IndeterminateActuation(RuntimeError):
+    """A CSW mutation committed but its verification read failed.
+
+    Distinct from a refusal: the caller cannot assume the mutation did or did
+    not take effect, so it must reconcile from authoritative state rather than
+    retry blindly or report a clean rollback.
+    """
+
+    def __init__(self, message: str, *,
+                 applied_directive_ids: tuple[str, ...] = (),
+                 attempted: tuple[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.applied_directive_ids = tuple(applied_directive_ids)
+        # Identity of the operation that was ATTEMPTED but whose outcome is
+        # unknown: (statework_id, intervention_id). Kept separate from
+        # applied_directive_ids so "confirmed applied" keeps its meaning while
+        # recovery can still identify what to reconcile.
+        self.attempted = attempted
+
+
 @dataclass(frozen=True)
 class ControlApplication:
     applied_directive_ids: tuple[str, ...]
@@ -37,6 +68,7 @@ class ControlReconciliation:
     cfw_lifecycle_revision: int
     csw_snapshot: Any
     rollback_errors: tuple[str, ...] = ()
+    indeterminate: bool = False
 
     @property
     def rollback_completed(self) -> bool:
@@ -102,7 +134,7 @@ class ControlActuator:
 
         cfw_prepared = None
         cfw_attempted = False
-        csw_changes: list[tuple[str, dict[str, Any]]] = []
+        csw_changes: list[tuple[tuple[str, dict[str, Any]], dict[str, Any]]] = []
         checkpoint_created = False
         tick_id = str(prepared.get("tick_id") or "")
         applied: set[str] = set()
@@ -168,10 +200,11 @@ class ControlActuator:
                     if directive.get("value") != "unselected" or statework_id not in \
                             snapshot.active_stateworks:
                         raise RuntimeError("CSW release does not match the current selection")
-                    csw_changes.append(("release_statework", {
+                    csw_changes.append((("release_statework", {
                         **directive,
                         "expires_at_action": self._directive_expiry(directive),
-                    }))
+                    }), {"statework_id": statework_id,
+                         "intervention_id": intervention_id}))
                     release_result = self.csw.deactivate_statework(
                         statework_id,
                         expected_selection_revision=snapshot.revision,
@@ -213,21 +246,55 @@ class ControlActuator:
                     if owner_expiry != expires_at_action:
                         raise RuntimeError(
                             "CSW activation expiry differs from its owning intervention")
-                    csw_changes.append(("prefer_statework", {
-                        **directive, "expires_at_action": expires_at_action}))
-                    snapshot = self.csw.activate_statework(
-                        statework_id,
-                        expected_selection_revision=snapshot.revision,
-                        candidate_statework_ids=candidate_ids,
-                        intervention_id=intervention_id,
-                        expires_at_action=expires_at_action,
-                    )
+                    csw_changes.append((("prefer_statework", {
+                        **directive, "expires_at_action": expires_at_action}),
+                        {"statework_id": statework_id,
+                         "intervention_id": intervention_id}))
+                    try:
+                        snapshot = self.csw.activate_statework(
+                            statework_id,
+                            expected_selection_revision=snapshot.revision,
+                            candidate_statework_ids=candidate_ids,
+                            intervention_id=intervention_id,
+                            expires_at_action=expires_at_action,
+                        )
+                    except GuaranteedNoMutation as exc:
+                        # The adapter guarantees no mutation occurred, so this is
+                        # a determinate refusal and keeps the ordinary path.
+                        raise exc
+                    except Exception as exc:
+                        # The authority was INVOKED with a valid request, so the
+                        # activation may have committed before the
+                        # acknowledgment was lost. A failed acknowledgment does
+                        # not establish a failed mutation, so this is
+                        # indeterminate rather than a refusal. The attempted
+                        # operation's identity is preserved separately from
+                        # applied_directive_ids, which retains its meaning of
+                        # "confirmed applied".
+                        raise _IndeterminateActuation(
+                            f"CSW activation acknowledgment lost for "
+                            f"{statework_id!r}; outcome unknown: {exc}",
+                            applied_directive_ids=tuple(sorted(applied)),
+                            attempted=(statework_id, intervention_id),
+                        ) from exc
                     if statework_id not in snapshot.active_stateworks:
                         raise RuntimeError("CSW did not confirm StateWork activation")
                 applied.add(directive["directive_id"])
 
             if self.csw is not None:
-                confirmed = self._snapshot(candidate_ids)
+                try:
+                    confirmed = self._snapshot(candidate_ids)
+                except Exception as exc:
+                    # The activation already committed; only the verification
+                    # read failed. This is an INDETERMINATE outcome, not a
+                    # refusal: the mutation is durable but unconfirmed, so the
+                    # caller must reconcile rather than assume either success
+                    # or a clean rollback.
+                    raise _IndeterminateActuation(
+                        f"CSW verification read failed after committing "
+                        f"{len(applied)} directive(s): {exc}",
+                        applied_directive_ids=tuple(sorted(applied)),
+                    ) from exc
                 if confirmed != snapshot:
                     raise RuntimeError("CSW selection changed during runtime actuation")
                 snapshot = confirmed
@@ -237,6 +304,20 @@ class ControlActuator:
                 raise RuntimeError("CFW did not materialize the candidate behavior revision")
             return ControlApplication(tuple(sorted(applied)), cfw_revision, snapshot)
         except Exception as failure:
+            if isinstance(failure, _IndeterminateActuation):
+                # A committed-but-unverifiable mutation must NOT be rolled back
+                # on the same degraded path, and must not be retried: both risk
+                # duplicating a consequential transition. Surface it as
+                # indeterminate so the caller reconciles from authority state,
+                # carrying the attempted operation's identity so recovery knows
+                # what to look for.
+                raise ActuationFailure(
+                    str(failure),
+                    applied_directive_ids=failure.applied_directive_ids,
+                    rollback_completed=False,
+                    indeterminate=True,
+                    attempted=failure.attempted,
+                ) from failure
             if authority_stage == "cfw" and cfw_directives:
                 _metric_increment(
                     self.production_metrics, "cfw_directive_rejections")
@@ -260,7 +341,7 @@ class ControlActuator:
                 except Exception as exc:
                     errors.append(f"CSW exact selection restore failed: {exc}")
             else:
-                for operation, directive in reversed(csw_changes):
+                for (operation, directive), _identity in reversed(csw_changes):
                     try:
                         statework_id = directive["target"]
                         intervention_id = directive["intervention_id"]
@@ -324,7 +405,21 @@ class ControlActuator:
                 item["directive_id"] for item in cfw_directives + csw_directives}:
             raise ValueError("prepared directive partitions are incomplete")
 
-        candidate_ids, snapshot = self._initial_csw_snapshot()
+        try:
+            candidate_ids, snapshot = self._initial_csw_snapshot()
+        except Exception as exc:
+            # The authoritative re-read itself failed, so the outcome is still
+            # UNRESOLVED. Report it as indeterminate rather than letting the
+            # transport error escape as an unclassified failure, and do not
+            # attempt rollback on the same degraded path.
+            return ControlReconciliation(
+                applied=False, applied_directive_ids=(),
+                cfw_lifecycle_revision=self.lifecycle_revision(),
+                csw_snapshot=self.empty_csw_snapshot(),
+                rollback_errors=(
+                    f"CSW authoritative read failed during recovery: {exc}",),
+                indeterminate=True,
+            )
         expected_active = expected_csw_active_stateworks(
             basis, csw_directives, snapshot.dependency_retention)
         expected_cfw = self.cfw_projection(candidate, basis)
@@ -568,4 +663,4 @@ class ControlActuator:
 
 
 __all__ = ["ActuationFailure", "ControlActuator", "ControlApplication",
-           "ControlReconciliation"]
+           "ControlReconciliation", "GuaranteedNoMutation"]
