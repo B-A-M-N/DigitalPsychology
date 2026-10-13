@@ -494,6 +494,14 @@ def test_laya_statework_preference_changes_only_a_csw_eligible_choice():
                 "selected": "verify-flow",
                 "raw_confidence": 0.96,
                 "calibrated_confidence": 0.96,
+                "raw_probabilities": (
+                    type("P", (), {"label": "verify-flow", "probability": 0.80})(),
+                    type("P", (), {"label": "diagnose-flow", "probability": 0.20})(),
+                ),
+                "calibrated_probabilities": (
+                    type("P", (), {"label": "verify-flow", "probability": 0.85})(),
+                    type("P", (), {"label": "diagnose-flow", "probability": 0.15})(),
+                ),
             })()
 
     csw = CSWBehaviorSnapshot(

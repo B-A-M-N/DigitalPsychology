@@ -224,6 +224,7 @@ class BehavioralController:
             semantic_statework_preference=qualified(
                 semantic.statework_preference, semantic.statework_confidence),
             semantic_statework_confidence=semantic.statework_confidence,
+            semantic_statework_support=semantic.statework_support,
             experimental_route_preference=(
                 context.policy_context.get("experimental_route_preference")
                 if isinstance(context.policy_context, dict)

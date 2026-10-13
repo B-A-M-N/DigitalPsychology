@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 class _Answer(Protocol):
     selected: str
     raw_confidence: float
     calibrated_confidence: Optional[float]
+    raw_probabilities: Any
+    calibrated_probabilities: Any
 class _Judgment(Protocol):
     def answer(self, question_id: str) -> Optional[_Answer]: ...
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ class SemanticAssessment:
     progress_confidence: float = 0.0
     statework_preference: str | None = None
     statework_confidence: float = 0.0
+    statework_support: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
         for name, choices in (
@@ -64,6 +67,23 @@ def assess_semantics(judgment: Optional[_Judgment]) -> SemanticAssessment:
                       else answer.raw_confidence)
         return answer.selected, float(confidence)
 
+    def support(question_id: str) -> tuple[tuple[str, float], ...]:
+        """Return the authentic option distribution for one question.
+
+        Preference ambiguity cannot be judged from a single selected label: the
+        runner-up mass is what distinguishes a decisive preference from a coin
+        flip. Calibrated probabilities are used when a calibration record
+        applies, otherwise raw model probabilities.
+        """
+        answer = judgment.answer(question_id)
+        if answer is None:
+            return ()
+        distribution = (answer.calibrated_probabilities
+                        if answer.calibrated_probabilities is not None
+                        else answer.raw_probabilities)
+        return tuple((str(item.label), float(item.probability))
+                     for item in distribution)
+
     action, action_conf = read("action_relation")
     progress, progress_conf = read("progress_relation")
     retry, retry_conf = read("retry_relation")
@@ -76,4 +96,6 @@ def assess_semantics(judgment: Optional[_Judgment]) -> SemanticAssessment:
         action, progress, retry, selected_drift, confidence,
         retry_confidence=retry_conf, goal_drift_confidence=drift_conf,
         action_confidence=action_conf, progress_confidence=progress_conf,
-        statework_preference=statework, statework_confidence=statework_conf)
+        statework_preference=statework, statework_confidence=statework_conf,
+        statework_support=support("route_preference"),
+    )

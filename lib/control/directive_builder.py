@@ -35,6 +35,7 @@ class DirectiveBuilder:
               applies_to_attention: Callable[[tuple[str, ...]], bool],
               semantic_statework_preference: str | None = None,
               semantic_statework_confidence: float = 0.0,
+              semantic_statework_support: tuple[tuple[str, float], ...] = (),
               experimental_route_preference: str | None = None,
               ) -> BehavioralDecision:
             selected_option = (candidate_pool.option_for(selection.candidate.candidate_id)
@@ -156,15 +157,17 @@ class DirectiveBuilder:
             )
 
             if experimental_route_preference is not None:
-                # Host-owned experimental assignment. Still restricted to the
-                # current CSW-eligible set and subject to the same lease
-                # capacity checks as a semantic route preference.
+                # Host-owned experimental assignment: an authorized forced
+                # treatment, not a model prediction. It is declared as such so
+                # provenance stays auditable and it cannot satisfy the model
+                # confidence gate by asserting a synthetic confidence value.
                 preference = rank_stateworks(
                     selected_candidate.cognitive_mode,
                     context.csw_snapshot.eligible_stateworks,
                     context.csw_snapshot.active_stateworks,
                     semantic_preference=experimental_route_preference,
                     semantic_confidence=1.0,
+                    provenance="host_experiment",
                     limit=1)
             elif (context.semantic_opportunity_question_id == "route_preference"
                     and semantic_statework_preference is not None):
@@ -174,6 +177,8 @@ class DirectiveBuilder:
                     context.csw_snapshot.active_stateworks,
                     semantic_preference=semantic_statework_preference,
                     semantic_confidence=semantic_statework_confidence,
+                    preference_support=semantic_statework_support or None,
+                    provenance="model_advisory",
                     limit=1)
             else:
                 preference = selected_candidate.statework_preferences[:1]
