@@ -22,9 +22,9 @@ description: >
 
 ## Agent Behavioral Science
 
-Digital Psychology governs the **meta-meta behavioral layer**: it analyzes
-observable behavior and decides how the runtime's cognitive configuration
-should adapt. It remains independent of CognitiveFrameWorks and
+Digital Psychology is the **external behavioral adaptation and evaluation
+layer**: it analyzes observable behavior and decides how the runtime's cognitive
+configuration should adapt. It remains independent of CognitiveFrameWorks and
 CognitiveStateWorks, and can study or manage agents using either, both, or
 neither.
 
