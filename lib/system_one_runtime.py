@@ -42,9 +42,9 @@ class SystemOneResult:
             "judgment": self.judgment.to_dict() if self.judgment is not None else None,
         }
         if self.inference_diagnostics is not None:
-            from .system_one_diagnostics import validate_laya_diagnostics
-            value["inference_diagnostics"] = validate_laya_diagnostics(
-                self.inference_diagnostics)
+            from .system_one_diagnostics import validate_inference_diagnostics
+            value["inference_diagnostics"] = validate_inference_diagnostics(
+                self.inference_diagnostics, self.judgment.backend_id)
         return value
 
 
@@ -333,6 +333,13 @@ class SystemOneRuntime:
             return SystemOneResult(
                 judgment, "shadow", calibrated_ids, cache_hit,
                 reason="laya_inference_coverage_unverified",
+                inference_diagnostics=inference_diagnostics)
+        if (mode == "advisory" and judgment.backend_id == "digitalpsychology-jev-openrouter"
+                and (not isinstance(inference_diagnostics, Mapping)
+                     or inference_diagnostics.get("advisory_eligible") is not True)):
+            return SystemOneResult(
+                judgment, "shadow", calibrated_ids, cache_hit,
+                reason="jev_not_task_calibrated",
                 inference_diagnostics=inference_diagnostics)
         if mode == "advisory" and not set(question_ids).issubset(calibrated_ids):
             return SystemOneResult(judgment, "shadow", calibrated_ids, cache_hit,

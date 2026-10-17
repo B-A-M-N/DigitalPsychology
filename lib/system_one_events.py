@@ -13,7 +13,7 @@ from .system_one_calibration import (
     validate_host_evaluator_receipt,
 )
 from .system_one_contracts import SystemOneFrame, SystemOneJudgment
-from .system_one_diagnostics import validate_laya_diagnostics
+from .system_one_diagnostics import validate_inference_diagnostics
 
 _HOST_BASELINE_VERSION = "deterministic-host-baseline/v2"
 _PROGRESS_BASELINES = {
@@ -158,8 +158,8 @@ def prepare_system_one_decision_event(
     }
     raw_diagnostics = raw_result.get("inference_diagnostics")
     if isinstance(raw_diagnostics, Mapping):
-        payload["system_one_inference_diagnostics"] = validate_laya_diagnostics(
-            raw_diagnostics)
+        payload["system_one_inference_diagnostics"] = validate_inference_diagnostics(
+            raw_diagnostics, judgment.backend_id)
     event_id = "dp-s1-" + hashlib.sha256(
         f"{identity.scope}|{judgment.request_id}".encode("utf-8")).hexdigest()[:40]
     event = Event(

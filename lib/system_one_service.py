@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .system_one_backends import (DisabledSystemOneBackend, LayaProvider,
                                  SemanticProvider, StatelessLoopbackHTTPBackend)
+from .system_one_jev import JevOpenRouterProvider, ProviderHealthError
 from .system_one_calibration import CalibrationBundle
 from .system_one_contracts import SystemOneFrame, SystemOneIdentity
 from .system_one_runtime import SystemOneResult, SystemOneRuntime
@@ -49,9 +50,68 @@ class SystemOneService:
     @classmethod
     def from_environment(cls) -> "SystemOneService":
         """Build a provider-neutral service; optional backends require explicit selection."""
+        providers_env = os.environ.get("DIGITALPSYCHOLOGY_SEMANTIC_PROVIDERS", "").strip()
         mode = os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_MODE", "disabled").strip()
+        if providers_env:
+            if os.environ.get("DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER", "").strip():
+                raise ValueError(
+                    "select either the legacy singular provider or the provider list")
+            provider_names = tuple(item.strip() for item in providers_env.split(",")
+                                   if item.strip())
+            if not provider_names or len(provider_names) != len(set(provider_names)):
+                raise ValueError(
+                    "DIGITALPSYCHOLOGY_SEMANTIC_PROVIDERS must be non-empty and unique")
+            if any(item not in {"disabled", "laya-native", "jev-openrouter"}
+                   for item in provider_names):
+                raise ValueError("unsupported DIGITALPSYCHOLOGY_SEMANTIC_PROVIDERS entry")
+            if len(provider_names) == 1:
+                if provider_names[0] != "disabled":
+                    os.environ["DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER"] = provider_names[0]
+                try:
+                    return cls.from_environment()
+                finally:
+                    if provider_names[0] != "disabled":
+                        os.environ.pop("DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER", None)
+            calibration_path = os.environ.get(
+                "DIGITALPSYCHOLOGY_SYSTEM_ONE_CALIBRATION_PATH", "")
+            calibration_bundle = CalibrationBundle(
+                json.loads(Path(calibration_path).read_text(encoding="utf-8"))
+                if calibration_path else {})
+            enabled = tuple(filter(None, os.environ.get(
+                "DIGITALPSYCHOLOGY_SYSTEM_ONE_QUESTIONS",
+                ",".join(QUESTION_REGISTRY)).split(",")))
+            if mode == "disabled":
+                raise ValueError("a portfolio requires an enabled System-1 mode")
+            if len(provider_names) < 2:
+                raise ValueError("a portfolio requires at least two providers")
+            runtimes = []
+            for name in provider_names:
+                if name == "disabled":
+                    raise ValueError("a disabled provider cannot join an enabled portfolio")
+                if name == "laya-native":
+                    backend = LayaProvider.from_environment()
+                elif name == "jev-openrouter":
+                    backend = JevOpenRouterProvider.from_environment(
+                        portfolio_explicit=True)
+                else:
+                    raise ValueError("unsupported portfolio provider")
+                runtimes.append(SystemOneRuntime(
+                    backend, calibrations=calibration_bundle,
+                    cache_size=int(os.environ.get(
+                        "DIGITALPSYCHOLOGY_SYSTEM_ONE_CACHE_SIZE", "128")),
+                    max_concurrent_requests=int(os.environ.get(
+                        "DIGITALPSYCHOLOGY_SYSTEM_ONE_MAX_CONCURRENCY", "4")),
+                    enabled_question_families=enabled))
+            from .system_one_portfolio import SystemOnePortfolio
+            service = cls(DisabledSystemOneBackend(), mode="disabled")
+            service.portfolio = SystemOnePortfolio(runtimes)
+            service.runtime = runtimes[0]
+            service.mode = mode
+            service.enabled_question_families = enabled
+            return service
         provider = os.environ.get("DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER", "disabled").strip()
-        if provider not in {"disabled", "laya-native", "loopback-http", "jev-http"}:
+        if provider not in {"disabled", "laya-native", "loopback-http", "jev-http",
+                            "jev-openrouter"}:
             raise ValueError("unsupported DIGITALPSYCHOLOGY_SEMANTIC_PROVIDER")
         if provider == "jev-http":
             warnings.warn(
@@ -65,6 +125,8 @@ class SystemOneService:
             mode = "disabled"
         elif provider == "laya-native":
             backend = LayaProvider.from_environment()
+        elif provider == "jev-openrouter":
+            backend = JevOpenRouterProvider.from_environment()
         else:
             required = {
                 "endpoint": os.environ.get("DIGITALPSYCHOLOGY_SYSTEM_ONE_ENDPOINT", ""),
@@ -122,6 +184,14 @@ class SystemOneService:
 
     def judge(self, frame: SystemOneFrame, *, mode: str | None = None) -> SystemOneResult:
         return self.runtime.judge(frame, mode=mode or self.mode)
+
+    def judge_portfolio(self, frames, *, observed_revision: int,
+                        mode: str | None = None) -> "SemanticDecisionBundle":
+        if not hasattr(self, "portfolio"):
+            raise ValueError("this service was not configured for a provider portfolio")
+        from .system_one_portfolio import SemanticDecisionBundle
+        return self.portfolio.evaluate(
+            frames, observed_revision=observed_revision, mode=mode or self.mode)
 
     def reset_identity(self, identity: SystemOneIdentity) -> None:
         self.runtime.reset_identity(identity)

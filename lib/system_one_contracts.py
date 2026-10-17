@@ -618,8 +618,9 @@ class SystemOneJudgment:
         if self.sequence < 1 or not self.answers or len(self.answers) > 8:
             raise ValueError("judgment sequence or answer count is invalid")
         if self.local_inference_diagnostics is not None:
-            from .system_one_diagnostics import validate_laya_diagnostics
-            validate_laya_diagnostics(self.local_inference_diagnostics)
+            from .system_one_diagnostics import validate_inference_diagnostics
+            validate_inference_diagnostics(self.local_inference_diagnostics,
+                                           self.backend_id)
         ids = [answer.question_id for answer in self.answers]
         if len(ids) != len(set(ids)):
             raise ValueError("judgment question answers must be unique")

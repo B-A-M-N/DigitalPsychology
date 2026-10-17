@@ -19,6 +19,10 @@ class SemanticQueryPlan:
     question_id: str | None
     reason: str
     value_of_information: float
+    provider_strategy: str = "none"
+    provider_reason: str = "provider selection was not requested"
+    provider_strategy: str = "none"
+    provider_reason: str = "provider selection was not requested"
 
     def __post_init__(self) -> None:
         if self.question_id is not None and self.question_id not in {
@@ -30,6 +34,13 @@ class SemanticQueryPlan:
         if (not isinstance(self.value_of_information, (int, float))
                 or not 0.0 <= float(self.value_of_information) <= 1.0):
             raise ValueError("semantic query value of information must be in [0, 1]")
+        if self.provider_strategy not in {"none", "jev", "laya", "dual"}:
+            raise ValueError("semantic query plan names an unsupported provider strategy")
+        if (not isinstance(self.provider_reason, str) or not self.provider_reason
+                or len(self.provider_reason) > 256):
+            raise ValueError("semantic provider reason must be bounded non-empty text")
+        if self.question_id is None and self.provider_strategy != "none":
+            raise ValueError("a skipped semantic query cannot select a provider")
         if self.question_id is None and self.value_of_information != 0:
             raise ValueError("a skipped semantic query must have zero value of information")
 
@@ -170,7 +181,8 @@ class SemanticQueryPlanner:
 
     @staticmethod
     def _skip(reason: str) -> SemanticQueryPlan:
-        return SemanticQueryPlan(None, reason[:256], 0.0)
+        return SemanticQueryPlan(None, reason[:256], 0.0,
+                                 provider_reason="no query was planned")
 
 
 __all__ = ["PolicyAmbiguity", "SemanticQueryPlan", "SemanticQueryPlanner"]
