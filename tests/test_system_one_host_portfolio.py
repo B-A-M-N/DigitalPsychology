@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -110,6 +111,136 @@ def _portfolio_service(tmp_path):
     return service, laya, jev
 
 
+
+def test_shadow_portfolio_records_both_but_selects_none(tmp_path):
+    service, laya, jev = _portfolio_service(tmp_path)
+    dp = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3",
+                                  system_one_service=service)
+    control = ControlPlaneService(decision_service=dp,
+                                  state_store=BehaviorStateStore(tmp_path / "behavior.sqlite3"))
+    identity = _identity("shadow-portfolio")
+    goals = _goal_set()
+    cfw = _CFWPort()
+    csw = _CSWPort()
+    csw.active = ("repair",)
+    # No semantic_remote_inference in policy context => shadow only.
+    bridge = HostControlBridge(
+        identity=identity, objective="Render the requested page",
+        objective_criteria=("criterion-visual",), initial_goal_set=goals,
+        cfw=CFWRuntimeAdapter(cfw), csw=csw,
+        client=InProcessControlClient(control, close_service=False),
+        host_policy_context={"deliverable_kind": "visual_ui"})
+    async def run():
+        try:
+            await bridge.open()
+            from dataclasses import replace
+            from lib.control_protocol import ControlTickRequest
+            prepared_request = ControlTickRequest(
+                control_session_id=identity.scope, tick_id="shadow-tick",
+                expected_behavior_revision=control.state_store.load(
+                    identity.scope).state.revision,
+                cfw_lifecycle_revision=bridge._current_cfw_revision(),
+                observation=replace(
+                    bridge._boundary_observation("post_action"),
+                    equivalent_retry_count=1, action_completed=True, action_index=1),
+                goal_set=goals, cfw_signals=bridge._cfw_signals(
+                    bridge._boundary_observation("post_action")),
+                csw_snapshot=csw.behavioral_snapshot(
+                    candidate_statework_ids=csw.available_statework_ids()),
+                boundary_kind="post_action",
+                boundary_sequence=bridge._boundary_sequence + 1)
+            prepared = control.prepare_control_tick(prepared_request.to_dict())
+            assert prepared["status"] == "prepared"
+            system_one = prepared["basis"].get("system_one") or {}
+            result = system_one.get("result", {})
+            assert result.get("portfolio") is True
+            assert result.get("selected_provider_id") is None
+            assert result.get("selection_reason") == "provider_not_selected"
+            # Remote denied: Jev is filtered out; only Laya is dispatched.
+            observations = result.get("observations", ())
+            assert len(observations) == 1
+            assert observations[0]["provider_id"] == "digitalpsychology-laya-native"
+            assert observations[0]["result"]["status"] == "shadow"
+            assert len(laya.calls) == 1
+            assert len(jev.calls) == 0
+            from tests.test_control_tick_noop import _commit_prepared
+            committed = _commit_prepared(
+                control, prepared, scope=identity.scope,
+                csw_snapshot=csw.behavioral_snapshot(
+                    candidate_statework_ids=csw.available_statework_ids()),
+                cfw_lifecycle_revision=prepared["candidate_behavior_state"]["revision"])
+            assert committed["status"] == "committed"
+            return
+        finally:
+            await bridge.close()
+    try:
+        asyncio.run(run())
+    finally:
+        dp.close()
+
+
+def test_remote_denied_jev_gets_zero_calls(tmp_path):
+    service, laya, jev = _portfolio_service(tmp_path)
+    # Track that Jev's transport never receives a call when remote is denied.
+    jev_calls_before = len(jev.calls)
+    dp = DigitalPsychologyService(event_db=tmp_path / "events.sqlite3",
+                                  system_one_service=service)
+    control = ControlPlaneService(decision_service=dp,
+                                  state_store=BehaviorStateStore(tmp_path / "behavior.sqlite3"))
+    identity = _identity("remote-denied")
+    goals = _goal_set()
+    cfw = _CFWPort()
+    csw = _CSWPort()
+    csw.active = ("repair",)
+    # semantic_remote_inference absent => default deny.
+    bridge = HostControlBridge(
+        identity=identity, objective="Render the requested page",
+        objective_criteria=("criterion-visual",), initial_goal_set=goals,
+        cfw=CFWRuntimeAdapter(cfw), csw=csw,
+        client=InProcessControlClient(control, close_service=False),
+        host_policy_context={"deliverable_kind": "visual_ui"})
+    async def run():
+        try:
+            await bridge.open()
+            from dataclasses import replace
+            from lib.control_protocol import ControlTickRequest
+            prepared_request = ControlTickRequest(
+                control_session_id=identity.scope, tick_id="deny-remote-tick",
+                expected_behavior_revision=control.state_store.load(
+                    identity.scope).state.revision,
+                cfw_lifecycle_revision=bridge._current_cfw_revision(),
+                observation=replace(
+                    bridge._boundary_observation("post_action"),
+                    equivalent_retry_count=1, action_completed=True, action_index=1),
+                goal_set=goals, cfw_signals=bridge._cfw_signals(
+                    bridge._boundary_observation("post_action")),
+                csw_snapshot=csw.behavioral_snapshot(
+                    candidate_statework_ids=csw.available_statework_ids()),
+                boundary_kind="post_action",
+                boundary_sequence=bridge._boundary_sequence + 1)
+            prepared = control.prepare_control_tick(prepared_request.to_dict())
+            assert prepared["status"] == "prepared"
+            system_one = prepared["basis"].get("system_one") or {}
+            result = system_one.get("result", {})
+            assert result.get("portfolio") is True
+            assert result.get("selected_provider_id") is None
+            # Jev received zero calls because remote inference was denied.
+            assert len(jev.calls) == jev_calls_before
+            from tests.test_control_tick_noop import _commit_prepared
+            committed = _commit_prepared(
+                control, prepared, scope=identity.scope,
+                csw_snapshot=csw.behavioral_snapshot(
+                    candidate_statework_ids=csw.available_statework_ids()),
+                cfw_lifecycle_revision=prepared["candidate_behavior_state"]["revision"])
+            assert committed["status"] == "committed"
+            return
+        finally:
+            await bridge.close()
+    try:
+        asyncio.run(run())
+    finally:
+        dp.close()
+
 def test_host_committed_portfolio_tick_records_both_observations(tmp_path):
     import asyncio
     service, laya, jev = _portfolio_service(tmp_path)
@@ -127,7 +258,8 @@ def test_host_committed_portfolio_tick_records_both_observations(tmp_path):
         objective_criteria=("criterion-visual",), initial_goal_set=goals,
         cfw=CFWRuntimeAdapter(cfw), csw=csw,
         client=InProcessControlClient(control, close_service=False),
-        host_policy_context={"deliverable_kind": "visual_ui"})
+        host_policy_context={"deliverable_kind": "visual_ui",
+                             "semantic_remote_inference": True})
     descriptor = bridge._descriptor()
     async def run():
         try:

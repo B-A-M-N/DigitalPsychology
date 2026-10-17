@@ -6,7 +6,50 @@ confidence into authorization and never averages independent probabilities.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Mapping
+
+
+@dataclass(frozen=True)
+class ProviderExecutionPlan:
+    """Host-owned authorization for which providers may be queried and heard."""
+
+    question_id: str
+    observation_providers: tuple[str, ...]
+    advisory_provider_id: str | None
+    strategy: str
+    selection_reason: str
+    remote_disclosure_permitted: bool
+    decision_basis_digest: str
+
+    def __post_init__(self) -> None:
+        if self.strategy not in {"none", "jev", "laya", "dual"}:
+            raise ValueError("unsupported semantic provider execution strategy")
+        if self.strategy == "none" and (self.advisory_provider_id is not None
+                                        or self.observation_providers):
+            raise ValueError("no-inference strategy must not dispatch any provider")
+        if self.strategy == "dual" and len(self.observation_providers) != 2:
+            raise ValueError("dual strategy requires exactly two observation providers")
+        if self.strategy == "dual" and self.advisory_provider_id is None:
+            raise ValueError("dual strategy must select one advisory provider")
+        if self.strategy == "jev":
+            if self.advisory_provider_id not in {"digitalpsychology-jev-openrouter", None}:
+                raise ValueError("Jev execution plan selected an unsupported provider")
+            if not self.remote_disclosure_permitted:
+                raise ValueError("Jev execution plan requires remote disclosure")
+        if self.strategy == "laya" and self.advisory_provider_id not in {
+                "digitalpsychology-laya-native", None}:
+            raise ValueError("Laya execution plan selected an unsupported provider")
+        if self.strategy != "none" and self.advisory_provider_id is not None:
+            if self.advisory_provider_id not in self.observation_providers:
+                raise ValueError("advisory provider must be in the observation set")
+        if len(self.selection_reason) > 256 or not self.selection_reason:
+            raise ValueError("semantic execution plan reason must be bounded non-empty text")
+        if (not isinstance(self.decision_basis_digest, str)
+                or len(self.decision_basis_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.decision_basis_digest)):
+            raise ValueError("semantic execution plan decision basis digest is invalid")
 
 
 @dataclass(frozen=True)
@@ -95,4 +138,4 @@ class SemanticProviderSelector:
         return self._qualification.get(provider) == "qualified"
 
 
-__all__ = ["SemanticProviderPlan", "SemanticProviderSelector"]
+__all__ = ["ProviderExecutionPlan", "SemanticProviderPlan", "SemanticProviderSelector"]

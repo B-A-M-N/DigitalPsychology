@@ -241,32 +241,37 @@ class SystemOneService:
     def reset_identity(self, identity: SystemOneIdentity) -> None:
         if hasattr(self, "portfolio"):
             failures = []
+            errors = []
             for runtime in self.runtimes:
                 try:
                     runtime.reset_identity(identity)
                 except Exception as exc:
                     failures.append(f"{runtime.backend_id}: {exc}")
+                    errors.append(exc)
             if failures:
-                raise RuntimeError("; ".join(failures)) from failures[0]
+                raise RuntimeError("; ".join(failures)) from errors[0]
         else:
             self.runtime.reset_identity(identity)
 
     def resync(self, frame: SystemOneFrame) -> None:
         if hasattr(self, "portfolio"):
             failures = []
+            errors = []
             for runtime in self.runtimes:
                 try:
                     runtime.resync(frame)
                 except Exception as exc:
                     failures.append(f"{runtime.backend_id}: {exc}")
+                    errors.append(exc)
             if failures:
-                raise RuntimeError("; ".join(failures)) from failures[0]
+                raise RuntimeError("; ".join(failures)) from errors[0]
         else:
             self.runtime.resync(frame)
 
     def close(self) -> None:
         if hasattr(self, "portfolio"):
             failures = []
+            errors = []
             for runtime in self.runtimes:
                 close = getattr(runtime.backend, "close", None)
                 try:
@@ -274,8 +279,9 @@ class SystemOneService:
                         close()
                 except Exception as exc:
                     failures.append(f"{runtime.backend_id}: {exc}")
+                    errors.append(exc)
             if failures:
-                raise RuntimeError("; ".join(failures)) from failures[0]
+                raise RuntimeError("; ".join(failures)) from errors[0]
         else:
             close = getattr(self.runtime.backend, "close", None)
             if callable(close):

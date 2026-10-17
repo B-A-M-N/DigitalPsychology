@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
+import json
 import time
 from typing import Any, Mapping
 
@@ -15,6 +17,7 @@ from ..outcomes import (HostOutcomeFact, InterventionEvaluationFrame,
 from ..runtime.contracts import RuntimeIdentity
 from ..runtime.store import RuntimeStateRecord
 from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
+from ..system_one_provider_selection import SemanticProviderSelector
 from .semantic_influence import SemanticInfluenceReceipt, compare_semantic_selection
 from ..control_protocol import (ACTION_INDEX_BOUNDARIES,
                                 CANDIDATE_ACTION_BOUNDARIES,
@@ -70,6 +73,50 @@ class ControlDecisionEngine:
                  system_one_frame_factory: Any = None) -> None:
         self.decision_service = decision_service
         self.system_one_frame_factory = system_one_frame_factory
+        self._provider_selector = None
+
+    def _get_selector(self):
+        """Build or reuse the host-owned semantic provider selector."""
+        if self._provider_selector is None:
+            policy_context = getattr(
+                getattr(self.decision_service, "_system_one_service", None)
+                or type("Empty", (), {})(), "policy_context", None)
+            # Read selector config from the decision service's system-one service.
+            service = getattr(self.decision_service, "_system_one_service", None)
+            mode = getattr(service, "mode", "disabled") if service else "disabled"
+            if mode == "disabled":
+                self._provider_selector = SemanticProviderSelector(
+                    default_provider="laya", qualification={})
+            else:
+                # Check which providers are configured and qualified.
+                qualification = {}
+                runtimes = getattr(service, "runtimes", None)
+                if runtimes:
+                    # Portfolio: inspect each runtime's backend.
+                    for runtime in runtimes:
+                        backend_id = getattr(runtime, "backend_id", "")
+                        if "laya" in backend_id:
+                            qualification["laya"] = "qualified" if getattr(
+                                runtime, "calibration_hash", "") else "unqualified"
+                        elif "jev" in backend_id:
+                            qualification["jev"] = "qualified" if getattr(
+                                runtime, "calibration_hash", "") else "unqualified"
+                else:
+                    backend_id = getattr(getattr(service, "runtime", None),
+                                         "backend_id", "")
+                    if "laya" in backend_id:
+                        qualification["laya"] = "qualified" if getattr(
+                            getattr(service, "runtime", None),
+                            "calibration_hash", "") else "unqualified"
+                    elif "jev" in backend_id:
+                        qualification["jev"] = "qualified" if getattr(
+                            getattr(service, "runtime", None),
+                            "calibration_hash", "") else "unqualified"
+                default = "jev" if "jev" in qualification and qualification.get(
+                    "jev") == "qualified" else "laya"
+                self._provider_selector = SemanticProviderSelector(
+                    default_provider=default, qualification=qualification)
+        return self._provider_selector
 
     def prepare(self, descriptor: ControlSessionDescriptor,
                 record: RuntimeStateRecord,
@@ -168,7 +215,55 @@ class ControlDecisionEngine:
                         identity).to_dict():
                     raise ValueError("System-1 frame identity escapes the control session")
                 system_one_query_attempted = True
+
+                # Host-owned provider selection: determine which providers may
+                # be dispatched and which, if any, may influence DP behavior.
+                remote_permitted = bool(policy_context.get(
+                    "semantic_remote_inference", False))
+                selector = self._get_selector()
+                decision_basis_digest = hashlib.sha256(
+                    json.dumps(first_frame.canonical_payload(), sort_keys=True,
+                               separators=(",", ":"), ensure_ascii=False).encode(
+                                   "utf-8")).hexdigest()
                 if isinstance(frame, tuple):
+                    provider_ids = tuple(item.backend_id for item in frame)
+                    laya_id = "digitalpsychology-laya-native"
+                    jev_id = "digitalpsychology-jev-openrouter"
+                    # Dispatch all configured providers as observations.
+                    # The selector only controls advisory influence, not dispatch.
+                    service_mode = getattr(
+                        getattr(self.decision_service, "_system_one_service", None),
+                        "mode", "disabled")
+                    if service_mode == "shadow":
+                        # In shadow mode, dispatch all configured providers for
+                        # observation. No provider can influence DP behavior.
+                        plan = selector.select(
+                            query_planned=True, remote_suitable=remote_permitted,
+                            local_only_data=False, explicit_dual_trial=False,
+                            laya_available=laya_id in provider_ids,
+                            jev_available=jev_id in provider_ids,
+                            authorized_providers=set())
+                        selected_id = None
+                        selection_reason = "provider_not_selected"
+                    else:
+                        plan = selector.select(
+                            query_planned=True, remote_suitable=remote_permitted,
+                            local_only_data=False,
+                            explicit_dual_trial=(
+                                laya_id in provider_ids and jev_id in provider_ids
+                                and remote_permitted),
+                            laya_available=laya_id in provider_ids,
+                            jev_available=jev_id in provider_ids,
+                            authorized_providers=(
+                                {"laya"} if not remote_permitted else {"laya", "jev"}))
+                        selected_id = plan.selected_provider_id
+                        selection_reason = plan.reason
+                    # Enforce remote authorization: filter Jev frames when denied.
+                    if not remote_permitted:
+                        frame = tuple(item for item in frame
+                                      if item.backend_id != jev_id)
+                    # Keep remaining frames for portfolio observation; the selector
+                    # only determines which result can become advisory.
                     system_one_frame = {
                         item.backend_id: item.canonical_payload() for item in frame}
                     started = time.perf_counter()
@@ -176,6 +271,8 @@ class ControlDecisionEngine:
                         bundle = self.decision_service.judge_portfolio(
                             frame, observed_revision=record.state.revision,
                             mode=None,
+                            selected_provider_id=selected_id,
+                            selection_reason=selection_reason,
                             current_decision_revision=record.state.revision)
                     except Exception as exc:
                         system_one_result = {
@@ -207,7 +304,7 @@ class ControlDecisionEngine:
                             for observation in bundle.observations)
                         selected = bundle.selected_result
                         judgment = (selected.judgment if selected is not None
-                                    and selected.result.status == "ok" else None)
+                                    and selected.status == "ok" else None)
                 else:
                     started = time.perf_counter()
                     try:
