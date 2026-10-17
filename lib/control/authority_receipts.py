@@ -47,7 +47,10 @@ def validate_applied_authorities(decision: BehavioralDecision,
     expected_active = expected_csw_active_stateworks(
         basis, [item.to_dict() for item in decision.directives], retained)
     if set(request.csw_snapshot.active_stateworks) != expected_active:
-        raise ValueError("CSW post-application state does not match DP requests")
+        raise ValueError(
+            "CSW post-application state does not match DP requests: "
+            f"actual={sorted(request.csw_snapshot.active_stateworks)} "
+            f"expected={sorted(expected_active)}")
     expected_revision = int(basis["csw_selection_revision"]) + csw_changes
     if request.csw_snapshot.revision != expected_revision:
         raise RuntimeError("CSW selection revision changed during control application")

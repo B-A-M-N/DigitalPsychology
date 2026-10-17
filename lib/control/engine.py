@@ -175,9 +175,9 @@ class ControlDecisionEngine:
                     try:
                         bundle = self.decision_service.judge_portfolio(
                             frame, observed_revision=record.state.revision,
-                            mode=self.decision_service.mode,
+                            mode=None,
                             current_decision_revision=record.state.revision)
-                    except Exception:
+                    except Exception as exc:
                         system_one_result = {
                             "status": "unavailable", "reason": "provider_exception",
                             "latency_ms": max(0.0, (time.perf_counter() - started) * 1000.0),
@@ -212,7 +212,7 @@ class ControlDecisionEngine:
                     started = time.perf_counter()
                     try:
                         judgment_result = self.decision_service.judge(frame)
-                    except Exception:
+                    except Exception as exc:
                         system_one_result = {
                             "status": "unavailable", "reason": "provider_exception",
                             "latency_ms": max(0.0, (time.perf_counter() - started) * 1000.0),

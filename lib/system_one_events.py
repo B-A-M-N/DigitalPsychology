@@ -153,7 +153,8 @@ def _observation_payload(frame: Any, judgment: Any, *, status: str,
 def _observation_event(identity: Any, frame: Any, judgment: Any,
                        payload: Mapping[str, Any]) -> dict[str, Any]:
     event_id = "dp-s1-" + hashlib.sha256(
-        f"{identity.scope}|{judgment.request_id}".encode("utf-8")).hexdigest()[:40]
+        f"{identity.scope}|{judgment.request_id}|{judgment.backend_id}".encode("utf-8")
+    ).hexdigest()[:40]
     event = Event(
         event_id=event_id,
         timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -184,7 +185,7 @@ def _observation_event(identity: Any, frame: Any, judgment: Any,
 
 
 def prepare_system_one_decision_event(
-        descriptor: Any, basis: Mapping[str, Any]) -> dict[str, Any] | None:
+        descriptor: Any, basis: Mapping[str, Any]) -> dict[str, Any] | list[dict[str, Any]] | None:
     """Build durable events for each valid provider judgment in a committed tick."""
     system_one = basis.get("system_one")
     if not isinstance(system_one, Mapping):
@@ -222,7 +223,9 @@ def prepare_system_one_decision_event(
                     validate_inference_diagnostics(
                         raw_diagnostics, judgment.backend_id))
             events.append(_observation_event(descriptor.identity, frame, judgment, payload))
-        return events[0] if events else None
+        if len(events) == 1:
+            return events[0]
+        return events if events else None
     parsed = _system_one_observation(raw_frame, raw_result)
     if parsed is None:
         return None

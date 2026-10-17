@@ -88,6 +88,21 @@ class DigitalPsychologyService:
             raise RuntimeError("System-1 service is not configured")
         return self._system_one_service.judge(frame, mode=mode)
 
+    def judge_portfolio(self, frames, *, observed_revision: int,
+                        mode: str | None = None,
+                        selected_provider_id: str | None = None,
+                        selection_reason: str = "provider_not_selected",
+                        current_decision_revision: int | None = None):
+        if self._system_one_service is None:
+            raise RuntimeError("System-1 service is not configured")
+        if not callable(getattr(self._system_one_service, "judge_portfolio", None)):
+            raise RuntimeError("System-1 service does not support a portfolio")
+        return self._system_one_service.judge_portfolio(
+            frames, observed_revision=observed_revision, mode=mode,
+            selected_provider_id=selected_provider_id,
+            selection_reason=selection_reason,
+            current_decision_revision=current_decision_revision)
+
     def control_system_one_frame_factory(self):
         """Plan host semantic opportunities; build frames only when enabled."""
         from .control.system_one import create_system_one_frame_factory

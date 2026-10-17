@@ -59,7 +59,13 @@ class SystemOnePortfolio:
     def _common_decision_basis(frame: SystemOneFrame) -> tuple[object, ...]:
         return (frame.identity.to_dict(), frame.request_id, frame.sequence,
                 frame.state_digest, frame.question_bundle_digest,
-                frame.request_digest, frame.policy_hash, frame.question_ids)
+                frame.request_digest, frame.policy_hash, frame.question_ids,
+                frame.protocol_version, frame.protocol_hash)
+
+    @staticmethod
+    def _provider_identity(frame: SystemOneFrame) -> tuple[object, ...]:
+        return (frame.backend_id, frame.model_id, frame.model_revision,
+                frame.model_content_hash, frame.provider_protocol_hash)
 
     def _validate_common_decision(self, frames: Mapping[str, SystemOneFrame]) -> None:
         if not frames:
@@ -69,6 +75,10 @@ class SystemOnePortfolio:
                 raise PortfolioDecisionMismatch(
                     "provider frame is not keyed by its own backend ID")
         reference = self._common_decision_basis(next(iter(frames.values())))
+        identities = {self._provider_identity(frame) for frame in frames.values()}
+        if len(identities) != len(frames):
+            raise PortfolioDecisionMismatch(
+                "portfolio frames do not have provider-specific identities")
         for provider_id, frame in frames.items():
             if self._common_decision_basis(frame) != reference:
                 raise PortfolioDecisionMismatch(

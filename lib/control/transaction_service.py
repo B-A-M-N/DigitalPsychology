@@ -677,7 +677,10 @@ class ControlTransactionMethods:
         if callable(prepare_system_one_event):
             system_one_event = prepare_system_one_event(descriptor, basis)
             if system_one_event is not None:
-                event_values.append(system_one_event)
+                if isinstance(system_one_event, list):
+                    event_values.extend(system_one_event)
+                else:
+                    event_values.append(system_one_event)
         result = {
             "protocol_version": PROTOCOL_VERSION,
             "control_session_id": scope,

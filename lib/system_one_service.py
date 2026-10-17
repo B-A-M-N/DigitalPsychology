@@ -226,6 +226,8 @@ class SystemOneService:
         if not hasattr(self, "portfolio"):
             raise ValueError("this service was not configured for a provider portfolio")
         from .system_one_portfolio import SemanticDecisionBundle
+        if isinstance(frames, tuple):
+            frames = {item.backend_id: item for item in frames}
         return self.portfolio.evaluate(
             frames, observed_revision=observed_revision, mode=mode or self.mode,
             selected_provider_id=selected_provider_id,

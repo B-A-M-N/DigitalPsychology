@@ -110,15 +110,16 @@ def create_system_one_frame_factory(system_one_service: Any):
                  and bool(getattr(system_one_service, "is_portfolio", False)))
     provider_enabled = (system_one_service is not None
                         and getattr(system_one_service, "mode", "disabled") != "disabled")
-    capabilities = (getattr(system_one_service, "portfolio", None).runtimes
-                    and [runtime.capability() for runtime in
-                         system_one_service.portfolio.runtimes]
-                    if portfolio and provider_enabled else None)
+    capabilities = None
+    if portfolio and provider_enabled:
+        portfolio_object = getattr(system_one_service, "portfolio", None)
+        capabilities = [runtime.capability() for runtime in
+                        getattr(portfolio_object, "runtimes", ())]
     capability = (system_one_service.capability() if provider_enabled
                   and not portfolio else None)
     def field(name: str):
         if capabilities is not None:
-            return [getattr(item, name) if hasattr(item, name)
+            return [getattr(item, name) if item is not None and hasattr(item, name)
                     else item[name] for item in capabilities]
         if capability is None:
             return "disabled"
@@ -126,10 +127,12 @@ def create_system_one_frame_factory(system_one_service: Any):
                 else capability[name])
     enabled = (set(system_one_service.enabled_question_families)
                if provider_enabled else set())
-    supported = set(field("supported_question_families")) if provider_enabled else set()
     supported = ({family for item in capabilities
-                  for family in item.supported_question_families}
-                 if capabilities is not None else supported)
+                  for family in (item.supported_question_families
+                                 if hasattr(item, "supported_question_families")
+                                 else item["supported_question_families"])}
+                 if capabilities is not None else
+                 set(field("supported_question_families")) if provider_enabled else set())
     effective_enabled_questions = sorted(enabled & supported)
     available_questions = tuple(item for item in (
         "action_relation", "progress_relation", "retry_relation", "goal_drift",
@@ -140,7 +143,8 @@ def create_system_one_frame_factory(system_one_service: Any):
         capability.to_dict() if callable(getattr(capability, "to_dict", None))
         else dict(capability))
     if capabilities is not None:
-        capability_payload = [item.to_dict() for item in capabilities]
+        capability_payload = [item.to_dict() if hasattr(item, "to_dict") else item
+                              for item in capabilities]
     query_planner = SemanticQueryPlanner()
     candidate_generator = BehaviorCandidateGenerator()
     def build(identity: RuntimeIdentity, objective: str,

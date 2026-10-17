@@ -472,7 +472,22 @@ class JevOpenRouterProvider:
         if not self._slots.acquire(timeout=self.timeout_ms / 1000.0):
             raise ProviderHealthError("Jev provider concurrency limit reached")
         try:
-            raw = self.transport(request, self.timeout_ms / 1000.0)
+            try:
+                raw = self.transport(request, self.timeout_ms / 1000.0)
+            except HTTPError as exc:
+                if exc.code == 429:
+                    raise JevThrottledError(
+                        f"OpenRouter throttled Jev; retry-after="
+                        f"{(exc.headers.get('Retry-After') if exc.headers else 'unknown')}") from exc
+                if exc.code == 402:
+                    raise JevQuotaExceededError("OpenRouter Jev quota is exhausted") from exc
+                if exc.code == 401 or exc.code == 403:
+                    raise ProviderContractError(
+                        "OpenRouter rejected Jev credentials") from exc
+                if exc.code >= 500:
+                    raise ProviderHealthError(
+                        "OpenRouter Jev provider is unavailable") from exc
+                raise
         finally:
             self._slots.release()
         elapsed_ms = (time.monotonic() - started) * 1000.0
