@@ -152,48 +152,96 @@ class ControlDecisionEngine:
             if isinstance(planned_question, str) and planned_question:
                 system_one_query_opportunity = True
                 system_one_opportunity_question_id = planned_question
-            if frame is not None and not isinstance(frame, SystemOneFrame):
+            if frame is not None and not (
+                    isinstance(frame, SystemOneFrame)
+                    or (isinstance(frame, tuple) and frame
+                        and all(isinstance(item, SystemOneFrame)
+                                for item in frame))):
                 raise TypeError("System-1 frame factory must return a validated frame")
             if frame is not None:
-                if not system_one_query_opportunity and frame.questions:
+                first_frame = frame[0] if isinstance(frame, tuple) else frame
+                if not system_one_query_opportunity and first_frame.questions:
                     system_one_query_opportunity = True
-                    system_one_opportunity_question_id = frame.questions[0].question_id
-                if frame.identity.to_dict() != self._system_one_identity(identity).to_dict():
+                    system_one_opportunity_question_id = (
+                        first_frame.questions[0].question_id)
+                if first_frame.identity.to_dict() != self._system_one_identity(
+                        identity).to_dict():
                     raise ValueError("System-1 frame identity escapes the control session")
                 system_one_query_attempted = True
-                system_one_frame = frame.canonical_payload()
-                started = time.perf_counter()
-                try:
-                    judgment_result = self.decision_service.judge(frame)
-                except Exception:
-                    system_one_result = {
-                        "status": "unavailable", "reason": "provider_exception",
-                        "latency_ms": max(0.0, (time.perf_counter() - started) * 1000.0),
-                    }
-                    system_one_query_failed = True
-                else:
-                    latency_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
-                    if hasattr(judgment_result, "judgment"):
-                        # Only calibrated/advisory output may influence executive
-                        # selection. Shadow results remain in the trusted audit basis.
-                        serialize = getattr(judgment_result, "to_dict", None)
-                        if callable(serialize):
-                            serialized = serialize()
-                            if isinstance(serialized, Mapping):
-                                system_one_result = {**dict(serialized),
-                                                     "latency_ms": latency_ms}
-                        system_one_judgment_returned = (
-                            getattr(judgment_result, "judgment", None) is not None)
-                        system_one_query_failed = getattr(
-                            judgment_result, "status", None) in {
-                                "unavailable", "rejected", "stale"}
-                        judgment = (judgment_result.judgment
-                                    if getattr(judgment_result, "status", None) == "ok"
-                                    else None)
+                if isinstance(frame, tuple):
+                    system_one_frame = {
+                        item.backend_id: item.canonical_payload() for item in frame}
+                    started = time.perf_counter()
+                    try:
+                        bundle = self.decision_service.judge_portfolio(
+                            frame, observed_revision=record.state.revision,
+                            mode=self.decision_service.mode,
+                            current_decision_revision=record.state.revision)
+                    except Exception:
+                        system_one_result = {
+                            "status": "unavailable", "reason": "provider_exception",
+                            "latency_ms": max(0.0, (time.perf_counter() - started) * 1000.0),
+                        }
+                        system_one_query_failed = True
                     else:
-                        judgment = judgment_result
-                        system_one_judgment_returned = judgment_result is not None
-                        system_one_query_failed = judgment_result is None
+                        latency_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+                        system_one_result = {
+                            "portfolio": True,
+                            "decision_basis_digest": bundle.decision_basis_digest,
+                            "question_id": bundle.question_id,
+                            "selected_provider_id": bundle.selected_provider_id,
+                            "selection_reason": bundle.selection_reason,
+                            "observations": [
+                                {"provider_id": observation.provider_id,
+                                 "result": observation.result.to_dict(),
+                                 "elapsed_ms": observation.elapsed_ms}
+                                for observation in bundle.observations],
+                            "latency_ms": latency_ms,
+                        }
+                        system_one_judgment_returned = any(
+                            observation.result.judgment is not None
+                            for observation in bundle.observations)
+                        system_one_query_failed = any(
+                            observation.result.status in {
+                                "unavailable", "rejected", "stale"}
+                            for observation in bundle.observations)
+                        selected = bundle.selected_result
+                        judgment = (selected.judgment if selected is not None
+                                    and selected.result.status == "ok" else None)
+                else:
+                    started = time.perf_counter()
+                    try:
+                        judgment_result = self.decision_service.judge(frame)
+                    except Exception:
+                        system_one_result = {
+                            "status": "unavailable", "reason": "provider_exception",
+                            "latency_ms": max(0.0, (time.perf_counter() - started) * 1000.0),
+                        }
+                        system_one_query_failed = True
+                    else:
+                        latency_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+                        system_one_frame = frame.canonical_payload()
+                        if hasattr(judgment_result, "judgment"):
+                            # Only calibrated/advisory output may influence executive
+                            # selection. Shadow results remain in the trusted audit basis.
+                            serialize = getattr(judgment_result, "to_dict", None)
+                            if callable(serialize):
+                                serialized = serialize()
+                                if isinstance(serialized, Mapping):
+                                    system_one_result = {**dict(serialized),
+                                                         "latency_ms": latency_ms}
+                            system_one_judgment_returned = (
+                                getattr(judgment_result, "judgment", None) is not None)
+                            system_one_query_failed = getattr(
+                                judgment_result, "status", None) in {
+                                    "unavailable", "rejected", "stale"}
+                            judgment = (judgment_result.judgment
+                                        if getattr(judgment_result, "status", None) == "ok"
+                                        else None)
+                        else:
+                            judgment = judgment_result
+                            system_one_judgment_returned = judgment_result is not None
+                            system_one_query_failed = judgment_result is None
 
         assessments = (self._assess_interventions(
             descriptor, record, request, goal_set, attention.last_seen)

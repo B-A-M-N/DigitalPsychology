@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Mapping, Sequence
 
 from ..behavior_state import (BehaviorState, CSWBehaviorSnapshot,
@@ -104,11 +105,21 @@ def _deliverable_kind(policy_context: Mapping[str, Any], *,
 
 
 def create_system_one_frame_factory(system_one_service: Any):
-    """Return host query planning plus an optional pinned-provider frame factory."""
+    """Return host query planning plus optional pinned-provider frame factories."""
+    portfolio = (system_one_service is not None
+                 and bool(getattr(system_one_service, "is_portfolio", False)))
     provider_enabled = (system_one_service is not None
                         and getattr(system_one_service, "mode", "disabled") != "disabled")
-    capability = system_one_service.capability() if provider_enabled else None
+    capabilities = (getattr(system_one_service, "portfolio", None).runtimes
+                    and [runtime.capability() for runtime in
+                         system_one_service.portfolio.runtimes]
+                    if portfolio and provider_enabled else None)
+    capability = (system_one_service.capability() if provider_enabled
+                  and not portfolio else None)
     def field(name: str):
+        if capabilities is not None:
+            return [getattr(item, name) if hasattr(item, name)
+                    else item[name] for item in capabilities]
         if capability is None:
             return "disabled"
         return (getattr(capability, name) if hasattr(capability, name)
@@ -116,6 +127,9 @@ def create_system_one_frame_factory(system_one_service: Any):
     enabled = (set(system_one_service.enabled_question_families)
                if provider_enabled else set())
     supported = set(field("supported_question_families")) if provider_enabled else set()
+    supported = ({family for item in capabilities
+                  for family in item.supported_question_families}
+                 if capabilities is not None else supported)
     effective_enabled_questions = sorted(enabled & supported)
     available_questions = tuple(item for item in (
         "action_relation", "progress_relation", "retry_relation", "goal_drift",
@@ -125,6 +139,8 @@ def create_system_one_frame_factory(system_one_service: Any):
         None if capability is None else
         capability.to_dict() if callable(getattr(capability, "to_dict", None))
         else dict(capability))
+    if capabilities is not None:
+        capability_payload = [item.to_dict() for item in capabilities]
     query_planner = SemanticQueryPlanner()
     candidate_generator = BehaviorCandidateGenerator()
     def build(identity: RuntimeIdentity, objective: str,
@@ -449,30 +465,50 @@ def create_system_one_frame_factory(system_one_service: Any):
             "question_bundle_digest": question_digest,
             "policy_hash": policy_hash,
         })
-        return SystemOneFrame(
-            identity=system_identity,
-            request_id=request_id,
-            sequence=sequence,
-            state_digest=state_digest,
-            question_bundle_digest=question_digest,
-            request_digest=request_digest,
-            policy_hash=policy_hash,
-            backend_id=field("backend_id"),
-            model_id=field("model_id"),
-            model_revision=field("model_revision"),
-            model_content_hash=field("model_content_hash"),
-            provider_protocol_hash=field("provider_protocol_hash"),
-            calibration_bundle_hash=system_one_service.calibration_bundle_hash,
-            state=semantic_state,
-            questions=questions,
-        )
+        provider_count = 1 if not isinstance(field("backend_id"), list) else len(
+            field("backend_id"))
+        frames = []
+        for provider_index in range(provider_count):
+            backend_id = (field("backend_id") if provider_count == 1
+                          else field("backend_id")[provider_index])
+            model_id = (field("model_id") if provider_count == 1
+                        else field("model_id")[provider_index])
+            model_revision = (field("model_revision") if provider_count == 1
+                              else field("model_revision")[provider_index])
+            model_content_hash = (field("model_content_hash") if provider_count == 1
+                                  else field("model_content_hash")[provider_index])
+            provider_protocol_hash = (field("provider_protocol_hash") if provider_count == 1
+                                      else field("provider_protocol_hash")[provider_index])
+            frames.append(SystemOneFrame(
+                identity=system_identity,
+                request_id=request_id,
+                sequence=sequence,
+                state_digest=state_digest,
+                question_bundle_digest=question_digest,
+                request_digest=request_digest,
+                policy_hash=policy_hash,
+                backend_id=backend_id,
+                model_id=model_id,
+                model_revision=model_revision,
+                model_content_hash=model_content_hash,
+                provider_protocol_hash=provider_protocol_hash,
+                calibration_bundle_hash=system_one_service.calibration_bundle_hash,
+                state=semantic_state,
+                questions=questions,
+            ))
+        return frames[0] if provider_count == 1 else tuple(frames)
 
     attestation = {
-        "backend_id": str(field("backend_id")),
-        "model_id": str(field("model_id")),
-        "model_revision": str(field("model_revision")),
-        "model_content_hash": str(field("model_content_hash")),
-        "provider_protocol_hash": str(field("provider_protocol_hash")),
+        "backend_id": (str(field("backend_id")) if provider_enabled and not portfolio
+                       else json.dumps([str(item) for item in field("backend_id")])),
+        "model_id": (str(field("model_id")) if provider_enabled and not portfolio
+                     else json.dumps([str(item) for item in field("model_id")])),
+        "model_revision": (str(field("model_revision")) if provider_enabled and not portfolio
+                           else json.dumps([str(item) for item in field("model_revision")])),
+        "model_content_hash": (str(field("model_content_hash")) if provider_enabled and not portfolio
+                               else json.dumps([str(item) for item in field("model_content_hash")])),
+        "provider_protocol_hash": (str(field("provider_protocol_hash")) if provider_enabled and not portfolio
+                                   else json.dumps([str(item) for item in field("provider_protocol_hash")])),
         "calibration_bundle_hash": str(
             getattr(system_one_service, "calibration_bundle_hash", "")),
         "enabled_question_families": effective_enabled_questions,

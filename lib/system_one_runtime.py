@@ -335,11 +335,15 @@ class SystemOneRuntime:
                 reason="laya_inference_coverage_unverified",
                 inference_diagnostics=inference_diagnostics)
         if (mode == "advisory" and judgment.backend_id == "digitalpsychology-jev-openrouter"
-                and (not isinstance(inference_diagnostics, Mapping)
-                     or inference_diagnostics.get("advisory_eligible") is not True)):
+                and not set(question_ids).issubset(calibrated_ids)):
+            reason = ("jev_unrecognized_served_snapshot"
+                      if (not isinstance(inference_diagnostics, Mapping)
+                          or inference_diagnostics.get("served_model")
+                          not in {"typesafe/jev-1.13-20260917",
+                                  "typesafe/jev-1.14-20261014"})
+                      else "jev_not_task_calibrated")
             return SystemOneResult(
-                judgment, "shadow", calibrated_ids, cache_hit,
-                reason="jev_not_task_calibrated",
+                judgment, "shadow", calibrated_ids, cache_hit, reason=reason,
                 inference_diagnostics=inference_diagnostics)
         if mode == "advisory" and not set(question_ids).issubset(calibrated_ids):
             return SystemOneResult(judgment, "shadow", calibrated_ids, cache_hit,

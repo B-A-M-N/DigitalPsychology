@@ -11,7 +11,7 @@ PROJECTION_SCHEMA = "laya-semantic-projection/v3"
 SUPPORTED_PROJECTION_SCHEMAS = frozenset({
     "laya-semantic-projection/v2", PROJECTION_SCHEMA,
 })
-JEV_PROJECTION_SCHEMA = "jev-minimal-semantic-projection/v1"
+JEV_PROJECTION_SCHEMA = "jev-family-semantic-projection/v2"
 _QUESTION_IDS = frozenset({
     "action_relation", "progress_relation", "retry_relation", "goal_drift",
     "route_preference",
@@ -109,7 +109,8 @@ def validate_jev_diagnostics(value: Any) -> dict[str, Any]:
     """Validate and copy the closed, bounded Jev diagnostics wire shape."""
     fields = {
         "schema_version", "projection_schema", "projection_digest",
-        "projection_bytes", "latency_ms", "provider_revision", "advisory_eligible",
+        "projection_bytes", "latency_ms", "provider_revision", "served_model",
+        "requested_model", "advisory_eligible",
     }
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("Jev inference diagnostics are malformed")
@@ -123,6 +124,11 @@ def validate_jev_diagnostics(value: Any) -> dict[str, Any]:
     if (not isinstance(revision, str) or not revision.strip()
             or len(revision) > 256):
         raise ValueError("Jev provider revision is malformed")
+    for name in ("served_model", "requested_model"):
+        identity = value[name]
+        if (not isinstance(identity, str) or not identity.strip()
+                or len(identity) > 256):
+            raise ValueError(f"Jev {name} is malformed")
     if type(value["advisory_eligible"]) is not bool:
         raise ValueError("Jev advisory eligibility must be boolean")
     return {**dict(value)}

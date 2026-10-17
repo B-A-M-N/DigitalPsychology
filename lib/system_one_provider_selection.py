@@ -45,28 +45,47 @@ class SemanticProviderSelector:
 
     def select(self, *, query_planned: bool, remote_suitable: bool,
                local_only_data: bool = False,
-               explicit_dual_trial: bool = False) -> SemanticProviderPlan:
+               explicit_dual_trial: bool = False,
+               laya_available: bool = True,
+               jev_available: bool = True,
+               authorized_providers: frozenset[str] | set[str] | None = None
+               ) -> SemanticProviderPlan:
+        """Select only available, privacy-eligible, and qualified providers."""
+        authorized = ({"jev", "laya"} if authorized_providers is None
+                      else set(authorized_providers))
         if not query_planned:
             return SemanticProviderPlan("none", None,
                                         "deterministic evidence resolves this boundary")
         if local_only_data:
-            return SemanticProviderPlan("laya", "digitalpsychology-laya-native",
-                                        "local-only data requires the local provider")
-        if explicit_dual_trial:
+            remote_suitable = False
+        laya_usable = (laya_available and "laya" in authorized
+                       and self._qualified("laya"))
+        jev_usable = (jev_available and remote_suitable and "jev" in authorized
+                      and self._qualified("jev"))
+        if local_only_data:
+            if laya_usable:
+                return SemanticProviderPlan("laya", "digitalpsychology-laya-native",
+                                            "local-only data requires the local provider")
+            return SemanticProviderPlan("none", None,
+                                        "local-only data has no available local provider")
+        if explicit_dual_trial and laya_usable and jev_usable:
             return SemanticProviderPlan("dual", self._default_id(),
                                         "operator-authorized dual qualification trial")
-        if (self.default_provider == "jev" and remote_suitable
-                and self._qualified("jev")):
+        if explicit_dual_trial:
+            reason = ("dual trial is missing an independently qualified or available "
+                      "provider")
+            return SemanticProviderPlan("none", None, reason)
+        if self.default_provider == "jev" and jev_usable:
             return SemanticProviderPlan("jev", "digitalpsychology-jev-openrouter",
                                         "bounded remote question with suitable public data")
-        if self._qualified("laya"):
+        if laya_usable:
             return SemanticProviderPlan("laya", "digitalpsychology-laya-native",
                                         "locally qualified provider is preferred")
-        if self._qualified("jev"):
+        if jev_usable:
             return SemanticProviderPlan("jev", "digitalpsychology-jev-openrouter",
                                         "remotely qualified provider is preferred")
         return SemanticProviderPlan("none", None,
-                                    "no provider is independently qualified for advisory use")
+                                    "no provider is available, qualified, and privacy-eligible")
 
     def _default_id(self) -> str:
         return ("digitalpsychology-jev-openrouter" if self.default_provider == "jev"

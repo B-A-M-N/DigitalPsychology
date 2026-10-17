@@ -45,5 +45,5 @@ def test_jev_high_confidence_stays_shadow_and_does_not_influence_behavior():
         enabled_question_families=("retry_relation",))
     result = runtime.judge(request, mode="advisory")
     assert result.status == "shadow"
-    assert result.reason == "jev_not_task_calibrated"
+    assert result.reason == "jev_unrecognized_served_snapshot"
     assert result.judgment.answer("retry_relation").raw_confidence == 0.85

@@ -10,8 +10,12 @@ from dataclasses import dataclass
 import time
 from typing import Mapping, Sequence
 
-from .system_one_contracts import SystemOneFrame
+from .system_one_contracts import SystemOneFrame, canonical_hash
 from .system_one_runtime import SystemOneResult, SystemOneRuntime
+
+
+class PortfolioDecisionMismatch(ValueError):
+    """Provider frames do not bind one common host decision snapshot."""
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,7 @@ class SemanticDecisionBundle:
     observations: tuple[ProviderDecision, ...]
     selected_provider_id: str | None
     selection_reason: str
+    decision_basis_digest: str | None = None
 
     @property
     def selected_result(self) -> SystemOneResult | None:
@@ -50,10 +55,34 @@ class SystemOnePortfolio:
             raise ValueError("System-1 portfolio providers must have unique backend IDs")
         self.runtimes = tuple(runtimes)
 
+    @staticmethod
+    def _common_decision_basis(frame: SystemOneFrame) -> tuple[object, ...]:
+        return (frame.identity.to_dict(), frame.request_id, frame.sequence,
+                frame.state_digest, frame.question_bundle_digest,
+                frame.request_digest, frame.policy_hash, frame.question_ids)
+
+    def _validate_common_decision(self, frames: Mapping[str, SystemOneFrame]) -> None:
+        if not frames:
+            raise PortfolioDecisionMismatch("portfolio requires at least one frame")
+        for provider_id, frame in frames.items():
+            if provider_id != frame.backend_id:
+                raise PortfolioDecisionMismatch(
+                    "provider frame is not keyed by its own backend ID")
+        reference = self._common_decision_basis(next(iter(frames.values())))
+        for provider_id, frame in frames.items():
+            if self._common_decision_basis(frame) != reference:
+                raise PortfolioDecisionMismatch(
+                    f"provider frame differs from the common decision basis: {provider_id}")
+
     def evaluate(self, frames: Mapping[str, SystemOneFrame], *,
                  observed_revision: int, mode: str,
                  selected_provider_id: str | None = None,
-                 selection_reason: str = "provider_not_selected") -> SemanticDecisionBundle:
+                 selection_reason: str = "provider_not_selected",
+                 current_decision_revision: int | None = None,
+                 total_deadline_ms: int | None = None) -> SemanticDecisionBundle:
+        self._validate_common_decision(frames)
+        if current_decision_revision is not None and current_decision_revision != observed_revision:
+            raise PortfolioDecisionMismatch("portfolio decision revision is stale")
         if selection_reason == "provider_not_selected":
             if selected_provider_id is not None:
                 raise ValueError("selection reason conflicts with selected provider")
@@ -63,11 +92,15 @@ class SystemOnePortfolio:
         question_id = next(iter(frames.values()), None)
         question_id = question_id.question_ids[0] if question_id is not None else ""
         observations: list[ProviderDecision] = []
+        evaluation_start = time.perf_counter()
         for runtime in self.runtimes:
             frame = frames.get(runtime.backend_id)
             if frame is None:
                 continue
             started = time.perf_counter()
+            if total_deadline_ms is not None and (
+                    time.perf_counter() - evaluation_start) * 1000.0 >= total_deadline_ms:
+                raise TimeoutError("portfolio deadline exceeded")
             result = runtime.judge(frame, mode=mode)
             observations.append(ProviderDecision(
                 provider_id=runtime.backend_id,
@@ -79,7 +112,9 @@ class SystemOnePortfolio:
         return SemanticDecisionBundle(
             question_id=question_id, observations=tuple(observations),
             selected_provider_id=selected_provider_id,
-            selection_reason=selection_reason)
+            selection_reason=selection_reason,
+            decision_basis_digest=canonical_hash(
+                self._common_decision_basis(next(iter(frames.values())))))
 
 
 __all__ = ["ProviderDecision", "SemanticDecisionBundle", "SystemOnePortfolio"]

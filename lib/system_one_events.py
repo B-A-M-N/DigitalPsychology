@@ -67,19 +67,11 @@ def _host_baseline_labels(frame: SystemOneFrame) -> dict[str, str]:
     return result
 
 
-def prepare_system_one_decision_event(
-        descriptor: Any, basis: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Build an outbox event for a valid provider judgment in a committed tick."""
-    system_one = basis.get("system_one")
-    if not isinstance(system_one, Mapping):
-        return None
-    raw_result = system_one.get("result")
-    if not isinstance(raw_result, Mapping):
-        return None
+def _system_one_observation(raw_frame: Mapping[str, Any],
+                            raw_result: Mapping[str, Any]) -> tuple[Any, Any]:
     status = raw_result.get("status")
     if status not in {"ok", "shadow"}:
         return None
-    raw_frame = system_one.get("frame")
     if not isinstance(raw_frame, Mapping):
         raise ValueError("successful System-1 observation has no prepared frame")
     raw_judgment = raw_result.get("judgment")
@@ -97,16 +89,16 @@ def prepare_system_one_decision_event(
             or frame.policy_hash != judgment.policy_hash
             or frame.question_ids != tuple(item.question_id for item in judgment.answers)):
         raise ValueError("System-1 judgment does not match its prepared frame")
+    return frame, judgment
 
-    identity = descriptor.identity
-    receipt = basis.get("semantic_influence_receipt")
+
+def _observation_payload(frame: Any, judgment: Any, *, status: str,
+                         receipt: Mapping[str, Any], basis: Mapping[str, Any]) -> dict[str, Any]:
     semantic_influenced = bool(
-        isinstance(receipt, Mapping)
-        and (receipt.get("changed_selection") or receipt.get("changed_mode")
-             or receipt.get("changed_frameworks")
-             or receipt.get("changed_statework_preference")))
-    receipt = receipt if isinstance(receipt, Mapping) else {}
-    payload = {
+        receipt.get("changed_selection") or receipt.get("changed_mode")
+        or receipt.get("changed_frameworks")
+        or receipt.get("changed_statework_preference"))
+    return {
         "system_one_decision_id": judgment.request_id,
         "system_one_mode": "shadow" if status == "shadow" else "advisory",
         "system_one_backend_id": judgment.backend_id,
@@ -156,10 +148,10 @@ def prepare_system_one_decision_event(
         "system_one_host_baseline_version": _HOST_BASELINE_VERSION,
         "system_one_host_baseline_labels": _host_baseline_labels(frame),
     }
-    raw_diagnostics = raw_result.get("inference_diagnostics")
-    if isinstance(raw_diagnostics, Mapping):
-        payload["system_one_inference_diagnostics"] = validate_inference_diagnostics(
-            raw_diagnostics, judgment.backend_id)
+
+
+def _observation_event(identity: Any, frame: Any, judgment: Any,
+                       payload: Mapping[str, Any]) -> dict[str, Any]:
     event_id = "dp-s1-" + hashlib.sha256(
         f"{identity.scope}|{judgment.request_id}".encode("utf-8")).hexdigest()[:40]
     event = Event(
@@ -189,6 +181,60 @@ def prepare_system_one_decision_event(
         payload=payload,
     )
     return EventFactory.from_dict(event.to_dict()).to_dict()
+
+
+def prepare_system_one_decision_event(
+        descriptor: Any, basis: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Build durable events for each valid provider judgment in a committed tick."""
+    system_one = basis.get("system_one")
+    if not isinstance(system_one, Mapping):
+        return None
+    raw_result = system_one.get("result")
+    if not isinstance(raw_result, Mapping):
+        return None
+    receipt = basis.get("semantic_influence_receipt")
+    receipt = receipt if isinstance(receipt, Mapping) else {}
+    raw_frame = system_one.get("frame")
+    if raw_result.get("portfolio") is True:
+        observations = raw_result.get("observations")
+        if not isinstance(observations, list):
+            return None
+        events = []
+        for observation in observations:
+            if not isinstance(observation, Mapping):
+                continue
+            observation_result = observation.get("result")
+            if not isinstance(observation_result, Mapping):
+                continue
+            observation_frame = raw_frame.get(observation.get("provider_id"))
+            if observation_frame is None:
+                continue
+            parsed = _system_one_observation(observation_frame, observation_result)
+            if parsed is None:
+                continue
+            frame, judgment = parsed
+            payload = _observation_payload(
+                frame, judgment, status=observation_result.get("status"),
+                receipt=receipt, basis=basis)
+            raw_diagnostics = observation_result.get("inference_diagnostics")
+            if isinstance(raw_diagnostics, Mapping):
+                payload["system_one_inference_diagnostics"] = (
+                    validate_inference_diagnostics(
+                        raw_diagnostics, judgment.backend_id))
+            events.append(_observation_event(descriptor.identity, frame, judgment, payload))
+        return events[0] if events else None
+    parsed = _system_one_observation(raw_frame, raw_result)
+    if parsed is None:
+        return None
+    frame, judgment = parsed
+    payload = _observation_payload(
+        frame, judgment, status=raw_result.get("status"), receipt=receipt,
+        basis=basis)
+    raw_diagnostics = raw_result.get("inference_diagnostics")
+    if isinstance(raw_diagnostics, Mapping):
+        payload["system_one_inference_diagnostics"] = validate_inference_diagnostics(
+            raw_diagnostics, judgment.backend_id)
+    return _observation_event(descriptor.identity, frame, judgment, payload)
 
 
 class SystemOneOutcomeLabeler:

@@ -74,7 +74,7 @@ def test_jev_high_confidence_is_not_advisory_without_task_calibration():
     runtime = SystemOneRuntime(backend, enabled_question_families=("retry_relation",))
     result = runtime.judge(request, mode="advisory")
     assert result.status == "shadow"
-    assert result.reason == "jev_not_task_calibrated"
+    assert result.reason == "jev_unrecognized_served_snapshot"
 
 
 def test_laya_high_confidence_is_not_advisory_without_coverage_diagnostics():

@@ -15,7 +15,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -23,7 +23,9 @@ from .protocol_artifact import (PROTOCOL_HASH, PROTOCOL_VERSION,
                                 QUESTION_REGISTRY, QUESTION_REGISTRY_HASH,
                                 STATE_PROJECTION_SCHEMA_HASH)
 from .system_one_backends import ProviderContractError, ProviderHealthError
-from .system_one_jev_models import DEFAULT_JEV_MODEL, JEV_MODELS, provider_protocol_hash
+from .system_one_jev_models import (DEFAULT_JEV_MODEL, JEV_MODELS,
+                                    provider_protocol_hash,
+                                    served_model_identity)
 from .system_one_contracts import (QuestionAnswer, QuestionProbability,
                                    SystemOneCapability, SystemOneFrame,
                                    SystemOneIdentity, SystemOneJudgment,
@@ -34,16 +36,33 @@ ALLOWED_MODELS = frozenset({"typesafe/jev-1.13", "typesafe/jev-1.14"})
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(?:authorization|bearer|api[_ -]?key|openrouter|password|"
-               r"secret|token|credential)\b\s*[:=]\s*[^,;}\"']+"),
+               r"secret|token|credential|customer[_ -]?id|account[_ -]?id)\b\s*"
+               r"[:=]\s*[^,;}\"']+"),
     re.compile(r"(?i)(?:sk-[a-z0-9_-]{20,}|github_pat_[a-z0-9_]{20,}|ghp_[a-z0-9]{20,})"),
     re.compile(r"(?i)\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{20,}={0,2}\b"),
+    re.compile(r"(?i)\b(?:[A-Za-z0-9._%+-]+):(?:[A-Za-z0-9._~+/-]{12,})@"),
+    re.compile(r"(?i)\b(?:[A-F0-9]{2}:){5}[A-F0-9]{2}\b"),
+    re.compile(r"(?i)\b(?:[0-9a-f]{8})[-_]?(?:[0-9a-f]{4})[-_]?"
+               r"(?:[0-9a-f]{4})[-_]?(?:[0-9a-f]{4})[-_]?(?:[0-9a-f]{12})\b"),
 )
-_PATH_PATTERN = re.compile(r"(?i)(?:/home/|/Users/|/root/|[A-Za-z]:\\)[^\s\"']+")
+_PATH_PATTERN = re.compile(r"(?i)(?:[A-Za-z]:\\|/[A-Za-z0-9._-]+/)[^\s\"']+")
+_HOSTNAME_PATTERN = re.compile(
+    r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
+    r"(?:internal|corp|local|lan|svc|cluster)\b")
 _REDACTED = "[REDACTED]"
 
 
 class JevSecretError(ProviderContractError):
-    """The outbound projection contains a prohibited secret or absolute path."""
+    """The outbound projection contains prohibited private task data."""
+
+
+class JevThrottledError(ProviderHealthError):
+    """OpenRouter throttled the bounded request."""
+
+
+class JevQuotaExceededError(ProviderHealthError):
+    """OpenRouter reported exhausted quota or spending controls."""
 
 
 @dataclass(frozen=True)
@@ -59,26 +78,47 @@ def _clean(value: Any, *, limit: int) -> str | None:
     value = value.strip()
     if not value:
         return None
+    value = _HOSTNAME_PATTERN.sub(_REDACTED, value)
     for pattern in _SECRET_PATTERNS:
         value = pattern.sub(_REDACTED, value)
     value = _PATH_PATTERN.sub(_REDACTED, value)
     return value[:limit]
 
 
-def _slots(values: Any) -> list[str]:
-    if not isinstance(values, (tuple, list)):
+def _stable_slots(criterion_ids: Any) -> list[str]:
+    if not isinstance(criterion_ids, (tuple, list)):
         return []
-    return [f"criterion_{index + 1}" for index, _ in enumerate(values[:8])]
+    return [f"criterion_{index + 1}" for index, _ in enumerate(criterion_ids[:8])]
+
+
+def _stable_criterion_mapping(criterion_rows: Sequence[Mapping[str, Any]]
+                              ) -> dict[str, str]:
+    """Map canonical criterion IDs once so every family uses the same opaque slot."""
+    slots: dict[str, str] = {}
+    for row in criterion_rows[:8]:
+        criterion_id = row.get("criterion_id")
+        if isinstance(criterion_id, str) and criterion_id and criterion_id not in slots:
+            slots[criterion_id] = f"criterion_{len(slots) + 1}"
+    return slots
 
 
 def jev_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
-    """Project only host-typed, bounded decision facts for the remote provider."""
+    """Project only allowlisted, question-relevant host facts.
+
+    The trusted frame already passes DP's closed semantic contract. This second
+    boundary removes free task text and emits typed facts needed by the exact
+    requested question family.
+    """
     state = frame.state.to_dict()
     task = state["task"]
     situation = state["situation"]
     candidate = state["candidate"]
+    criteria = state["criteria"][:8]
+    slot_for = _stable_criterion_mapping(criteria)
+    question_id = frame.questions[0].question_id
     projected: dict[str, Any] = {
-        "schema": "jev-minimal-semantic-projection/v1",
+        "schema": "jev-family-semantic-projection/v2",
+        "question_id": question_id,
         "task": {
             "work_mode": task["work_mode"],
             "deliverable_kind": task["deliverable_kind"],
@@ -88,72 +128,132 @@ def jev_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
                             for item in task.get("domain_tags", ())[:8]],
         },
         "situation": {
-            "current_state": _clean(situation.get("current_state"), limit=64),
-            "blockers": [_clean(item, limit=128) or "redacted"
-                         for item in situation.get("blockers", ())[:4]],
+            "current_state": situation.get("current_state"),
             "actions_since_goal_progress": situation.get(
                 "actions_since_goal_progress"),
             "actions_since_artifact_change": situation.get(
                 "actions_since_artifact_change"),
+            "verification_actions_since_artifact_change": situation.get(
+                "verification_actions_since_artifact_change"),
             "recovery_epochs": situation.get("recovery_epochs"),
             "repeated_branch_count": situation.get("repeated_branch_count"),
         },
         "criteria": [{
-            "id": _clean(item["criterion_id"], limit=64) or f"criterion_{index + 1}",
-            "status": item["status"], "evidence_status": item["evidence_status"],
-        } for index, item in enumerate(state["criteria"][:8])],
+            "id": slot_for.get(item.get("criterion_id"), "unknown"),
+            "status": item.get("status"),
+            "evidence_status": item.get("evidence_status"),
+        } for item in criteria],
         "candidate": {
-            "action_class": _clean(candidate["action_class"], limit=64) or "unknown",
+            "action_class": _clean(candidate.get("action_class"), limit=64) or "unknown",
             "host_relation": candidate.get("host_declared_relation"),
             "target_kind": _clean(candidate.get("target_kind"), limit=64),
-            "purpose": _clean(candidate.get("proposed_purpose"), limit=256),
-            "affected_criteria": _slots(candidate.get("affected_criterion_ids")),
+            "purpose_class": _clean(candidate.get("proposed_purpose"), limit=256),
+            "affected_criteria": [
+                slot_for.get(item, "unknown")
+                for item in candidate.get("affected_criterion_ids", ())[:8]],
             "relation_certainty": candidate.get("relation_certainty"),
+            "result_class": candidate.get("result_class"),
+            "progress_class": candidate.get("progress_class"),
+            "artifact_changed": candidate.get("artifact_changed"),
         },
-        "convergence": {key: value for key, value in state["convergence"].items()
-                        if isinstance(value, (int, float)) and value >= 0},
     }
-    if state["failed_approaches"]:
-        projected["failed_approaches"] = [{
-            "cause_class": _clean(item.get("cause_class"), limit=64) or "unknown",
-            "hypothesis": _clean(item.get("hypothesis_summary"), limit=128),
-            "mechanism": _clean(item.get("mechanism"), limit=128),
-            "planned_action_class": _clean(item.get("planned_action_class"), limit=64),
-            "result_class": _clean(item.get("failed_result_class"), limit=64),
-            "affected_criteria": _slots(item.get("affected_criterion_ids")),
-        } for item in state["failed_approaches"][:4]]
-    if state["legal_routes"]:
-        projected["legal_routes"] = [_clean(item, limit=64) or "redacted"
-                                      for item in state["legal_routes"][:8]]
+    if question_id in {"action_relation", "goal_drift", "route_preference"}:
+        objective = _clean(task.get("objective"), limit=256)
+        if objective:
+            projected["task"]["objective"] = objective
+        unfinished = [{
+            "id": slot_for.get(item.get("criterion_id"), "unknown"),
+            "status": item.get("status"),
+        } for item in criteria
+          if item.get("status") in {"unmet", "active", "partially_observed", "blocked"}]
+        if unfinished:
+            projected["unfinished_criteria"] = unfinished
+    if question_id == "progress_relation":
+        observed = state["activity"][:8]
+        projected["observed_activity"] = [{
+            "sequence": item.get("sequence"),
+            "activity_type": item.get("activity_type"),
+            "result_class": item.get("result_class"),
+            "progress_class": item.get("progress_class"),
+            "artifact_changed": item.get("artifact_changed"),
+            "affected_criteria": [
+                slot_for.get(value, "unknown")
+                for value in item.get("affected_criterion_ids", ())[:8]],
+        } for item in observed]
+        before = state.get("criteria_before")
+        if before is not None:
+            projected["criteria_before"] = [{
+                "id": slot_for.get(item.get("criterion_id"), "unknown"),
+                "status": item.get("status"),
+                "evidence_status": item.get("evidence_status"),
+            } for item in before[:8]]
+    if question_id == "retry_relation":
+        failures = state["failed_approaches"][:4]
+        projected["approach_comparison"] = {
+            "proposed": {
+                "action_class": _clean(candidate.get("action_class"), limit=64)
+                or "unknown",
+                "target_kind": _clean(candidate.get("target_kind"), limit=64),
+                "purpose_class": _clean(candidate.get("proposed_purpose"), limit=256),
+                "affected_criteria": [
+                    slot_for.get(item, "unknown")
+                    for item in candidate.get("affected_criterion_ids", ())[:8]],
+            },
+            "previous_failures": [{
+                "cause_class": _clean(item.get("cause_class"), limit=64) or "unknown",
+                "hypothesis_class": _clean(item.get("hypothesis_summary"), limit=128),
+                "mechanism_class": _clean(item.get("mechanism"), limit=128),
+                "evidence_target_class": _clean(item.get("evidence_target"), limit=128),
+                "planned_action_class": _clean(item.get("planned_action_class"), limit=64),
+                "planned_target_kind": _clean(item.get("planned_target_kind"), limit=64),
+                "result_class": _clean(item.get("failed_result_class"), limit=64),
+                "affected_criteria": [
+                    slot_for.get(item, "unknown")
+                    for item in item.get("affected_criterion_ids", ())[:8]],
+            } for item in failures],
+        }
+    if question_id == "route_preference":
+        projected["legal_routes"] = state["legal_routes"][:8]
+        projected["eligible_workflows"] = [{
+            "statework_id": item.get("statework_id"),
+            "domain": item.get("domain"),
+            "current_state": item.get("current_state"),
+            "progress_class": item.get("progress_class"),
+            "legal_next_states": item.get("legal_next_states", ()),
+            "active": item.get("active"), "eligible": item.get("eligible"),
+        } for item in state["workflows"] if item.get("eligible")][:8]
     payload = {key: value for key, value in projected.items()
                if value not in (None, (), [], {})}
+    _assert_no_private_data(payload)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                          ensure_ascii=False)
-    _assert_no_secrets(payload)
     if len(encoded.encode("utf-8")) > 8192:
         raise JevSecretError("Jev projection exceeds its privacy and size boundary")
     return payload
 
 
-def _assert_no_secrets(value: Any) -> None:
+def _assert_no_private_data(value: Any) -> None:
+    """Defense in depth over the entire allowlisted projection."""
     if isinstance(value, str):
         if _PATH_PATTERN.search(value):
             raise JevSecretError("Jev projection contains an absolute filesystem path")
+        if _HOSTNAME_PATTERN.search(value):
+            raise JevSecretError("Jev projection contains an internal hostname")
         for pattern in _SECRET_PATTERNS:
             if pattern.search(value):
-                raise JevSecretError("Jev projection contains a suspected secret")
+                raise JevSecretError("Jev projection contains suspected private data")
     elif isinstance(value, Mapping):
         for key, item in value.items():
             if isinstance(key, str):
-                if _PATH_PATTERN.search(key):
-                    raise JevSecretError("Jev projection contains an absolute path")
+                if _PATH_PATTERN.search(key) or _HOSTNAME_PATTERN.search(key):
+                    raise JevSecretError("Jev projection key contains private data")
                 for pattern in _SECRET_PATTERNS:
                     if pattern.search(key):
-                        raise JevSecretError("Jev projection contains a suspected secret")
-            _assert_no_secrets(item)
+                        raise JevSecretError("Jev projection key contains private data")
+            _assert_no_private_data(item)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            _assert_no_secrets(item)
+            _assert_no_private_data(item)
 
 
 def build_jev_request(frame: SystemOneFrame) -> dict[str, Any]:
@@ -194,39 +294,60 @@ def _probability_map(value: Any, labels: tuple[str, ...]) -> tuple[QuestionProba
 
 def judgment_from_jev(frame: SystemOneFrame, response: Mapping[str, Any],
                       *, elapsed_ms: float) -> SystemOneJudgment:
+    """Parse OpenRouter's documented Decisions response into the canonical contract."""
     if not isinstance(response, Mapping):
         raise ProviderContractError("Jev response must be JSON")
-    actual_model = response.get("model")
-    if actual_model != frame.model_id:
-        raise ProviderContractError("Jev returned an unexpected model substitution")
-    provider_revision = response.get("provider_revision")
-    if not isinstance(provider_revision, str) or not provider_revision.strip() \
-            or len(provider_revision) > 256:
-        raise ProviderContractError("Jev response omits its provider revision")
+    served_model = response.get("model")
+    if not isinstance(served_model, str):
+        raise ProviderContractError("Jev response omits its served model")
+    try:
+        served_identity = served_model_identity(frame.model_id, served_model)
+    except ValueError as exc:
+        raise ProviderContractError(str(exc)) from exc
     answers = response.get("answers")
     if not isinstance(answers, Mapping) or set(map(str, answers)) != set(frame.question_ids):
         raise ProviderContractError("Jev response question set does not match the request")
     built = []
     for question in frame.questions:
         row = answers[question.question_id]
-        if not isinstance(row, Mapping) or set(row) != {"choice", "probabilities"}:
-            raise ProviderContractError(f"Jev answer is malformed for {question.question_id}")
+        if not isinstance(row, Mapping) or set(row) != {
+                "type", "choice", "probabilities", "confidence"}:
+            raise ProviderContractError(
+                f"Jev answer is malformed for {question.question_id}")
+        if row["type"] != question.question_type:
+            raise ProviderContractError(
+                f"Jev answer type differs for {question.question_id}")
         selected = row["choice"]
         labels = tuple(label for label, _description in question.criteria)
         if not isinstance(selected, str) or selected not in labels:
-            raise ProviderContractError(f"Jev returned an illegal choice for {question.question_id}")
+            raise ProviderContractError(
+                f"Jev returned an illegal choice for {question.question_id}")
+        probabilities = _probability_map(row["probabilities"], labels)
+        confidence = row["confidence"]
+        selected_probability = next(item.probability for item in probabilities
+                                    if item.label == selected)
+        if (not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
+                or not math.isfinite(float(confidence))
+                or not 0.0 <= float(confidence) <= 1.0
+                or abs(float(confidence) - selected_probability) > 0.01):
+            raise ProviderContractError(
+                f"Jev confidence conflicts with its distribution for "
+                f"{question.question_id}")
         built.append(QuestionAnswer(
             question_id=question.question_id, selected=selected,
-            raw_probabilities=_probability_map(row["probabilities"], labels)))
+            raw_probabilities=probabilities))
+    projection = jev_state_projection(frame)
     diagnostics = {
         "schema_version": "jev-inference-diagnostics/v1",
-        "projection_schema": "jev-minimal-semantic-projection/v1",
-        "projection_digest": canonical_hash(jev_state_projection(frame)),
+        "projection_schema": "jev-family-semantic-projection/v2",
+        "projection_digest": canonical_hash(projection),
         "projection_bytes": len(json.dumps(
-            jev_state_projection(frame), sort_keys=True, separators=(",", ":"),
+            projection, sort_keys=True, separators=(",", ":"),
             ensure_ascii=False).encode("utf-8")),
         "latency_ms": min(30000, max(0, round(elapsed_ms))),
-        "provider_revision": provider_revision,
+        "provider_revision": served_identity["provider_revision"],
+        "served_model": served_identity["served_model"],
+        "requested_model": frame.model_id,
         "advisory_eligible": False,
     }
     return SystemOneJudgment(
@@ -249,8 +370,17 @@ def _http_post(request: Request, timeout: float) -> bytes:
         with urlopen(request, timeout=timeout) as response:
             return response.read(65537)
     except HTTPError as exc:
+        if exc.code == 401 or exc.code == 403:
+            raise ProviderContractError("OpenRouter rejected Jev credentials") from exc
+        if exc.code == 429:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            raise JevThrottledError(
+                f"OpenRouter throttled Jev; retry-after={retry_after or 'unknown'}") from exc
+        if exc.code == 402:
+            raise JevQuotaExceededError("OpenRouter Jev quota is exhausted") from exc
         if 400 <= exc.code < 500:
-            raise ProviderContractError(f"OpenRouter rejected the Jev request ({exc.code})") from exc
+            raise ProviderContractError(
+                f"OpenRouter rejected the Jev request ({exc.code})") from exc
         raise ProviderHealthError("OpenRouter Jev provider is unavailable") from exc
     except (OSError, TimeoutError, URLError) as exc:
         raise ProviderHealthError("OpenRouter Jev provider is unavailable") from exc
@@ -268,6 +398,11 @@ class JevOpenRouterProvider:
     endpoint: str = DECISIONS_ENDPOINT
     transport: Callable[[Request, float], bytes] = _http_post
     backend_id: str = "digitalpsychology-jev-openrouter"
+
+    @classmethod
+    def from_environment(cls, *, portfolio_explicit: bool = False) -> "JevOpenRouterProvider":
+        """Build Jev only when the operator explicitly enables it and supplies a key."""
+        return from_environment(portfolio_explicit=portfolio_explicit)
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_key, str) or not self.api_key.strip():
@@ -374,6 +509,7 @@ def from_environment(*, portfolio_explicit: bool = False) -> JevOpenRouterProvid
             "DIGITALPSYCHOLOGY_JEV_MAX_CONCURRENCY", "2")))
 
 
-__all__ = ["DECISIONS_ENDPOINT", "ALLOWED_MODELS",
-           "JevOpenRouterProvider", "JevSecretError", "build_jev_request",
-           "jev_state_projection", "judgment_from_jev", "from_environment"]
+__all__ = ["DECISIONS_ENDPOINT", "ALLOWED_MODELS", "JevOpenRouterProvider",
+           "JevSecretError", "JevThrottledError", "JevQuotaExceededError",
+           "build_jev_request", "jev_state_projection", "judgment_from_jev",
+           "from_environment"]
