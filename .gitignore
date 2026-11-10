@@ -7,3 +7,4 @@ build/
 *.egg-info/
 compiled-guard-pack.json
 .coverage
+/.env

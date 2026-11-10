@@ -36,6 +36,16 @@ class DirectiveBuilder:
               semantic_statework_preference: str | None = None,
               semantic_statework_confidence: float = 0.0,
               semantic_statework_support: tuple[tuple[str, float], ...] = (),
+              semantic_test_strategy_preference: str | None = None,
+              semantic_test_strategy_confidence: float = 0.0,
+              semantic_test_strategy_support: tuple[tuple[str, float], ...] = (),
+              semantic_decomposition_preference: str | None = None,
+              semantic_decomposition_confidence: float = 0.0,
+              semantic_decomposition_support: tuple[tuple[str, float], ...] = (),
+              semantic_integration_preference: str | None = None,
+              semantic_integration_confidence: float = 0.0,
+              semantic_integration_support: tuple[tuple[str, float], ...] = (),
+              advisory_semantic_families: frozenset[str] = frozenset(),
               experimental_route_preference: str | None = None,
               ) -> BehavioralDecision:
             selected_option = (candidate_pool.option_for(selection.candidate.candidate_id)
@@ -169,19 +179,47 @@ class DirectiveBuilder:
                     semantic_confidence=1.0,
                     provenance="host_experiment",
                     limit=1)
-            elif (context.semantic_opportunity_question_id == "route_preference"
-                    and semantic_statework_preference is not None):
-                preference = rank_stateworks(
-                    selected_candidate.cognitive_mode,
-                    context.csw_snapshot.eligible_stateworks,
-                    context.csw_snapshot.active_stateworks,
-                    semantic_preference=semantic_statework_preference,
-                    semantic_confidence=semantic_statework_confidence,
-                    preference_support=semantic_statework_support or None,
-                    provenance="model_advisory",
-                    limit=1)
             else:
-                preference = selected_candidate.statework_preferences[:1]
+                advisory = (advisory_semantic_families
+                            if isinstance(advisory_semantic_families,
+                                           (frozenset, set, tuple, list))
+                            else frozenset())
+                preference = None
+                for _family, _preference, _confidence, _support in (
+                    ("route", semantic_statework_preference,
+                     semantic_statework_confidence, semantic_statework_support),
+                    ("test_strategy", semantic_test_strategy_preference,
+                     semantic_test_strategy_confidence,
+                     semantic_test_strategy_support),
+                    ("decomposition", semantic_decomposition_preference,
+                     semantic_decomposition_confidence,
+                     semantic_decomposition_support),
+                    ("integration", semantic_integration_preference,
+                     semantic_integration_confidence,
+                     semantic_integration_support),
+                ):
+                    if _family == "route":
+                        if not (context.semantic_opportunity_question_id == "route_preference"
+                                and semantic_statework_preference is not None):
+                            continue
+                    else:
+                        if (_family not in advisory
+                                and f"{_family}_preference" not in advisory):
+                            continue
+                        if _preference is None:
+                            continue
+                    preference = rank_stateworks(
+                        selected_candidate.cognitive_mode,
+                        context.csw_snapshot.eligible_stateworks,
+                        context.csw_snapshot.active_stateworks,
+                        semantic_preference=_preference,
+                        semantic_confidence=_confidence,
+                        preference_support=_support or None,
+                        provenance="model_advisory",
+                        limit=1)
+                    break
+                if preference is None:
+                    preference = selected_candidate.statework_preferences[:1]
             if preference and not any(
                     any(target.target == f"statework:{preference[0]}" for target in item.targets)
                     for item in working.active_interventions):

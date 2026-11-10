@@ -110,7 +110,8 @@ def _replay_frame(raw_frame: Mapping[str, Any]) -> SystemOneFrame:
                 or row.get("type") != registry["type"]
                 or not isinstance(row.get("criteria"), Mapping)):
             raise ValueError("historical System-1 question family is unsupported")
-        if question_id == "route_preference":
+        if question_id in {"route_preference", "decomposition_preference",
+                           "integration_preference", "test_strategy_preference"}:
             criteria = dict(row["criteria"])
         else:
             if set(row["criteria"]) != set(registry["criteria"]):

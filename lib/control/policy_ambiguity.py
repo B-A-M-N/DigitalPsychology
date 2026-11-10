@@ -24,8 +24,9 @@ class PolicyAmbiguity:
             raise ValueError("policy ambiguity score gap must be between zero and one")
         dimensions = tuple(self.unresolved_dimensions)
         supported = {"action_relation", "progress_relation", "retry_relation",
-                     "goal_drift", "statework_fit"}
-        if (not dimensions or len(dimensions) > 5
+                     "goal_drift", "statework_fit", "decomposition_fit",
+                     "integration_fit", "test_strategy_fit"}
+        if (not dimensions or len(dimensions) > 8
                 or len(dimensions) != len(set(dimensions))
                 or any(item not in supported for item in dimensions)):
             raise ValueError("policy ambiguity must name bounded unresolved dimensions")

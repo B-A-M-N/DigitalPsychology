@@ -14,7 +14,8 @@ SUPPORTED_PROJECTION_SCHEMAS = frozenset({
 JEV_PROJECTION_SCHEMA = "jev-family-semantic-projection/v2"
 _QUESTION_IDS = frozenset({
     "action_relation", "progress_relation", "retry_relation", "goal_drift",
-    "route_preference",
+    "route_preference", "decomposition_preference",
+    "integration_preference", "test_strategy_preference",
 })
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 

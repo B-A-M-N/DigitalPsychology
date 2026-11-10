@@ -60,10 +60,12 @@ def _host_baseline_labels(frame: SystemOneFrame) -> dict[str, str]:
                 result["goal_drift"] = "no"
             elif all(status == "satisfied" for status in affected):
                 result["goal_drift"] = "yes"
-    if "route_preference" in legal_labels:
-        legal_routes = tuple(frame.state.legal_routes)
-        if legal_routes and legal_routes[0] in legal_labels["route_preference"]:
-            result["route_preference"] = legal_routes[0]
+    for _family in ("route_preference", "decomposition_preference",
+                    "integration_preference", "test_strategy_preference"):
+        if _family in legal_labels:
+            legal_routes = tuple(frame.state.legal_routes)
+            if legal_routes and legal_routes[0] in legal_labels[_family]:
+                result[_family] = legal_routes[0]
     return result
 
 
@@ -282,7 +284,8 @@ class SystemOneOutcomeLabeler:
         if payload.get("system_one_status") not in {"ok", "shadow"}:
             raise ValueError("decision event does not contain a valid provider result")
         allowed_labels = set(QUESTION_REGISTRY[question_id]["criteria"])
-        if question_id == "route_preference":
+        if question_id in {"route_preference", "decomposition_preference",
+                           "integration_preference", "test_strategy_preference"}:
             legal_routes = payload.get("system_one_legal_routes")
             if (not isinstance(legal_routes, list)
                     or any(not isinstance(route, str) or not route for route in legal_routes)):

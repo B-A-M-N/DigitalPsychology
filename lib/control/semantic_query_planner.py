@@ -27,7 +27,8 @@ class SemanticQueryPlan:
     def __post_init__(self) -> None:
         if self.question_id is not None and self.question_id not in {
                 "action_relation", "progress_relation", "retry_relation", "goal_drift",
-                "route_preference"}:
+                "route_preference", "decomposition_preference",
+                "integration_preference", "test_strategy_preference"}:
             raise ValueError("semantic query plan names an unsupported question")
         if not isinstance(self.reason, str) or not self.reason or len(self.reason) > 256:
             raise ValueError("semantic query reason must be bounded non-empty text")
@@ -47,6 +48,24 @@ class SemanticQueryPlan:
     @property
     def should_query(self) -> bool:
         return self.question_id is not None
+
+
+# Advisory questions bypass the pair-gap gate: their calibrated VOI stands
+# regardless of the deterministic top-pair margin. Every other question,
+# including route preference, still requires a close pair.
+_ADVISORY_QUESTIONS = frozenset({
+    "decomposition_preference", "integration_preference",
+    "test_strategy_preference"})
+
+
+# Dimension a planned question resolves. Route and advisory families each map
+# to their own fit dimension; the remaining families map to themselves.
+_QUESTION_DIMENSION = {
+    "route_preference": "statework_fit",
+    "decomposition_preference": "decomposition_fit",
+    "integration_preference": "integration_fit",
+    "test_strategy_preference": "test_strategy_fit",
+}
 
 
 class SemanticQueryPlanner:
@@ -112,8 +131,6 @@ class SemanticQueryPlanner:
 
         if policy_ambiguity is None:
             return self._skip("no candidate ambiguity was supplied")
-        if policy_ambiguity.score_gap > self.maximum_ambiguity_gap:
-            return self._skip("candidate margin is too large for a semantic result to change policy")
 
         question: str | None = None
         reason = "host evidence does not identify a semantic ambiguity"
@@ -122,6 +139,18 @@ class SemanticQueryPlanner:
             question = "route_preference"
             reason = "two CSW-eligible StateWorks are plausible for the current behavior mode"
             voi = 0.70
+        elif "test_strategy_fit" in policy_ambiguity.unresolved_dimensions:
+            question = "test_strategy_preference"
+            reason = "testworks-owned StateWorks are plausible with unresolved test strategy"
+            voi = 0.72
+        elif "decomposition_fit" in policy_ambiguity.unresolved_dimensions:
+            question = "decomposition_preference"
+            reason = "godkiller-owned StateWorks are plausible with unresolved decomposition"
+            voi = 0.68
+        elif "integration_fit" in policy_ambiguity.unresolved_dimensions:
+            question = "integration_preference"
+            reason = "terraformer-owned StateWorks are plausible with unresolved integration"
+            voi = 0.68
         elif candidate is not None:
             if retry_count >= 2:
                 return self._skip("repeated approach is already established by host counters")
@@ -161,7 +190,16 @@ class SemanticQueryPlanner:
         else:
             return self._skip("non-action boundary has no unresolved semantic decision")
 
-        question_dimension = "statework_fit" if question == "route_preference" else question
+        # The pair-gap gate applies to route and the original families: a
+        # close deterministic pair is required for their result to change
+        # policy. Owner advisory families carry their own calibrated VOI
+        # regardless of the deterministic margin. The minimum-VOI gate
+        # below applies to all.
+        if (question is not None and question not in _ADVISORY_QUESTIONS
+                and policy_ambiguity.score_gap > self.maximum_ambiguity_gap):
+            return self._skip("candidate margin is too large for a semantic result to change policy")
+        question_dimension = (_QUESTION_DIMENSION.get(question, question)
+                                if question is not None else None)
         if (question is None
                 or question_dimension not in policy_ambiguity.unresolved_dimensions
                 or voi < self.minimum_value_of_information):

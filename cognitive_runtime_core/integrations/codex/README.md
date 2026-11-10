@@ -33,3 +33,24 @@ The separate DP/CFW lifecycle integration consumes canonical shared events and
 injected authority context. The CFW host adapter uses CFW's local action and
 completion authorities while translating Codex App Server boundaries into the
 neutral contract; it does not define DP behavior policy or workflow truth.
+
+## Private Codex host launcher
+
+For Codex profiles that must use DP without exposing its control protocol to the
+model, use the local `codex-dp` or `harvardcodex-dp` launcher. It starts Codex
+App Server with native execution and configured MCP servers disabled, while a
+trusted host process calls the standard-stdio `digital-psychology-control-mcp`
+through `MCPControlClient`. The model receives only the host-registered CFW
+workspace actions; DP control tools are never part of `tools/list`.
+
+The admin MCP is a separate operator interface. Do not register it in an agent
+profile with an empty tool allowlist: Codex reports that as an unknown MCP with
+zero tools, and it does not connect DP to the host lifecycle. Generic MCP hosts
+can launch the control server as a private child and implement the same host
+boundary without Codex App Server. App Server is the Codex-specific embedding
+transport, not a requirement of MCP itself.
+
+Launch from a workspace with `codex-dp --workspace /path/to/workspace -- "task text"` or `harvardcodex-dp --workspace /path/to/workspace -- "task text"`. HarvardCodex delegates credential loading to its existing launcher; the DP host receives the credential only for the App Server provider connection.
+The host uses bounded workspace read/inspect/write actions, blocks sensitive
+path components, and keeps provider credentials out of the private DP child and
+model-visible action results.

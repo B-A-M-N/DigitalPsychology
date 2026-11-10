@@ -7,12 +7,14 @@ from collections.abc import Sequence
 
 _NATIVE_MODEL_TOOL_FEATURES = (
     # Native model-callable integrations and alternate execution surfaces.
-    "agent_message_board", "apps", "auth_elicitation", "browser_use",
+    "agent_message_board", "api_key_model_discovery", "apps",
+    "auth_elicitation", "browser_annotation_api", "browser_use",
     "browser_use_external", "browser_use_full_cdp_access", "code_mode",
     "computer_use", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
     "exec_permission_approvals", "image_generation", "in_app_browser",
     "in_app_chat", "in_app_dictation", "in_app_local_automation",
-    "in_app_updates", "multi_agent", "multi_agent_v2", "parallel",
+    "in_app_updates", "in_app_voice", "mentions_v2", "multi_agent",
+    "multi_agent_v2", "parallel",
     "plugin_sharing", "plugins", "remote_plugin", "request_permissions_tool",
     "rmcp_client", "skill_mcp_dependency_install", "skill_search", "skills",
     "sqlite", "tool_call_mcp_elicitation", "tool_suggest",
@@ -25,6 +27,7 @@ _NATIVE_MODEL_TOOL_FEATURES = (
 _NATIVE_SIDE_EFFECT_FEATURES = (
     "daemon_auto_start", "goals", "hooks", "memories", "prevent_idle_sleep",
     "realtime_conversation", "shell_snapshot", "shell_snapshot_v2", "sleep_tool",
+    "unbounded_connection_retries",
 )
 _NATIVE_EXEC_FEATURES = ("shell_tool", "unified_exec")
 _NATIVE_WORKSPACE_FEATURES = ("workspace_dependencies",)
@@ -32,13 +35,15 @@ _HOST_ONLY_FEATURES = (set(_NATIVE_EXEC_FEATURES) | set(_NATIVE_MODEL_TOOL_FEATU
                        | set(_NATIVE_SIDE_EFFECT_FEATURES)
                        | set(_NATIVE_WORKSPACE_FEATURES))
 NATIVE_FEATURE_CATALOG_VERSION = "codex-native-host-policy-v1"
-NATIVE_FEATURE_CATALOG_SHA256 = "82b363a94a1372a9ef42cafe5b160c67f38bf2502583d34858faa97d8b4bada2"
-REVIEWED_CODEX_CLI_VERSION = "codex-cli 0.160.1"
+NATIVE_FEATURE_CATALOG_SHA256 = "f4d6c471f8cbf146e229698c8c855af24cc4a9b4a1cc185b4608b5b7df228c24"
+REVIEWED_CODEX_CLI_VERSION = "codex-cli 0.162.1"
 REVIEWED_CODEX_FEATURE_CATALOG_SHA256 = (
-    "3fe988b7cd6e943692cc315f98824cdda73be8c382971b9b1fa8ec5ed7bb8696")
+    "9db1458c05a0eee06bee402f930242d329a1162592fe04d101cc8007cdf9997c")
 _REVIEWED_CODEX_FEATURE_CATALOGS = {
     "codex-cli 0.160.0":
         "3310a31f8ec0d7a985fb07cf6043bc060dc5c438c4b23058e14b9b1144b86714",
+    "codex-cli 0.160.1":
+        "3fe988b7cd6e943692cc315f98824cdda73be8c382971b9b1fa8ec5ed7bb8696",
     REVIEWED_CODEX_CLI_VERSION: REVIEWED_CODEX_FEATURE_CATALOG_SHA256,
 }
 

@@ -55,6 +55,24 @@
       "type": "choice",
       "instructions": "Which already-authorized legal route best fits the current task state?",
       "criteria": {}
+    },
+    "decomposition_preference": {
+      "family": "decomposition_preference",
+      "type": "choice",
+      "instructions": "Which already-authorized legal decomposition best fits the current task state?",
+      "criteria": {}
+    },
+    "integration_preference": {
+      "family": "integration_preference",
+      "type": "choice",
+      "instructions": "Which already-authorized legal integration best fits the current task state?",
+      "criteria": {}
+    },
+    "test_strategy_preference": {
+      "family": "test_strategy_preference",
+      "type": "choice",
+      "instructions": "Which already-authorized legal test strategy best fits the current task state?",
+      "criteria": {}
     }
   },
   "$defs": {

@@ -27,6 +27,29 @@ from .control.policy_selector import (
 )
 
 
+def _advisory_semantic_families(context: FastLoopInput) -> frozenset[str]:
+    """Return the advisory-only semantic families enabled for this decision.
+
+    Slice A owns FastLoopInput.advisory_semantic_families (derived from
+    the advisory_semantic_families policy-context key); read it
+    defensively so this path works with or without that field, falling back
+    to the raw policy-context key. Anything malformed enables nothing:
+    advisory families are shadow by default.
+    """
+    raw = getattr(context, "advisory_semantic_families", ())
+    policy_context = getattr(context, "policy_context", None)
+    policy_raw = ()
+    if isinstance(policy_context, dict):
+        policy_raw = policy_context.get("advisory_semantic_families", ())
+    values: list[str] = []
+    for source in (raw, policy_raw):
+        if isinstance(source, (str, bytes)):
+            values.append(source.decode() if isinstance(source, bytes) else source)
+        elif isinstance(source, (tuple, list, set, frozenset)):
+            values.extend(item for item in source if isinstance(item, str))
+    return frozenset(value for value in values if value)
+
+
 class BehavioralController:
     """DP's deterministic fast-loop policy over host-observed inputs."""
 
@@ -225,6 +248,22 @@ class BehavioralController:
                 semantic.statework_preference, semantic.statework_confidence),
             semantic_statework_confidence=semantic.statework_confidence,
             semantic_statework_support=semantic.statework_support,
+            semantic_test_strategy_preference=qualified(
+                semantic.test_strategy_preference,
+                semantic.test_strategy_confidence),
+            semantic_test_strategy_confidence=semantic.test_strategy_confidence,
+            semantic_test_strategy_support=semantic.test_strategy_support,
+            semantic_decomposition_preference=qualified(
+                semantic.decomposition_preference,
+                semantic.decomposition_confidence),
+            semantic_decomposition_confidence=semantic.decomposition_confidence,
+            semantic_decomposition_support=semantic.decomposition_support,
+            semantic_integration_preference=qualified(
+                semantic.integration_preference,
+                semantic.integration_confidence),
+            semantic_integration_confidence=semantic.integration_confidence,
+            semantic_integration_support=semantic.integration_support,
+            advisory_semantic_families=_advisory_semantic_families(context),
             experimental_route_preference=(
                 context.policy_context.get("experimental_route_preference")
                 if isinstance(context.policy_context, dict)

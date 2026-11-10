@@ -28,6 +28,15 @@ class SemanticAssessment:
     statework_preference: str | None = None
     statework_confidence: float = 0.0
     statework_support: tuple[tuple[str, float], ...] = ()
+    decomposition_preference: str | None = None
+    decomposition_confidence: float = 0.0
+    decomposition_support: tuple[tuple[str, float], ...] = ()
+    integration_preference: str | None = None
+    integration_confidence: float = 0.0
+    integration_support: tuple[tuple[str, float], ...] = ()
+    test_strategy_preference: str | None = None
+    test_strategy_confidence: float = 0.0
+    test_strategy_support: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
         for name, choices in (
@@ -48,9 +57,20 @@ class SemanticAssessment:
                      or not self.statework_preference
                      or len(self.statework_preference) > 128)):
             raise ValueError("statework_preference must be bounded text or null")
+        for name in ("decomposition_preference", "integration_preference",
+                     "test_strategy_preference"):
+            value = getattr(self, name)
+            if (value is not None
+                    and (not isinstance(value, str)
+                         or not value
+                         or len(value) > 128)):
+                raise ValueError(f"{name} must be bounded text or null")
         for confidence in (self.confidence, self.retry_confidence,
                            self.goal_drift_confidence, self.action_confidence,
-                           self.progress_confidence, self.statework_confidence):
+                           self.progress_confidence, self.statework_confidence,
+                           self.decomposition_confidence,
+                           self.integration_confidence,
+                           self.test_strategy_confidence):
             if not 0.0 <= float(confidence) <= 1.0:
                 raise ValueError("semantic confidence must be between zero and one")
 
@@ -89,13 +109,26 @@ def assess_semantics(judgment: Optional[_Judgment]) -> SemanticAssessment:
     retry, retry_conf = read("retry_relation")
     drift, drift_conf = read("goal_drift")
     statework, statework_conf = read("route_preference")
+    decomposition, decomposition_conf = read("decomposition_preference")
+    integration, integration_conf = read("integration_preference")
+    test_strategy, test_strategy_conf = read("test_strategy_preference")
     selected_drift = (True if drift == "yes" else False if drift == "no" else None)
     confidence = max(action_conf, progress_conf, retry_conf, drift_conf,
-                     statework_conf)
+                     statework_conf, decomposition_conf, integration_conf,
+                     test_strategy_conf)
     return SemanticAssessment(
         action, progress, retry, selected_drift, confidence,
         retry_confidence=retry_conf, goal_drift_confidence=drift_conf,
         action_confidence=action_conf, progress_confidence=progress_conf,
         statework_preference=statework, statework_confidence=statework_conf,
         statework_support=support("route_preference"),
+        decomposition_preference=decomposition,
+        decomposition_confidence=decomposition_conf,
+        decomposition_support=support("decomposition_preference"),
+        integration_preference=integration,
+        integration_confidence=integration_conf,
+        integration_support=support("integration_preference"),
+        test_strategy_preference=test_strategy,
+        test_strategy_confidence=test_strategy_conf,
+        test_strategy_support=support("test_strategy_preference"),
     )

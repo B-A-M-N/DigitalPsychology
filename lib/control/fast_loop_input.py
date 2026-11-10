@@ -29,6 +29,12 @@ class FastLoopInput:
     # Host-computed semantic query opportunity. This controls which soft
     # alternatives enter the candidate pool; the provider answer never does.
     semantic_opportunity_question_id: str | None = None
+    # Advisory semantic families the host enabled for this decision, taken
+    # from the ``advisory_semantic_families`` policy-context declaration.
+    # Values are family stems ("decomposition", "integration",
+    # "test_strategy"); the provider question IDs carry a "_preference"
+    # suffix and never appear here.
+    advisory_semantic_families: tuple[str, ...] = ()
     actions_since_goal_progress: int = 0
     equivalent_retry_count: int = 0
     host_action_index: int = 0
@@ -58,7 +64,8 @@ class FastLoopInput:
         if (self.semantic_opportunity_question_id is not None
                 and self.semantic_opportunity_question_id not in {
                     "action_relation", "progress_relation", "retry_relation",
-                    "goal_drift", "route_preference"}):
+                    "goal_drift", "route_preference", "decomposition_preference",
+                    "integration_preference", "test_strategy_preference"}):
             raise ValueError("unsupported host semantic query opportunity")
         if any(not isinstance(value, str) or not value or len(value) > 128
                for value in self.objective_criteria):
@@ -156,6 +163,30 @@ class FastLoopInput:
         if len(encoded_policy_context.encode("utf-8")) > 8192:
             raise ValueError("policy context exceeds its byte bound")
         object.__setattr__(self, "policy_context", policy_context)
+        advisory_families = {"decomposition", "integration", "test_strategy"}
+        raw_advisory = policy_context.get("advisory_semantic_families", ())
+        if raw_advisory is None:
+            raw_advisory = ()
+        if isinstance(raw_advisory, list):
+            raw_advisory = tuple(raw_advisory)
+        if (not isinstance(raw_advisory, tuple) or len(raw_advisory) > 3
+                or len(set(raw_advisory)) != len(raw_advisory)
+                or any(not isinstance(item, str) or item not in advisory_families
+                       for item in raw_advisory)):
+            raise ValueError(
+                "policy context advisory families must be a unique subset of known advisory IDs")
+        declared_advisory = tuple(self.advisory_semantic_families or ())
+        if (len(declared_advisory) > 3
+                or len(set(declared_advisory)) != len(declared_advisory)
+                or any(not isinstance(item, str) or item not in advisory_families
+                       for item in declared_advisory)):
+            raise ValueError(
+                "advisory semantic families must be a unique subset of known advisory IDs")
+        if declared_advisory and raw_advisory and declared_advisory != raw_advisory:
+            raise ValueError(
+                "advisory semantic families differ from policy context declaration")
+        object.__setattr__(self, "advisory_semantic_families",
+                           declared_advisory or raw_advisory)
 
     @property
     def behavioral_causes(self) -> tuple[BehavioralCause, ...]:

@@ -157,7 +157,9 @@ def jev_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
             "artifact_changed": candidate.get("artifact_changed"),
         },
     }
-    if question_id in {"action_relation", "goal_drift", "route_preference"}:
+    if question_id in {"action_relation", "goal_drift", "route_preference",
+                       "decomposition_preference", "integration_preference",
+                       "test_strategy_preference"}:
         objective = _clean(task.get("objective"), limit=256)
         if objective:
             projected["task"]["objective"] = objective
@@ -212,7 +214,8 @@ def jev_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
                     for item in item.get("affected_criterion_ids", ())[:8]],
             } for item in failures],
         }
-    if question_id == "route_preference":
+    if question_id in {"route_preference", "decomposition_preference",
+                       "integration_preference", "test_strategy_preference"}:
         projected["legal_routes"] = state["legal_routes"][:8]
         projected["eligible_workflows"] = [{
             "statework_id": item.get("statework_id"),

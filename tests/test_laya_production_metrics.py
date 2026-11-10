@@ -41,7 +41,8 @@ def test_laya_event_and_family_allowlists_are_fixed(tmp_path: Path):
 
     assert set(QUESTION_FAMILIES) == {
         "action_relation", "progress_relation", "retry_relation",
-        "goal_drift", "route_preference",
+        "goal_drift", "route_preference", "decomposition_preference",
+        "integration_preference", "test_strategy_preference",
     }
     for event in LAYA_EVENTS:
         metrics.record_laya_event(event, question_family="progress_relation")
@@ -61,7 +62,10 @@ def test_laya_event_and_family_allowlists_are_fixed(tmp_path: Path):
     assert counters["laya_question_retry_relation_attempt"] == 1
     assert counters["laya_question_goal_drift_attempt"] == 1
     assert counters["laya_question_route_preference_attempt"] == 1
-    assert counters["laya_query_attempts"] == 6
+    assert counters["laya_question_decomposition_preference_attempt"] == 1
+    assert counters["laya_question_integration_preference_attempt"] == 1
+    assert counters["laya_question_test_strategy_preference_attempt"] == 1
+    assert counters["laya_query_attempts"] == 9
 
 
 def test_laya_latency_summary_uses_persisted_bounded_histogram(tmp_path: Path):

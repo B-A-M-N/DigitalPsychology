@@ -60,6 +60,9 @@ QUESTION_FAMILIES = (
     "retry_relation",
     "goal_drift",
     "route_preference",
+    "decomposition_preference",
+    "integration_preference",
+    "test_strategy_preference",
 )
 
 LAYA_EVENTS = {

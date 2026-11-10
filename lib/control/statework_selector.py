@@ -140,6 +140,35 @@ def rank_stateworks(mode: str, eligible: tuple[StateWorkOption, ...],
     return tuple(ranked[:limit])
 
 
+def _advisory_owner(item: StateWorkOption) -> str | None:
+    """Derive the advisory owner of a StateWork, if it names a known owner.
+
+    Owners are declared by the leading token of the StateWork ID
+    (``testworks-regression`` is owned by ``testworks``) with the domain
+    field as a fallback. Unknown owners carry no advisory family.
+    """
+    lowered = item.statework_id.lower()
+    for separator in ("-", "_", ":", "/", ".", " "):
+        if separator in lowered:
+            lowered = lowered.split(separator, 1)[0]
+    if lowered in ("godkiller", "terraformer", "testworks"):
+        return lowered
+    domain = item.domain.lower() if isinstance(item.domain, str) else ""
+    if domain in ("godkiller", "terraformer", "testworks"):
+        return domain
+    return None
+
+
+# Advisory owner dimensions appended after ``statework_fit``, in fixed order:
+# test_strategy (testworks), decomposition (godkiller), integration
+# (terraformer). Only owners present in the candidate pool are appended.
+_ADVISORY_OWNER_DIMENSION = (
+    ("testworks", "test_strategy_fit"),
+    ("godkiller", "decomposition_fit"),
+    ("terraformer", "integration_fit"),
+)
+
+
 def statework_ambiguity(mode: str, eligible: tuple[StateWorkOption, ...],
                         active: tuple[str, ...] = (), *,
                         candidates_limit: int = 24) -> PolicyAmbiguity | None:
@@ -149,7 +178,14 @@ def statework_ambiguity(mode: str, eligible: tuple[StateWorkOption, ...],
         return None
     (top_id, top_score), (second_id, second_score) = scored[:2]
     gap = max(0, top_score - second_score) / max(1, top_score)
-    return PolicyAmbiguity(top_id, second_id, float(gap), ("statework_fit",))
+    active_ids = set(active)
+    owners = {owner for item in eligible
+              if item.statework_id not in active_ids
+              for owner in (_advisory_owner(item),) if owner is not None}
+    extra = tuple(dimension for owner, dimension in _ADVISORY_OWNER_DIMENSION
+                  if owner in owners)
+    return PolicyAmbiguity(top_id, second_id, float(gap),
+                           ("statework_fit",) + extra)
 
 
 def eligible_statework_descriptions(

@@ -29,6 +29,15 @@ from ..runtime.cfw_behavior_contract import (
 )
 
 
+# Semantic question IDs the control plane may surface as an opportunity.
+# Route plus the three owner advisory families (decomposition, integration,
+# test strategy); the provider answer itself never enters the candidate pool.
+_SEMANTIC_OPPORTUNITY_QUESTIONS = frozenset({
+    "action_relation", "progress_relation", "retry_relation", "goal_drift",
+    "route_preference", "decomposition_preference", "integration_preference",
+    "test_strategy_preference"})
+
+
 class _ProvidedOutcomeFacts(OutcomeEvidenceAuthority):
     """Resolve evidence facts supplied by the trusted host control channel."""
 
@@ -196,7 +205,8 @@ class ControlDecisionEngine:
             query_plan = getattr(self.system_one_frame_factory,
                                  "last_query_plan", None)
             planned_question = getattr(query_plan, "question_id", None)
-            if isinstance(planned_question, str) and planned_question:
+            if (isinstance(planned_question, str)
+                    and planned_question in _SEMANTIC_OPPORTUNITY_QUESTIONS):
                 system_one_query_opportunity = True
                 system_one_opportunity_question_id = planned_question
             if frame is not None and not (
@@ -208,9 +218,10 @@ class ControlDecisionEngine:
             if frame is not None:
                 first_frame = frame[0] if isinstance(frame, tuple) else frame
                 if not system_one_query_opportunity and first_frame.questions:
-                    system_one_query_opportunity = True
-                    system_one_opportunity_question_id = (
-                        first_frame.questions[0].question_id)
+                    framed_question = first_frame.questions[0].question_id
+                    if framed_question in _SEMANTIC_OPPORTUNITY_QUESTIONS:
+                        system_one_query_opportunity = True
+                        system_one_opportunity_question_id = framed_question
                 if first_frame.identity.to_dict() != self._system_one_identity(
                         identity).to_dict():
                     raise ValueError("System-1 frame identity escapes the control session")
@@ -354,9 +365,8 @@ class ControlDecisionEngine:
             cfw_signals=request.cfw_signals,
             active_trigger_codes=request.observation.active_trigger_codes,
             semantic_opportunity_question_id=(
-                planned_question if planned_question in {
-                    "action_relation", "progress_relation", "retry_relation",
-                    "goal_drift", "route_preference"} else None),
+                planned_question if planned_question in _SEMANTIC_OPPORTUNITY_QUESTIONS
+                else None),
             actions_since_goal_progress=request.observation.actions_since_goal_progress,
             equivalent_retry_count=request.observation.equivalent_retry_count,
             host_action_index=request.observation.action_index,

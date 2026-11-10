@@ -198,7 +198,8 @@ def _host_blocker_view(values: Any, slots: Mapping[str, str]) -> list[dict[str, 
     result = []
     answer_terms = {
         "action_relation", "progress_relation", "retry_relation", "goal_drift",
-        "route_preference", "advances_primary_goal", "removes_concrete_blocker",
+        "route_preference", "decomposition_preference",
+        "integration_preference", "test_strategy_preference", "advances_primary_goal", "removes_concrete_blocker",
         "required_verification", "diagnostic_support", "unrelated",
         "goal_progress", "blocker_removed", "diagnostic_progress",
         "verification_progress", "recovery_progress", "no_progress",
@@ -314,7 +315,8 @@ def laya_state_projection(frame: SystemOneFrame) -> dict[str, Any]:
             "proposed": candidate_hypothesis,
             "previous_failures": previous_failures,
         }
-    elif family == "route_preference":
+    elif family in {"route_preference", "decomposition_preference",
+                     "integration_preference", "test_strategy_preference"}:
         projection["legal_routes"] = list(state["legal_routes"])
         projection["eligible_workflows"] = [{
             key: item[key] for key in (

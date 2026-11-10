@@ -541,7 +541,10 @@ class CalibrationRecord:
             and dict(((mode, kind), count) for mode, kind, count in self.cohort_counts).get(
                 (str(task["work_mode"]), str(task["deliverable_kind"])), 0)
             >= self.minimum_cohort_trajectories
-            and (self.question_id != "route_preference"
+            and (self.question_id not in {"route_preference",
+                                           "decomposition_preference",
+                                           "integration_preference",
+                                           "test_strategy_preference"}
                  or dict((((count, candidates, domain), sample)
                           for count, candidates, domain, sample
                           in self.candidate_context_counts)).get((
@@ -688,7 +691,8 @@ def _paired_rows(events: Iterable[Any], question_id: str, *,
         selected = answer.get("selected")
         actual = payload[outcome_key]
         prediction_labels = set(allowed_labels)
-        if question_id == "route_preference":
+        if question_id in {"route_preference", "decomposition_preference",
+                           "integration_preference", "test_strategy_preference"}:
             legal_routes = decision_payload.get("system_one_legal_routes")
             prediction_labels = (set(map(str, legal_routes))
                                  if isinstance(legal_routes, list) else set())
@@ -722,14 +726,16 @@ def _paired_rows(events: Iterable[Any], question_id: str, *,
         host_baseline = (host_baselines.get(question_id)
                          if isinstance(host_baselines, Mapping) else None)
         baseline_labels = allowed_labels
-        if question_id == "route_preference":
+        if question_id in {"route_preference", "decomposition_preference",
+                           "integration_preference", "test_strategy_preference"}:
             baseline_labels = set(decision_payload.get("system_one_legal_routes") or ())
         if host_baseline not in baseline_labels:
             host_baseline = None
         legal_routes = decision_payload.get("system_one_legal_routes")
         domain_tags = decision_payload.get("system_one_domain_tags")
         candidate_context = None
-        if question_id == "route_preference":
+        if question_id in {"route_preference", "decomposition_preference",
+                           "integration_preference", "test_strategy_preference"}:
             if (not isinstance(legal_routes, list) or not legal_routes
                     or not isinstance(domain_tags, list)):
                 continue
@@ -1103,7 +1109,8 @@ def calibration_record_from_events(
     if not applicable_cohorts:
         raise ValueError("no work-mode/deliverable cohort has enough distinct task fixtures")
     candidate_context_counts: tuple[tuple[int, str, str, int], ...] = ()
-    if question_id == "route_preference":
+    if question_id in {"route_preference", "decomposition_preference",
+                       "integration_preference", "test_strategy_preference"}:
         contexts: dict[tuple[int, str, str], set[str]] = {}
         for row in rows:
             context = row.get("candidate_context")

@@ -136,7 +136,8 @@ def create_system_one_frame_factory(system_one_service: Any):
     effective_enabled_questions = sorted(enabled & supported)
     available_questions = tuple(item for item in (
         "action_relation", "progress_relation", "retry_relation", "goal_drift",
-        "route_preference")
+        "route_preference", "decomposition_preference",
+        "integration_preference", "test_strategy_preference")
         if item in effective_enabled_questions)
     capability_payload = (
         None if capability is None else
@@ -436,7 +437,9 @@ def create_system_one_frame_factory(system_one_service: Any):
             family=QUESTION_REGISTRY[question_id]["family"],
             question_type=QUESTION_REGISTRY[question_id]["type"],
             instructions=QUESTION_REGISTRY[question_id]["instructions"],
-            criteria=(legal_stateworks if question_id == "route_preference"
+            criteria=(legal_stateworks if question_id in {
+                "route_preference", "decomposition_preference",
+                "integration_preference", "test_strategy_preference"}
                       else tuple(QUESTION_REGISTRY[question_id]["criteria"].items())),
         ) for question_id in question_ids)
         state_digest = canonical_hash(semantic_state.to_dict())
