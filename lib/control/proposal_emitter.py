@@ -22,6 +22,17 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .adjustment_schema import (
+    ADJUSTMENT_KINDS,
+    ADJUSTMENT_SCHEMA,
+    AUTHORIZED_SKILLS,
+    AUTHORIZED_STATEWORKS,
+    RUNTIME_CONTROLS,
+    SCHEMA_VERSION,
+    build_adjustment as _build_adjustment,
+    validate_adjustment as _validate_adjustment,
+)
+
 FAMILY_TO_KIND = {
     "decomposition_preference": "partition_draft",
     "integration_preference": "integration_plan_draft",
@@ -133,4 +144,91 @@ __all__ = [
     "FAMILY_TO_OWNER",
     "PROPOSAL_ORDER",
     "emit_proposals",
+    "ADJUSTMENT_KINDS",
+    "ADJUSTMENT_SCHEMA",
+    "AUTHORIZED_SKILLS",
+    "AUTHORIZED_STATEWORKS",
+    "RUNTIME_CONTROLS",
+    "SCHEMA_VERSION",
+    "build_adjustment",
+    "build_runtime_control_adjustment",
+    "build_workflow_preference_adjustment",
+    "build_skill_improvement_adjustment",
+    "validate_adjustment",
 ]
+
+
+# --- Typed executable adjustments (semantic-adjustment/v1). ---
+#
+# Recommendations via emit_proposals() stay advisory. The builders below are
+# the separate executable lane: pure formatting over caller-supplied fields.
+# They mint no evidence (refs pass through verbatim; empty refs require an
+# explicit unknown_evidence=True), touch no workflow state, and grant no
+# authority. Bounds and allow-lists live in adjustment_schema.py.
+
+def build_adjustment(kind: str, **fields: Any) -> dict[str, Any]:
+    """Build one validated semantic-adjustment/v1 payload.
+
+    Required keyword fields: origin, target, detail, projected_benefit,
+    rollback_criteria, expiry, plus evidence_refs and/or unknown_evidence.
+    Raises ValueError on malformed input or unknown kinds/targets.
+    """
+    return _build_adjustment(kind, **fields)
+
+
+def validate_adjustment(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-validate a built adjustment payload; returns its normalized copy."""
+    return _validate_adjustment(payload)
+
+
+def build_runtime_control_adjustment(*, origin: Mapping[str, Any],
+                                     target: Mapping[str, Any],
+                                     control: str, proposed_value: Any,
+                                     scope: str, evidence_refs: Any = (),
+                                     unknown_evidence: bool = False,
+                                     projected_benefit: str,
+                                     rollback_criteria: str,
+                                     expiry: str) -> dict[str, Any]:
+    """Build a runtime_control adjustment: CFW control + proposed value."""
+    return _build_adjustment(
+        "runtime_control", origin=origin, target=target,
+        detail={"control": control, "proposed_value": proposed_value,
+                "scope": scope},
+        evidence_refs=evidence_refs, unknown_evidence=unknown_evidence,
+        projected_benefit=projected_benefit,
+        rollback_criteria=rollback_criteria, expiry=expiry)
+
+
+def build_workflow_preference_adjustment(*, origin: Mapping[str, Any],
+                                         target: Mapping[str, Any],
+                                         statework: str,
+                                         basis_revisions: Any,
+                                         evidence_refs: Any = (),
+                                         unknown_evidence: bool = False,
+                                         projected_benefit: str,
+                                         rollback_criteria: str,
+                                         expiry: str) -> dict[str, Any]:
+    """Build a workflow_preference adjustment: StateWork + basis revisions."""
+    return _build_adjustment(
+        "workflow_preference", origin=origin, target=target,
+        detail={"statework": statework, "basis_revisions": basis_revisions},
+        evidence_refs=evidence_refs, unknown_evidence=unknown_evidence,
+        projected_benefit=projected_benefit,
+        rollback_criteria=rollback_criteria, expiry=expiry)
+
+
+def build_skill_improvement_adjustment(*, origin: Mapping[str, Any],
+                                       target: Mapping[str, Any],
+                                       skill: str, proposed_invariant: str,
+                                       evidence_refs: Any = (),
+                                       unknown_evidence: bool = False,
+                                       projected_benefit: str,
+                                       rollback_criteria: str,
+                                       expiry: str) -> dict[str, Any]:
+    """Build a skill_improvement adjustment: skill + proposed invariant."""
+    return _build_adjustment(
+        "skill_improvement", origin=origin, target=target,
+        detail={"skill": skill, "proposed_invariant": proposed_invariant},
+        evidence_refs=evidence_refs, unknown_evidence=unknown_evidence,
+        projected_benefit=projected_benefit,
+        rollback_criteria=rollback_criteria, expiry=expiry)

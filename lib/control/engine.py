@@ -19,6 +19,7 @@ from ..runtime.store import RuntimeStateRecord
 from ..system_one_contracts import SystemOneFrame, SystemOneIdentity
 from ..system_one_provider_selection import SemanticProviderSelector
 from .semantic_influence import SemanticInfluenceReceipt, compare_semantic_selection
+from .provider_qualification import resolve_portfolio_qualification
 from ..control_protocol import (ACTION_INDEX_BOUNDARIES,
                                 CANDIDATE_ACTION_BOUNDARIES,
                                 ControlSessionDescriptor, ControlTickRequest)
@@ -83,48 +84,46 @@ class ControlDecisionEngine:
         self.decision_service = decision_service
         self.system_one_frame_factory = system_one_frame_factory
         self._provider_selector = None
+        self._provider_snapshot_id = None
+        self._provider_snapshot_question = None
 
-    def _get_selector(self):
-        """Build or reuse the host-owned semantic provider selector."""
-        if self._provider_selector is None:
-            policy_context = getattr(
-                getattr(self.decision_service, "_system_one_service", None)
-                or type("Empty", (), {})(), "policy_context", None)
-            # Read selector config from the decision service's system-one service.
-            service = getattr(self.decision_service, "_system_one_service", None)
-            mode = getattr(service, "mode", "disabled") if service else "disabled"
-            if mode == "disabled":
-                self._provider_selector = SemanticProviderSelector(
-                    default_provider="laya", qualification={})
+    def _get_selector(self, *, question_id: str | None = None):
+        """Build or reuse the host-owned semantic provider selector.
+
+        Qualification is resolved per (provider, question-family) against a
+        versioned snapshot (calibration digest + question id + model
+        revision) bound at selection time. The memoized selector is reused
+        only while its snapshot id still matches; any change rebuilds
+        instead of serving memoized state. Unknown families stay
+        unqualified (fail closed), and calibration artifact existence alone
+        never qualifies.
+        """
+        service = getattr(self.decision_service, "_system_one_service", None)
+        mode = getattr(service, "mode", "disabled") if service else "disabled"
+        bound_question = question_id if isinstance(question_id, str) else None
+        if mode == "disabled":
+            snapshot_id = "disabled"
+            qualification: dict[str, str] = {}
+            default = "laya"
+        else:
+            runtimes = getattr(service, "runtimes", None)
+            if runtimes:
+                candidates = tuple(runtimes)
             else:
-                # Check which providers are configured and qualified.
-                qualification = {}
-                runtimes = getattr(service, "runtimes", None)
-                if runtimes:
-                    # Portfolio: inspect each runtime's backend.
-                    for runtime in runtimes:
-                        backend_id = getattr(runtime, "backend_id", "")
-                        if "laya" in backend_id:
-                            qualification["laya"] = "qualified" if getattr(
-                                runtime, "calibration_hash", "") else "unqualified"
-                        elif "jev" in backend_id:
-                            qualification["jev"] = "qualified" if getattr(
-                                runtime, "calibration_hash", "") else "unqualified"
-                else:
-                    backend_id = getattr(getattr(service, "runtime", None),
-                                         "backend_id", "")
-                    if "laya" in backend_id:
-                        qualification["laya"] = "qualified" if getattr(
-                            getattr(service, "runtime", None),
-                            "calibration_hash", "") else "unqualified"
-                    elif "jev" in backend_id:
-                        qualification["jev"] = "qualified" if getattr(
-                            getattr(service, "runtime", None),
-                            "calibration_hash", "") else "unqualified"
-                default = "jev" if "jev" in qualification and qualification.get(
-                    "jev") == "qualified" else "laya"
-                self._provider_selector = SemanticProviderSelector(
-                    default_provider=default, qualification=qualification)
+                single = getattr(service, "runtime", None)
+                candidates = (single,) if single is not None else ()
+            portfolio = resolve_portfolio_qualification(candidates, bound_question or "")
+            snapshot_id = portfolio.snapshot_id
+            qualification = dict(portfolio.selector_qualification)
+            default = ("jev" if qualification.get("jev") == "qualified"
+                       else "laya")
+        if (self._provider_selector is None
+                or self._provider_snapshot_id != snapshot_id
+                or self._provider_snapshot_question != bound_question):
+            self._provider_selector = SemanticProviderSelector(
+                default_provider=default, qualification=qualification)
+            self._provider_snapshot_id = snapshot_id
+            self._provider_snapshot_question = bound_question
         return self._provider_selector
 
     def prepare(self, descriptor: ControlSessionDescriptor,
@@ -229,9 +228,18 @@ class ControlDecisionEngine:
 
                 # Host-owned provider selection: determine which providers may
                 # be dispatched and which, if any, may influence DP behavior.
+                # Qualification binds to the framed question family at
+                # selection time via a versioned snapshot.
                 remote_permitted = bool(policy_context.get(
                     "semantic_remote_inference", False))
-                selector = self._get_selector()
+                if (isinstance(planned_question, str)
+                        and planned_question in _SEMANTIC_OPPORTUNITY_QUESTIONS):
+                    selection_question_id: str | None = planned_question
+                elif first_frame.questions:
+                    selection_question_id = first_frame.questions[0].question_id
+                else:
+                    selection_question_id = None
+                selector = self._get_selector(question_id=selection_question_id)
                 decision_basis_digest = hashlib.sha256(
                     json.dumps(first_frame.canonical_payload(), sort_keys=True,
                                separators=(",", ":"), ensure_ascii=False).encode(
